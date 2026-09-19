@@ -1,0 +1,20 @@
+# runtime / env
+.venv/
+__pycache__/
+*.pyc
+screencap.png
+tmp
+log.log
+probe.txt
+lhm_dump.txt
+
+# theme/render scratch
+preview/
+shots/
+
+# Vendored upstream library (1.1 GB, 1.05 GB of it theme artwork).
+# Tracked here is only the pin + provenance note; see vendor/README.md and
+# tools/vendor_lock.ps1.
+/vendor/*
+!/vendor/README.md
+!/vendor/LOCK.txt

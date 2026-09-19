@@ -1,0 +1,536 @@
+#!/usr/bin/env python
+"""Live two-up preview of the idle and in-game layouts.
+
+Renders BOTH states side by side from live-or-simulated telemetry and serves an
+auto-refreshing browser page:
+
+    .venv\\Scripts\\python tools\\liveview.py                    # simulated data
+    .venv\\Scripts\\python tools\\liveview.py --backend auto     # this PC's sensors
+    .venv\\Scripts\\python tools\\liveview.py --port 5681 --hz 2
+
+Then open http://localhost:5680. `app/layout.py`, `app/power.py` and
+`config.yaml` are hot-reloaded when they change on disk, so editing the layout
+shows up in the browser within a tick — no restart, no refresh needed.
+
+Per-state "push" stats (changed-pixel fraction + how many bands a partial
+update would need) are reported the same way app/output.py would do it, so the
+design can be judged against what the panel actually has to redraw.
+"""
+from __future__ import annotations
+
+import argparse
+import io
+import json
+import sys
+import threading
+import time
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+ROOT = Path(__file__).resolve().parent.parent
+for _p in (str(ROOT), str(ROOT / "vendor" / "turing-smart-screen-python")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import numpy as np  # noqa: E402
+from PIL import Image, ImageDraw, ImageEnhance  # noqa: E402
+
+from app import config as cfgmod  # noqa: E402
+from app import history as history_mod  # noqa: E402
+from app import layout as layout_mod  # noqa: E402
+from app import power as power_mod  # noqa: E402
+from app.output import _runs  # noqa: E402  (same band-merge logic as the real pusher)
+from app.sensors import demo as demo_mod  # noqa: E402
+from app.sensors import make_hub  # noqa: E402
+from app.sensors.demo import DemoBackend  # noqa: E402
+
+STATES = ("idle", "game")
+# hot-reload order matters: each module keeps references to the ones before it
+HOT_MODULES = [power_mod, history_mod, demo_mod, layout_mod]
+WATCH_FILES = [Path(m.__file__) for m in HOT_MODULES] + [ROOT / "config.yaml"]
+
+PAGE = """<!doctype html>
+<html><head><meta charset="utf-8"><title>PC Monitor — live layouts</title>
+<style>
+  :root { --scale: 1; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 18px 20px 40px; background: #05060a; color: #cfd6e4;
+         font: 13px/1.45 ui-monospace, "Cascadia Mono", Consolas, monospace; }
+  h1 { font-size: 14px; font-weight: 600; letter-spacing: .12em; margin: 0 0 4px;
+       text-transform: uppercase; color: #8b96ab; }
+  #status { font-size: 12px; color: #6f7a8f; margin-bottom: 14px; }
+  #status b { color: #b9c4d6; font-weight: 600; }
+  .bar { display: flex; flex-wrap: wrap; gap: 10px 18px; align-items: center;
+         margin-bottom: 16px; padding: 10px 12px; background: #0b0e14;
+         border: 1px solid #1c2230; border-radius: 8px; }
+  .grp { display: flex; gap: 6px; align-items: center; }
+  .grp > span { color: #6f7a8f; font-size: 11px; text-transform: uppercase;
+                letter-spacing: .08em; }
+  button { background: #161b26; color: #cfd6e4; border: 1px solid #2a3143;
+           border-radius: 5px; padding: 4px 9px; font: inherit; font-size: 12px;
+           cursor: pointer; }
+  button.on { background: #22406b; border-color: #3f6ea8; color: #eaf2ff; }
+  input[type=range] { width: 130px; accent-color: #5b8fd0; }
+  #err { display: none; white-space: pre-wrap; margin-bottom: 14px; padding: 10px;
+         background: #2a1114; border: 1px solid #7d2b32; border-radius: 8px;
+         color: #ffb3bb; font-size: 12px; }
+  .stage { display: flex; flex-wrap: wrap; gap: 26px; align-items: flex-start; }
+  figure { margin: 0; }
+  .bezel { background: #0c0e12; border: 10px solid #15181d; border-radius: 6px;
+           box-shadow: 0 8px 26px rgba(0,0,0,.6); line-height: 0; overflow: hidden;
+           width: calc(800px * var(--scale)); }
+  .bezel img { width: 100%; display: block; image-rendering: auto; }
+  figcaption { display: flex; justify-content: space-between; gap: 14px;
+               padding: 8px 2px 0; color: #8b96ab; font-size: 12px; }
+  figcaption b { letter-spacing: .14em; text-transform: uppercase; color: #d7dfec; }
+  figcaption i { font-style: normal; color: #6f7a8f; }
+</style></head><body>
+<h1>PC Monitor — live layouts (800×480 panel)</h1>
+<div id="status">connecting… · <span id="link" style="color:#6f7a8f"></span></div>
+<div id="err"></div>
+<div class="bar">
+  <div class="grp"><span>zoom</span>
+    <button data-scale="1" class="on">1×</button><button data-scale="1.5">1.5×</button>
+    <button data-scale="2">2×</button></div>
+  <div class="grp"><span>brightness</span>
+    <input id="dim" type="range" min="0.1" max="1" step="0.05" value="1">
+    <i id="dimv" style="color:#6f7a8f">100%</i></div>
+  <div class="grp"><span>overlay</span>
+    <button id="grid">50px grid</button><button id="shift">burn-in shift</button>
+    <button id="trends" class="on" title="layout.trend_bands — off = serial budget mode">trend bands</button></div>
+  <div class="grp"><button id="pause">pause</button>
+    <button id="dl">save PNGs</button></div>
+</div>
+<div class="stage">
+  <figure>
+    <div class="bezel"><img id="img-idle" alt="idle"></div>
+    <figcaption><b>Idle</b><i id="d-idle"></i></figcaption>
+  </figure>
+  <figure>
+    <div class="bezel"><img id="img-game" alt="game"></div>
+    <figcaption><b>In-game</b><i id="d-game"></i></figcaption>
+  </figure>
+</div>
+<script>
+const S = {scale:1, dim:1, grid:0, shift:0, paused:false, n:0, last:{}};
+function q(s){ return `/frame.png?state=${s}&dim=${S.dim}&grid=${S.grid}` +
+                     `&shift=${S.shift}&n=${S.n}`; }
+function tick(){
+  if (S.paused) return;
+  S.n++;
+  for (const s of ['idle','game']) document.getElementById('img-'+s).src = q(s);
+  fetch('/api/status?n='+S.n).then(r=>r.json()).then(j=>{
+    const ago = j.reloaded ? Math.round((j.now - j.reloaded)) : null;
+    document.getElementById('status').innerHTML =
+      `backend <b>${j.backend}</b> · tick <b>${j.tick}</b> · ` +
+      `hot-reloads <b>${j.reloads}</b>` + (ago===null?'':` (${ago}s ago)`) +
+      ` · render <b>${j.render_ms} ms</b> · trend <b>${j.trend_s}s</b>` +
+      ` · watching <b>${j.watched}</b> files`;
+    for (const s of ['idle','game']) {
+      const d = j.push[s] || {};
+      document.getElementById('d-'+s).textContent =
+        `${d.mode||'?'} · ${((d.changed||0)*100).toFixed(1)}% px · ${d.bands||0} band(s) · ` +
+        `USB ${(d.bytes_partial_png/1024||0).toFixed(1)} KB / serial ${(d.bytes_partial/1024||0).toFixed(0)} KB`;
+    }
+    if (j.push.idle) {
+      const p = j.push.idle.bytes_partial_png + j.push.game.bytes_partial_png;
+      const r = j.push.idle.bytes_partial + j.push.game.bytes_partial;
+      document.getElementById('link').textContent =
+        `wire: ~${(p/1024).toFixed(0)} KB/s → ${(p/1e6*1000).toFixed(0)} ms/frame on TUR_USB · ` +
+        `raw ${(r/1024).toFixed(0)} KB/s → ${(r/14400).toFixed(1)} s/frame on 115200 serial`;
+      const b = document.getElementById('trends');
+      b.classList.toggle('on', !!j.trends);
+    }
+    document.getElementById('err').style.display = j.error ? 'block' : 'none';
+    document.getElementById('err').textContent = j.error || '';
+  }).catch(()=>{ document.getElementById('status').textContent = 'server not responding'; });
+}
+setInterval(tick, 600); tick();
+document.querySelectorAll('[data-scale]').forEach(b => b.onclick = () => {
+  document.querySelectorAll('[data-scale]').forEach(x => x.classList.remove('on'));
+  b.classList.add('on'); S.scale = parseFloat(b.dataset.scale);
+  document.documentElement.style.setProperty('--scale', S.scale);
+});
+dim.oninput = () => { S.dim = parseFloat(dim.value); dimv.textContent = Math.round(S.dim*100)+'%'; };
+grid.onclick = () => { S.grid ^= 1; grid.classList.toggle('on', !!S.grid); };
+trends.onclick = () => {
+  const want = !document.getElementById('trends').classList.contains('on');
+  fetch('/ctrl?trends=' + (want ? 1 : 0));   // next status confirms the state
+};
+shift.onclick = () => { S.shift = S.shift ? 0 : 1; shift.classList.toggle('on', !!S.shift); };
+pause.onclick = () => { S.paused = !S.paused; pause.classList.toggle('on', S.paused);
+                        pause.textContent = S.paused ? 'resume' : 'pause'; };
+dl.onclick = () => { for (const s of ['idle','game'])
+  window.open(`/frame.png?state=${s}&dim=1&raw=1`, '_blank'); };
+</script></body></html>
+"""
+
+
+def _merge_bands(runs, gap: int = 6):
+    """Mirror DiffPusher's band merging so the reported cost is the real one."""
+    if not runs:
+        return []
+    merged = [list(runs[0])]
+    for s, e in runs[1:]:
+        if s - merged[-1][1] <= gap:
+            merged[-1][1] = e
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def _bytes_png(img) -> int:
+    """What the TUR_USB driver would actually put on the wire for this image: it
+    PNG-encodes each push (`_encode_png`, compress_level=9, `send_pil_image_auto`),
+    so compressed bytes — not width*height*2 — decide whether a design is
+    affordable. JPEG fallback only kicks in above the 1 MB payload cap."""
+    buf = io.BytesIO()
+    img.save(buf, "PNG", compress_level=9)
+    return len(buf.getvalue())
+
+
+def diff_report(prev, new, merge_gap: int = 6, max_bands: int = 6,
+                full_fraction: float = 0.35):
+    """What app/output.py would do with this frame, plus the real cost of each
+    option: raw RGB565 bytes (what the 115200-baud serial revisions receive) and
+    PNG bytes scaled to full size (what TUR_USB actually puts on the wire)."""
+    if prev is None or prev.shape != new.shape:
+        return {"mode": "full", "changed": 1.0, "bands": 1,
+                "bytes_partial": int(new.size * 2), "bytes_full": int(new.size * 2)}
+    changed = np.any(new != prev, axis=2)
+    frac = float(changed.mean())
+    h, w = new.shape[0], new.shape[1]
+    full_raw = int(w * h * 2)
+    full_png = _bytes_png(Image.fromarray(new))
+    if frac == 0.0:
+        return {"mode": "none", "changed": 0.0, "bands": 0,
+                "bytes_partial": 0, "bytes_full": full_raw,
+                "bytes_partial_png": 0, "bytes_full_png": full_png}
+    rows = np.flatnonzero(changed.any(axis=1))
+    merged = _merge_bands(_runs(rows), gap=merge_gap)
+    usable = frac <= full_fraction and 0 < len(merged) <= max_bands
+    area = png_area = 0
+    if usable:
+        for y0, y1 in merged:
+            cols = np.flatnonzero(changed[y0:y1].any(axis=0))
+            x0, x1 = int(cols[0]), int(cols[-1]) + 1
+            area += (y1 - y0) * (x1 - x0)
+            png_area += _bytes_png(Image.fromarray(new[y0:y1, x0:x1]))
+    return {"mode": "bands" if usable else "full", "changed": frac,
+            "bands": (len(merged) if usable else 1),
+            "bytes_partial": (area * 2 if usable else full_raw),
+            "bytes_full": full_raw,
+            "bytes_partial_png": (png_area if usable else full_png),
+            "bytes_full_png": full_png}
+
+
+def synth_frames(snap, t: float) -> None:
+    """Placeholder frame stats until PresentMon lands, so the game layout has
+    something to show when driven by real sensors."""
+    f = snap.frames
+    if f.fps is None:
+        fps = 118 + 14 * np.sin(t * 0.31) + 5 * np.sin(t * 1.7)
+        f.fps = fps
+        f.low1_pct = fps * 0.74
+        f.low01_pct = fps * 0.46
+        f.latency_ms = 1000.0 / fps * 0.86
+
+
+class Engine:
+    """Ticks telemetry, hot-reloads the layout code, keeps both frames."""
+
+    def __init__(self, cfg, backend: str, hz: float, synth: bool):
+        self.cfg = cfg
+        self.hz = hz
+        self.backend = backend
+        self.synth = synth
+        self.demo = backend == "demo"
+        self.lock = threading.Lock()
+        self.base: dict[tuple[str, int], Image.Image] = {}
+        self.prev: dict[str, np.ndarray | None] = {s: None for s in STATES}
+        self.diff: dict[str, dict] = {s: {"mode": "init", "changed": 1.0, "bands": 1}
+                                     for s in STATES}
+        self.tick_n = 0
+        self.reloads = 0
+        self.reloaded_at: float | None = None
+        self.render_ms = 0.0
+        self.error: str | None = None
+        self.started = time.time()
+        self._stamps = {p: self._stamp(p) for p in WATCH_FILES}
+        self.layouts = {s: layout_mod.Layout(cfg, rate_hz=hz) for s in STATES}
+        self.samples = self.layouts["idle"].samples
+        self._cfg_path = Path(cfg["_root"]) / "config.yaml"
+
+        if self.demo:
+            self._make_hubs()
+        else:
+            self.hub = make_hub(cfg, force=backend)
+            self.hub_idle = self.hub_game = self.hub
+        if self.demo:
+            self._backfill()
+
+    def _backfill(self) -> None:
+        """Fill the trend rings before the first paint by running the same demo
+        generator backwards in time, so a restart never shows empty graphs; live
+        samples then continue seamlessly from the last backfilled one. Real
+        sensors cannot be backfilled, so there the bands fill honestly."""
+        for _ in range(self.samples):
+            for hub in (self.hub_idle, self.hub_game):
+                hub.backend._t0 -= 1.0
+            si, sg = self._snapshots()
+            for state, snap in (("idle", si), ("game", sg)):
+                self.layouts[state].observe(snap, state)
+
+    def _make_hubs(self) -> None:
+        """Two independent demo streams: idle-shaped data on the left screen,
+        game-shaped data on the right, both animating from the same clock."""
+        self.hub_idle = make_hub(self.cfg, force="demo")
+        self.hub_game = make_hub(self.cfg, force="demo")
+        assert isinstance(self.hub_idle.backend, DemoBackend)
+        self.hub_idle.backend.game = False
+        self.hub_game.backend.game = True
+
+    @staticmethod
+    def _stamp(p: Path):
+        try:
+            st = p.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    # ---- hot reload ----------------------------------------------------------
+    def _maybe_reload(self) -> None:
+        changed = [p for p in WATCH_FILES if self._stamp(p) != self._stamps.get(p)]
+        if not changed:
+            return
+        for p in changed:
+            self._stamps[p] = self._stamp(p)
+        cfg_changed = self._cfg_path in changed
+        demo_changed = Path(demo_mod.__file__) in changed
+        # reload the whole chain in dependency order whenever anything changed:
+        # each module keeps direct references to the ones before it, so a partial
+        # reload would leave the new module wired to the old classes.
+        for mod in HOT_MODULES:
+            importlib_reload(mod)
+        if cfg_changed:
+            fresh = cfgmod.load(str(self._cfg_path))
+            self.cfg.clear()
+            self.cfg.update(fresh)
+        if demo_changed and self.demo:
+            # existing DemoBackend objects are bound to the old class, so the
+            # streams have to be rebuilt for edited data shapes to show up
+            self._make_hubs()
+        # rebuild the layouts, carrying the trend history across the reload so an
+        # edit never blanks the graphs out from under us
+        old = {s: l.history for s, l in self.layouts.items()}
+        self.layouts = {s: layout_mod.Layout(self.cfg, rate_hz=self.hz) for s in STATES}
+        for s, hist in old.items():
+            # a History instance is just rings + a length, so it survives the
+            # reload even though the Layout class around it was replaced
+            if hist.samples == self.layouts[s].history.samples:
+                self.layouts[s].history = hist
+        self.samples = self.layouts["idle"].samples
+        self.reloads += 1
+        self.reloaded_at = time.time()
+        names = ", ".join(p.name for p in changed)
+        print(f"[liveview] hot-reloaded ({names})")
+
+    # ---- one tick ------------------------------------------------------------
+    def _snapshots(self):
+        t = time.monotonic() - self.started
+        if self.demo:
+            # two independent demo streams: the idle panel shows idle-shaped
+            # data, the game panel shows game-shaped data, both animating
+            si = self.hub_idle.tick()
+            sg = self.hub_game.tick()
+        else:
+            sg = self.hub_game.tick()
+            si = sg
+            if self.synth:
+                synth_frames(sg, t)
+        for s in {id(si): si, id(sg): sg}.values():
+            s.power_total_w, _ = power_mod.estimate(s, self.cfg)
+        return si, sg
+
+    def step(self) -> None:
+        self._maybe_reload()
+        t0 = time.perf_counter()
+        si, sg = self._snapshots()
+        shots = {"idle": si, "game": sg}
+        frames: dict[tuple[str, int], Image.Image] = {}
+        for state, snap in shots.items():
+            layout = self.layouts[state]
+            layout.observe(snap, state)
+            for sh, shift in ((0, (0, 0)), (1, (3, 3))):
+                frames[(state, sh)] = layout.render(snap, state, shift)
+        dt = (time.perf_counter() - t0) * 1000.0
+        diffs = {s: diff_report(self.prev[s], np.asarray(frames[(s, 0)], np.uint8))
+                 for s in STATES}
+        with self.lock:
+            self.base = frames
+            self.diff = diffs
+            self.render_ms = round(dt, 1)
+            self.tick_n += 1
+            self.error = None
+            for s in STATES:
+                self.prev[s] = np.asarray(frames[(s, 0)], np.uint8)
+
+    def frame(self, state: str, shift: int, dim: float, grid: bool) -> bytes:
+        with self.lock:
+            img = self.base.get((state, 1 if shift else 0))
+        if img is None:
+            img = Image.new("RGB", (800, 480), (6, 8, 12))
+            ImageDraw.Draw(img).text((20, 20), "no frame yet", fill=(120, 130, 150))
+        if dim < 0.999:
+            img = ImageEnhance.Brightness(img).enhance(max(0.02, dim))
+        if grid:
+            rgba = img.convert("RGBA")
+            ov = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+            d = ImageDraw.Draw(ov)
+            for x in range(0, rgba.size[0], 50):
+                d.line([(x, 0), (x, rgba.size[1])], fill=(150, 190, 255, 34))
+            for y in range(0, rgba.size[1], 50):
+                d.line([(0, y), (rgba.size[0], y)], fill=(150, 190, 255, 34))
+            img = Image.alpha_composite(rgba, ov).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, "PNG", optimize=False, compress_level=2)
+        return buf.getvalue()
+
+    def status(self) -> dict:
+        with self.lock:
+            return {
+                "backend": self.backend + (" (sim)" if self.demo else ""),
+                "tick": self.tick_n, "reloads": self.reloads,
+                "reloaded": self.reloaded_at, "now": time.time(),
+                "render_ms": self.render_ms, "push": self.diff,
+                "trend_s": round(self.samples / max(self.hz, 0.001)),
+                "trends": bool(self.cfg["layout"].get("trend_bands", True)),
+                "error": self.error, "uptime_s": round(time.time() - self.started, 1),
+                "watched": len(WATCH_FILES),
+            }
+
+
+def importlib_reload(mod):
+    import importlib
+    try:
+        return importlib.reload(mod)
+    except Exception:  # broken edit: keep the last good module object alive
+        tb = traceback.format_exc()
+        print("[liveview] reload failed:\n" + tb)
+        raise RuntimeError(tb) from None
+
+
+def run(cfg, backend, hz, port, synth) -> None:
+    engine = Engine(cfg, backend, hz, synth)
+
+    # first tick on the main thread so the page always has something to show
+    try:
+        engine.step()
+    except Exception:
+        engine.error = traceback.format_exc()
+        print(engine.error)
+
+    def loop():
+        while True:
+            t0 = time.monotonic()
+            try:
+                engine.step()
+            except Exception as e:  # a bad edit must not kill the server
+                engine.error = traceback.format_exc()
+                print(f"[liveview] render failed: {e.__class__.__name__}: {e}")
+            left = 1.0 / hz - (time.monotonic() - t0)
+            if left > 0:
+                time.sleep(left)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+    cache: dict[tuple, tuple[float, bytes]] = {}
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):  # quiet
+            pass
+
+        def _send(self, code, body: bytes, ctype: str, extra=None):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802
+            u = urlparse(self.path)
+            qs = {k: v[0] for k, v in parse_qs(u.query).items()}
+            try:
+                if u.path in ("/", "/index.html"):
+                    return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+                if u.path == "/api/status":
+                    return self._send(200, json.dumps(engine.status()).encode(),
+                                      "application/json")
+                if u.path == "/ctrl":
+                    # live config switches, written straight into the cfg dict the
+                    # layouts read on every render (no restart, no state race)
+                    if "trends" in qs:
+                        engine.cfg["layout"]["trend_bands"] = \
+                            qs["trends"] not in ("0", "", "false", "off")
+                    return self._send(200, json.dumps(
+                        {"trends": bool(engine.cfg["layout"].get("trend_bands", True))}
+                    ).encode(), "application/json")
+                if u.path == "/frame.png":
+                    state = qs.get("state", "idle")
+                    state = state if state in STATES else "idle"
+                    shift = 1 if qs.get("shift", "0") not in ("0", "", "false") else 0
+                    if qs.get("raw") in ("1", "true"):
+                        dim, grid = 1.0, False
+                    else:
+                        dim = float(qs.get("dim", "1"))
+                        grid = qs.get("grid", "0") not in ("0", "", "false")
+                    key = (state, shift, round(dim, 3), grid)
+                    hit = cache.get(key)
+                    now = time.monotonic()
+                    if hit and now - hit[0] < 0.45:
+                        png = hit[1]
+                    else:
+                        png = engine.frame(state, shift, dim, grid)
+                        cache.clear() if len(cache) > 12 else None
+                        cache[key] = (now, png)
+                    return self._send(200, png, "image/png",
+                                      {"Content-Disposition":
+                                       f'inline; filename="pcmonitor-{state}.png"'})
+                return self._send(404, b"not found", "text/plain")
+            except Exception:
+                return self._send(500, traceback.format_exc().encode(), "text/plain")
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    srv.daemon_threads = True
+    print(f"[liveview] http://localhost:{port}  backend={backend}  hz={hz}")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--config", default=None)
+    ap.add_argument("--backend", default="demo", help="demo|auto|lhm|fallback")
+    ap.add_argument("--port", type=int, default=5680)
+    ap.add_argument("--hz", type=float, default=1.0, help="render ticks/second")
+    ap.add_argument("--synth-fps", default="auto", choices=["auto", "on", "off"],
+                    help="fill frame stats when the backend has none (game layout)")
+    args = ap.parse_args()
+
+    cfg = cfgmod.load(args.config)
+    backend = args.backend.lower()
+    synth = args.synth_fps == "on" or (args.synth_fps == "auto" and backend != "demo")
+    run(cfg, backend, args.hz, args.port, synth)
+
+
+if __name__ == "__main__":
+    main()

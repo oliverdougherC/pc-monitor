@@ -1,0 +1,85 @@
+# PC Monitor - desk display config
+# NOTE: keys are consumed by app/config.py; missing keys fall back to defaults there.
+
+display:
+  # Once hardware arrives set revision to the right protocol:
+  #   SIMU = simulated display (web preview on http://localhost:5678)
+  #   C    = Turing Smart Screen 5" (classic)      TUR_USB = newer TURZX USB models
+  revision: SIMU
+  com_port: AUTO
+  # portrait/native panel dims (rotated to landscape below). 5" Turing = 480x800
+  portrait_width: 480
+  portrait_height: 800
+  orientation: landscape
+  brightness_idle: 45     # %
+  brightness_game: 70     # %
+  brightness_dim: 12      # % when nobody has touched the PC for a while
+  screen_off_after_min: 45
+
+sensors:
+  # auto: LHM if pythonnet+dll available, else psutil+NVML. Or force: lhm | fallback | demo
+  backend: auto
+  interval_s: 1.0
+
+power:
+  # total = base + (cpu + gpu) * (1 + rail_overhead_pct/100)
+  #
+  # base_w — everything on the 24-pin/aux rails that sensors can't see,
+  # researched for this exact build (2026-07):
+  #   board logic+chipset (X870E dual-PCH ProArt, HWCooling 24-pin clamp data
+  #     says 15-25W idle / up to ~40W loaded on feature-heavy boards) ... 20
+  #   2x DDR5-6400 32GB (1.5W idle ... 5W memory-heavy) ..............    3
+  #   SN850X 8TB NVMe (0.05W idle, ~1W typical, 9W burst) ...........    1.5
+  #   5 case fans (~0.8-1.5W each at PWM duty) ......................    6
+  #   Liquid Freezer III 360 pump (max ~3W) + its 3 fans ............    5.5
+  #   WiFi/BT, USB, front panel, misc ................................    3
+  #   ≈ 39 W when working, ~30 W at idle → midpoint 34
+  base_w: 34
+  # LHM "Total Power" is at the CPU socket and NVML power at the card plug;
+  # VRM conversion (~5%) + PSU loss (~4%) sit upstream of both.
+  rail_overhead_pct: 9
+  cpu_tdp: 170        # 7950X PPT — used only when no power sensor exists
+  gpu_tdp: 575        # RTX 5090
+  gradient_min_w: 50   # color: green at/below this
+  gradient_max_w: 1000 # color: red at/above this
+  gradient_gamma: 0.75
+
+game:
+  # explicit process names (lowercase .exe) that always trigger game mode
+  processes: []
+  # never trigger from these
+  ignore:
+    - explorer.exe
+    - dwm.exe
+    - taskmgr.exe
+    - windowsinternal.composableshell.experiences.exe
+    - searchapp.exe
+    - searchhost.exe
+    - startmenuexperiencehost.exe
+    - applicationframehost.exe
+    - phonolink.exe
+  # heuristic: true fullscreen foreground window + gpu busy for this many seconds
+  fullscreen_heuristic: true
+  min_gpu_load: 10
+  enter_after_s: 4
+  exit_after_s: 25
+  # dashed reference line in the in-game frametime graph (16.7 ms = 60 fps)
+  frametime_target_ms: 16.7
+
+burnin:
+  shift_every_min: 5       # global pixel-shift of the layout
+  exercise_every_h: 8      # full-screen color sweep "refresh" animation
+  exercise_s: 12
+
+layout:
+  # fonts resolve relative to the vendored library res/ folder
+  font_value: jetbrains-mono/JetBrainsMono-ExtraBold.ttf
+  font_label: roboto/Roboto-Bold.ttf
+  font_small: roboto/Roboto-Medium.ttf
+  # seconds of history drawn in the trend bands (= samples at interval_s: 1 Hz)
+  trend_window_s: 60
+  # Trend bands cost nothing on TUR_USB (each push is PNG-encoded: ~50 KB for a
+  # whole frame) but they are impossible on the 115200-baud serial revisions,
+  # where one full frame would take ~68 s. Set false for those boards: the bands
+  # collapse to plain level bars and only the digits change.
+  trend_bands: true
