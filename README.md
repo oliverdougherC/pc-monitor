@@ -28,13 +28,52 @@ state, how many bands a partial panel update would need (same math as
 | `app/sensors/` | backends: `lhm` (LibreHardwareMonitorLib via pythonnet, full fidelity incl. package power & per-core clocks), `fallback` (psutil+NVML, no admin), `demo` |
 | `app/power.py` | total-watt estimate (base+cpu+gpu) & green→red 50–1000 W gradient |
 | `app/gamewatch.py` | idle/game state: fullscreen foreground window + GPU busy, with hysteresis |
-| `app/layout.py` | 800×480 rendering, color-coded, thick tabular digits, 60s trend bands |
+| `app/layout.py` | 800×480 rendering: permanent top half + mode strip, trend bands, worst-case-fit type |
 | `app/history.py` | bounded ring buffers feeding the trend bands |
 | `app/output.py` | numpy diff → only changed bands are sent to the panel |
 | `app/burnin.py` | brightness schedule, screen-off on idle, 3-px layout shift, periodic color sweep |
 | `tools/liveview.py` | dev server: live idle+game two-up, hot-reload, push-cost stats |
 | `tools/layout_check.py` | geometry guard: value extremes → collisions / panel overflow |
 | `tools/vendor_lock.ps1` | pin + verify the vendored library (see `vendor/README.md`) |
+
+## Screen design: permanent furniture
+
+Both states share one skeleton — a legibility decision and, as it turns out, a
+bandwidth one:
+
+| region | idle | in-game | moves? |
+|---|---|---|---|
+| top left | CPU panel, 394×212, 58 px digits | identical | **never** |
+| top right | GPU panel | identical | **never** |
+| bottom strip, 3 slots | RAM · DISK · NETWORK | FRAMES · RAM · DISK | content only |
+| power strip | total W + clock | identical | **never** |
+
+Measured on one snapshot (`tools/liveview.py` prints it live under the frames):
+the state change touches **0 pixels above y=228** — 10.2 % of the frame, which as
+partial-push bands is 3 bands / 220 KB raw / 23 KB PNG. On a serial revision that
+turns a ~68 s mode switch into a ~15 s one; on TUR_USB it is a 23 KB push.
+
+Type sizes are fixed per slot from the **worst-case** string (`100°` beside `100%`,
+`999.9 MB/s` under a `WRITE` caption), so digits never collide and never resize
+while they update. `tools/layout_check.py` re-proves that — both states, both
+trend modes, the value extremes *and* the all-`None` sensor case.
+
+A missing sensor renders as a small dim `--` on the same baseline rather than a
+giant bright dash, and a metric with no history draws a dashed empty axis instead
+of a blank box. That is not hypothetical: the non-elevated fallback backend
+genuinely has no CPU temp and no package power.
+
+### The idle ↔ game transition
+
+Detection debounces asymmetrically already — game after `enter_after_s: 4`, back
+to idle after `exit_after_s: 25`, so alt-tabs and loading screens do not flip the
+panel. Since the top half never moves, the switch is a strip-level event, and
+`layout.transition: wipe` covers even that: one dark frame (near-black PNG ≈ 1 KB),
+hold `transition_hold_s: 0.12`, then the new layout. The panel has no framebuffer
+and slow pixels, so without the gap the outgoing layout ghosts through the
+incoming one and reads as a glitch. Wipes are skipped automatically on the serial
+revisions, where an extra frame cannot be afforded; `transition: none` disables
+them everywhere. The hold's visible effect can only be judged on the real panel.
 
 ## Vendored dependency (not in git)
 

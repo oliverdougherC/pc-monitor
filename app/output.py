@@ -9,7 +9,33 @@ numpy, and send back the smallest set of horizontal bands that changed.
 """
 from __future__ import annotations
 
+import time
+
 import numpy as np
+
+# Revisions whose link is a 115200-baud serial port: one full 800x480 RGB565
+# frame is ~750 KB and takes ~68 s, so no extra frame is ever affordable there.
+SERIAL_REVISIONS = {"A", "B", "C", "D", "WEACT_A", "WEACT_B"}
+
+
+def wipe_supported(revision: str, cfg: dict) -> bool:
+    """Should state changes be wiped? On (default) unless the layout opts out or
+    the transport is serial, where the extra frame is physically impossible."""
+    mode = str(cfg["layout"].get("transition", "wipe")).lower()
+    return mode != "none" and str(revision).upper() not in SERIAL_REVISIONS
+
+
+def wipe(pusher, blank_frame, new_frame, hold_s: float = 0.12) -> None:
+    """Push a dark frame, hold, then the new layout — used when the layout changes
+    (idle ↔ game). The panel has no framebuffer and slow pixels: without the gap
+    the outgoing layout ghosts through the incoming one for a few hundred ms,
+    which reads as a glitch rather than a switch. Both pushes are full frames,
+    since neither resembles the other; near-black compresses to ~1 KB as PNG."""
+    pusher.invalidate()
+    pusher.push(blank_frame)
+    time.sleep(max(0.0, hold_s))
+    pusher.invalidate()
+    pusher.push(new_frame)
 
 
 def _runs(indices: np.ndarray) -> list[tuple[int, int]]:

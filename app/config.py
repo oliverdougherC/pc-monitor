@@ -40,6 +40,8 @@ DEFAULTS = {
         # false = serial-transport budget mode: bands become plain level bars and
         # nothing animates except the digits (see README bandwidth note)
         "trend_bands": True,
+        "transition": "wipe",           # "wipe" | "none" on idle↔game reflow
+        "transition_hold_s": 0.12,      # dark-frame hold before the new layout
     },
 }
 

@@ -14,7 +14,13 @@ shows up in the browser within a tick — no restart, no refresh needed.
 
 Per-state "push" stats (changed-pixel fraction + how many bands a partial
 update would need) are reported the same way app/output.py would do it, so the
-design can be judged against what the panel actually has to redraw.
+design can be judged against what the panel actually has to redraw. A third
+number, "swap", is the cost of the idle→game transition itself: one snapshot and
+one history rendered in both shapes.
+
+Bytes are reported twice, because they mean different things per revision: PNG at
+full size is what TUR_USB puts on the wire (the driver encodes every push), while
+width*height*2 is what a 115200-baud serial revision receives.
 """
 from __future__ import annotations
 
@@ -137,9 +143,14 @@ function tick(){
     if (j.push.idle) {
       const p = j.push.idle.bytes_partial_png + j.push.game.bytes_partial_png;
       const r = j.push.idle.bytes_partial + j.push.game.bytes_partial;
+      const sw = j.swap || {};
+      const swap = sw.bytes_partial ?
+        ` · idle→game swap (${sw.mode}, ${sw.bands} band(s)): ` +
+        `${(sw.bytes_partial_png/1024).toFixed(1)} KB PNG / ` +
+        `${(sw.bytes_partial/1024).toFixed(0)} KB raw = ${(sw.bytes_partial/14400).toFixed(1)} s serial` : '';
       document.getElementById('link').textContent =
         `wire: ~${(p/1024).toFixed(0)} KB/s → ${(p/1e6*1000).toFixed(0)} ms/frame on TUR_USB · ` +
-        `raw ${(r/1024).toFixed(0)} KB/s → ${(r/14400).toFixed(1)} s/frame on 115200 serial`;
+        `raw ${(r/1024).toFixed(0)} KB/s → ${(r/14400).toFixed(1)} s/frame on 115200 serial` + swap;
       const b = document.getElementById('trends');
       b.classList.toggle('on', !!j.trends);
     }
@@ -252,6 +263,10 @@ class Engine:
         self.prev: dict[str, np.ndarray | None] = {s: None for s in STATES}
         self.diff: dict[str, dict] = {s: {"mode": "init", "changed": 1.0, "bands": 1}
                                      for s in STATES}
+        # cost of the idle->game swap itself: the two frames differ only in the
+        # bottom strip now, and that is the number that decides whether a serial
+        # board can survive a mode change at all
+        self.swap: dict | None = None
         self.tick_n = 0
         self.reloads = 0
         self.reloaded_at: float | None = None
@@ -368,9 +383,17 @@ class Engine:
         dt = (time.perf_counter() - t0) * 1000.0
         diffs = {s: diff_report(self.prev[s], np.asarray(frames[(s, 0)], np.uint8))
                  for s in STATES}
+        # What a state change actually costs: the SAME telemetry and the SAME
+        # history rendered in both shapes (the demo feeds its two panes from
+        # separate streams, so diffing those would measure the data, not the
+        # layout). One extra render, ~8 ms.
+        shared = self.layouts["game"].render(sg, "idle", (0, 0))
+        swap = diff_report(np.asarray(shared, np.uint8),
+                           np.asarray(frames[("game", 0)], np.uint8))
         with self.lock:
             self.base = frames
             self.diff = diffs
+            self.swap = swap
             self.render_ms = round(dt, 1)
             self.tick_n += 1
             self.error = None
@@ -404,7 +427,7 @@ class Engine:
                 "backend": self.backend + (" (sim)" if self.demo else ""),
                 "tick": self.tick_n, "reloads": self.reloads,
                 "reloaded": self.reloaded_at, "now": time.time(),
-                "render_ms": self.render_ms, "push": self.diff,
+                "render_ms": self.render_ms, "push": self.diff, "swap": self.swap,
                 "trend_s": round(self.samples / max(self.hz, 0.001)),
                 "trends": bool(self.cfg["layout"].get("trend_bands", True)),
                 "error": self.error, "uptime_s": round(time.time() - self.started, 1),

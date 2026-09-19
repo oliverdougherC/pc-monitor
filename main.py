@@ -22,7 +22,7 @@ from app import config as cfgmod
 from app.burnin import BurnIn
 from app.gamewatch import GameWatch
 from app.layout import Layout
-from app.output import DiffPusher
+from app.output import DiffPusher, wipe, wipe_supported
 from app.power import estimate
 from app.sensors import make_hub
 
@@ -80,6 +80,10 @@ def main() -> None:
     lcd = None if dump_mode else make_lcd(cfg)
     pusher = None if dump_mode else DiffPusher(lcd)
     last_shift = burn.shift()
+    # idle→game reflow is hidden by a dark frame; serial boards can't afford it
+    can_wipe = not dump_mode and wipe_supported(cfg["display"]["revision"], cfg)
+    hold_s = float(cfg["layout"].get("transition_hold_s", 0.12))
+    prev_state = None
 
     from app.sensors.demo import DemoBackend
     demo = hub.backend if isinstance(hub.backend, DemoBackend) else None
@@ -96,6 +100,8 @@ def main() -> None:
         tick_dt = t0
 
         state = args.force_state or watch.tick(snap, dt)
+        state_changed = prev_state is not None and state != prev_state
+        prev_state = state
         if demo is not None:
             demo.game = state == "game"
 
@@ -139,7 +145,10 @@ def main() -> None:
                 return
         else:
             assert pusher is not None
-            pusher.push(frame)
+            if state_changed and can_wipe:
+                wipe(pusher, layout.blank(), frame, hold_s)
+            else:
+                pusher.push(frame)
             if shift != last_shift:
                 last_shift = shift
 

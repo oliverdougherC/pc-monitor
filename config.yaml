@@ -83,3 +83,9 @@ layout:
   # where one full frame would take ~68 s. Set false for those boards: the bands
   # collapse to plain level bars and only the digits change.
   trend_bands: true
+  # idle <-> game: the three bottom slots swap content (RAM|DISK|NET -> FRAMES|RAM|DISK).
+  # "wipe" pushes a dark frame, holds, then the new layout, so the old one does not
+  # ghost through the panel's slow pixels. Ignored on the serial revisions (A/B/C/D,
+  # WeAct), where an extra frame is physically unaffordable. "none" never wipes.
+  transition: wipe
+  transition_hold_s: 0.12

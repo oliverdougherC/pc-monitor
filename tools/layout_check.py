@@ -68,10 +68,7 @@ def build(case: dict, state: str) -> Snapshot:
 
 
 def panels_for(state: str):
-    return {**({"cpu": layout_mod.IDLE_TOP["cpu"], "gpu": layout_mod.IDLE_TOP["gpu"]}
-               if state == "idle" else
-               {"cpu": layout_mod.GAME_TOP["cpu"], "fps": layout_mod.GAME_TOP["fps"],
-                "gpu": layout_mod.GAME_TOP["gpu"]}),
+    return {"cpu": layout_mod.TOP_BOX["cpu"], "gpu": layout_mod.TOP_BOX["gpu"],
             **{f"bot:{k}": v for k, v in layout_mod.BOT_BOX[state].items()},
             "power": layout_mod.POWER_BOX}
 

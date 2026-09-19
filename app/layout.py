@@ -5,10 +5,13 @@ Design rules:
 - CPU+RAM blue, GPU green, storage white, network pink, frametime tan
 - big thick values (JetBrains Mono ExtraBold: tabular digits, no jitter),
   small dim labels
-- one panel slot language in both states, so the screen does not have to be
-  relearned when game mode starts:
+- the top half (CPU left, GPU right) and the power strip are IDENTICAL in both
+  states — permanent furniture. Only the three bottom slots change content
+  (idle RAM|DISK|NET → game FRAMES|RAM|DISK), so switching to a game is a strip
+  event, not a reflow: the glance points never move and nothing has to be relearned.
+- within a panel, one slot language everywhere, in both states:
     label → big values (baseline-aligned) → dim captions → 60s trend band →
-    detail row → power row (dim caption left, value right)
+    detail row → value row (dim caption left, value right)
 - the trend band is the same element everywhere: a TRACK rectangle, a muted
   60s polyline (muted by blending toward TRACK so it never competes with the
   numbers), a bright dot on "now", and optionally a 4px level bar along its
@@ -44,14 +47,19 @@ PINK = (255, 106, 182)
 W, H = 800, 480
 INNER = 12                 # content inset inside a panel
 
-# panel boxes: (x0, y0, x1, y1), landscape pixels
-IDLE_TOP = {"cpu": (12, 12, 394, 224), "gpu": (406, 12, 788, 224)}
-GAME_TOP = {"cpu": (12, 12, 238, 224), "fps": (250, 12, 550, 224), "gpu": (562, 12, 788, 224)}
-# in-game drops NETWORK and widens RAM + DISK into two panels
+# Panel geometry. TOP_BOX is the SAME in both states — the top half is permanent
+# furniture (CPU left, GPU right, big digits) so the glance points never move
+# when a game starts. Only the bottom three slots change content:
+#   idle  RAM   | DISK | NETWORK
+#   game  FRAMES| RAM  | DISK          (network drops out, like the old design)
+# Power strip is likewise permanent. The state change is therefore a strip-level
+# event, and the wipe in main.py covers even that.
+TOP_BOX = {"cpu": (12, 12, 394, 224), "gpu": (406, 12, 788, 224)}
 BOT_BOX = {
     "idle": {"ram": (12, 234, 294, 424), "disk": (306, 234, 540, 424),
              "net": (552, 234, 788, 424)},
-    "game": {"ram": (12, 234, 394, 424), "disk": (406, 234, 788, 424)},
+    "game": {"frames": (12, 234, 294, 424), "ram": (306, 234, 540, 424),
+             "disk": (552, 234, 788, 424)},
 }
 POWER_BOX = (12, 436, 788, 472)
 
@@ -142,16 +150,16 @@ class Layout:
                plain: bool = False):
         """TRACK band + muted 60s polyline (newest at the right edge) + 'now' dot.
         level: optional 0..1 fraction drawn as a bar along the bottom edge.
-        plain: trend bands switched off (serial-budget mode) — the band becomes a
-        solid level bar, with no polyline and no 'waiting for data' axis."""
+        plain: trend bands switched off (serial-budget mode) — the band collapses
+        to a static TRACK rectangle plus a solid level bar, so nothing inside it
+        can ever change and it costs zero bytes per tick."""
+        d.rectangle((x0, y0, x1, y1), fill=TRACK)
         if plain:
             if level is not None:
                 f = max(0.0, min(1.0, float(level)))
-                d.rectangle((x0, y0, x1, y1), fill=TRACK)
                 if f > 0:
                     d.rectangle((x0, y0, x0 + max(2, int((x1 - x0) * f)), y1), fill=color)
             return
-        d.rectangle((x0, y0, x1, y1), fill=TRACK)
         if level is None:
             bar_h = 0
         top, bot = y0 + 3, y1 - bar_h - 3
@@ -258,36 +266,45 @@ class Layout:
             ms = 1000.0 / f.fps
         h.push("frames.ms", ms)
 
-    # ---------- CPU / GPU panel (same slots in both states) ---------------------
+    # ---------- CPU / GPU panels: identical in both states -----------------------
     def _chip_panel(self, d, box, name: str, color, temp, load, sub: str,
                     power_w, power_label: str, series,
-                    big: int = 58, captions: bool = True, name_size: int = 15,
-                    pow_size: int = 24):
+                    big: int = 58, name_size: int = 15, pow_size: int = 24):
         x0, y0, x1, y1 = box
         cx0, cx1 = x0 + INNER, x1 - INNER
         self._panel(d, box)
         self._txt(d, (cx0, y0 + 24), name, (self.flabel, name_size), color, "ls")
 
-        big_base = y0 + (88 if captions else 82)
+        big_base = y0 + 88
         self._big(d, cx0, big_base, self.num(temp, "{:.0f}\u00b0"), big, color, "ls",
                   temp is not None)
         self._big(d, cx1, big_base, self.num(load, "{:.0f}%"), big, color, "rs",
                   load is not None)
-        if captions:
-            self._txt(d, (cx0, big_base + 22), "TEMP", (self.fsmall, 12), DIMMER, "ls")
-            self._txt(d, (cx1, big_base + 22), "LOAD", (self.fsmall, 12), DIMMER, "rs")
-            band_top = big_base + 30
-        else:
-            band_top = big_base + 16
+        self._txt(d, (cx0, big_base + 22), "TEMP", (self.fsmall, 12), DIMMER, "ls")
+        self._txt(d, (cx1, big_base + 22), "LOAD", (self.fsmall, 12), DIMMER, "rs")
 
         detail_y = y1 - 48
-        self._graph(d, cx0, band_top, cx1, detail_y - 24, series, color,
+        self._graph(d, cx0, big_base + 30, cx1, detail_y - 24, series, color,
                     span_min=4.0, level=None if load is None else load / 100.0,
                     plain=not self.trends)
 
         self._txt(d, (cx0, detail_y), sub, (self.fsmall, 18), color, "ls")
         self._row(d, cx0, cx1, y1 - 20, left=(power_label, DIMMER, 13),
                   right=self._value(power_w, "{:.0f} W", color, pow_size))
+
+    def _chips(self, d, snap: Snapshot, sx: int, sy: int) -> None:
+        """The permanent top half — literally the same call in both states."""
+        c, g = snap.cpu, snap.gpu
+        self._chip_panel(d, _off(TOP_BOX["cpu"], sx, sy), "CPU", BLUE,
+                         c.temp_c, c.load_pct,
+                         f"PEAK {self.ghz(c.clock_max_mhz)}  AVG {self.ghz(c.clock_avg_mhz)} GHz",
+                         c.power_w, "PKG POWER", self._series("cpu.temp"))
+        vram_gb = g.vram_used_mb / 1000 if g.vram_used_mb else None
+        self._chip_panel(d, _off(TOP_BOX["gpu"], sx, sy), "GPU", GREEN,
+                         g.temp_c, g.load_pct,
+                         f"CORE {self.num(g.core_mhz, '{:.0f}')} MHz   "
+                         f"VRAM {self.num(vram_gb, '{:.1f}')} GB",
+                         g.power_w, "BOARD POWER", self._series("gpu.temp"))
 
     # ---------- bottom row: RAM --------------------------------------------------
     def _ram_panel(self, d, box, snap: Snapshot) -> None:
@@ -312,61 +329,71 @@ class Layout:
 
     # ---------- bottom row: paired-rate panel (DISK / NETWORK) -------------------
     def _rate_panel(self, d, box, title, color, lab_a, val_a, ser_a,
-                    lab_b, val_b, ser_b, wide: bool) -> None:
+                    lab_b, val_b, ser_b) -> None:
         x0, y0, x1, y1 = box
         cx0, cx1 = x0 + INNER, x1 - INNER
         self._panel(d, box)
         self._txt(d, (cx0, y0 + 24), title, (self.flabel, 15), color, "ls")
         if not self.trends:
             # serial budget mode: no history bands at all — stacked rows spaced to
-            # fill the panel. Same shape in both widths on purpose: two side-by-side
-            # 10-char rate columns ("999.9 MB/s") overlap in a 358 px column.
+            # fill the panel. Two side-by-side 10-char rate columns ("999.9 MB/s")
+            # would overlap in a 210 px column, so the rows stay stacked either way.
             mid = (y0 + 34 + y1 - 12) // 2
-            vsize = 26
             for off, lab, val in ((mid - 34, lab_a, val_a), (mid + 46, lab_b, val_b)):
                 self._row(d, cx0, cx1, off, left=(lab, DIMMER, 14),
-                          right=self._rate_value(val, color, vsize))
+                          right=self._rate_value(val, color, 26))
             d.line((cx0, mid + 4, cx1, mid + 4), fill=BORDER, width=1)
             return
-        if wide:
-            # two columns: caption / big value / graph under each
-            colw = int((cx1 - cx0 - 30) / 2)
-            for col, (lab, val, ser) in enumerate(((lab_a, val_a, ser_a), (lab_b, val_b, ser_b))):
-                left = col == 0
-                tx = cx0 if left else cx1
-                gx0 = cx0 + col * (colw + 30)
-                gx1 = gx0 + colw
-                self._txt(d, (tx, y0 + 54), lab, (self.fsmall, 13), DIMMER,
-                          "ls" if left else "rs")
-                self._txt(d, (tx, y0 + 98), self.rate(val), (self.fval, 28),
-                          color if val is not None else DIMMER,
-                          "ls" if left else "rs")
-                self._graph(d, gx0, y0 + 112, gx1, y0 + 162, ser, color, span_min=1.0,
-                            plain=not self.trends)
-        else:
-            # stacked rows: caption + value on one baseline, graph under each
-            for row, (lab, val, ser) in enumerate(((lab_a, val_a, ser_a), (lab_b, val_b, ser_b))):
-                base = y0 + 58 + row * 80
-                self._row(d, cx0, cx1, base, left=(lab, DIMMER, 14),
-                          right=self._rate_value(val, color, 26))
-                self._graph(d, cx0, base + 8, cx1, base + 44, ser, color, span_min=1.0,
-                            plain=not self.trends)
-            d.line((cx0, y0 + 100, cx1, y0 + 100), fill=BORDER, width=1)
+        # stacked rows: caption + value on one baseline, graph under each
+        for row, (lab, val, ser) in enumerate(((lab_a, val_a, ser_a), (lab_b, val_b, ser_b))):
+            base = y0 + 58 + row * 80
+            self._row(d, cx0, cx1, base, left=(lab, DIMMER, 14),
+                      right=self._rate_value(val, color, 26))
+            self._graph(d, cx0, base + 8, cx1, base + 44, ser, color, span_min=1.0,
+                        plain=not self.trends)
+        d.line((cx0, y0 + 100, cx1, y0 + 100), fill=BORDER, width=1)
+
+    # ---------- bottom slot, game only: frame stats ------------------------------
+    def _frames_panel(self, d, box, snap: Snapshot) -> None:
+        """Frametime history + the numbers PresentMon will fill in Phase 2. Same
+        slot language as the other bottom panels: label, big value, band, rows."""
+        f = snap.frames
+        x0, y0, x1, y1 = box
+        cx0, cx1 = x0 + INNER, x1 - INNER
+        self._panel(d, box)
+        self._txt(d, (cx0, y0 + 22), "FRAMES", (self.flabel, 15), TAN, "ls")
+        self._big(d, cx0, y0 + 76, self.num(f.fps, "{:.0f}"), 56, TAN, "ls",
+                  f.fps is not None)
+        self._txt(d, (cx1, y0 + 76), "FPS", (self.flabel, 14), DIM, "rs")
+
+        ms = self.history.last("frames.ms")
+        self._row(d, cx0, cx1, y0 + 104, left=("FRAME TIME", DIMMER, 13),
+                  right=self._value(ms, "{:.1f} ms", TAN, 20))
+        target = float(self.cfg["game"].get("frametime_target_ms", 16.7))
+        self._graph(d, cx0, y0 + 112, cx1, y0 + 142, self._series("frames.ms"),
+                    TAN, span_min=2.0, target=target, plain=not self.trends)
+
+        self._pair(d, cx0, y0 + 168, "1% LOW", self.num(f.low1_pct), DIMMER, TAN, 13, 22,
+                   present=f.low1_pct is not None)
+        self._pair(d, 0, y0 + 168, "0.1% LOW", self.num(f.low01_pct), DIMMER, TAN, 13, 22,
+                   right_edge=cx1, present=f.low01_pct is not None)
 
     # ---------- shared bottom row dispatch ---------------------------------------
     def _bottom_row(self, img, d, snap: Snapshot, sx: int, sy: int, state: str) -> None:
-        boxes = BOT_BOX[state]
-        self._ram_panel(d, _off(boxes["ram"], sx, sy), snap)
-        disk_wide = len(boxes) == 2
-        self._rate_panel(d, _off(boxes["disk"], sx, sy), "DISK", WHITE,
-                         "READ", snap.disk_read_bps, self._series("disk.read"),
-                         "WRITE", snap.disk_write_bps, self._series("disk.write"),
-                         wide=disk_wide)
-        if "net" in boxes:
-            self._rate_panel(d, _off(boxes["net"], sx, sy), "NETWORK", PINK,
-                             "DOWN", snap.net_down_bps, self._series("net.down"),
-                             "UP", snap.net_up_bps, self._series("net.up"),
-                             wide=False)
+        for key, box in BOT_BOX[state].items():
+            b = _off(box, sx, sy)
+            if key == "ram":
+                self._ram_panel(d, b, snap)
+            elif key == "frames":
+                self._frames_panel(d, b, snap)
+            elif key == "disk":
+                self._rate_panel(d, b, "DISK", WHITE,
+                                 "READ", snap.disk_read_bps, self._series("disk.read"),
+                                 "WRITE", snap.disk_write_bps, self._series("disk.write"))
+            elif key == "net":
+                self._rate_panel(d, b, "NETWORK", PINK,
+                                 "DOWN", snap.net_down_bps, self._series("net.down"),
+                                 "UP", snap.net_up_bps, self._series("net.up"))
 
     # ---------- power strip ------------------------------------------------------
     def _power_strip(self, img, d, snap: Snapshot, sx: int, sy: int) -> None:
@@ -400,65 +427,16 @@ class Layout:
         sx, sy = shift
         img = Image.new("RGB", (self.w, self.h), BG)
         d = ImageDraw.Draw(img)
-        if state == "game":
-            self._game(d, snap, sx, sy)
-        else:
-            self._idle(d, snap, sx, sy)
-        self._bottom_row(img, d, snap, sx, sy, state)
-        self._power_strip(img, d, snap, sx, sy)
+        self._chips(d, snap, sx, sy)                      # permanent top half
+        self._bottom_row(img, d, snap, sx, sy, state)     # the mode-dependent strip
+        self._power_strip(img, d, snap, sx, sy)           # permanent bottom strip
         return img
 
-    def _idle(self, d, snap: Snapshot, sx: int, sy: int) -> None:
-        c, g = snap.cpu, snap.gpu
-        self._chip_panel(d, _off(IDLE_TOP["cpu"], sx, sy), "CPU", BLUE,
-                         c.temp_c, c.load_pct,
-                         f"PEAK {self.ghz(c.clock_max_mhz)}  AVG {self.ghz(c.clock_avg_mhz)} GHz",
-                         c.power_w, "PKG POWER", self._series("cpu.temp"),
-                         big=58, captions=True)
-        vram = (f"CORE {self.num(g.core_mhz, '{:.0f}')} MHz   "
-                f"VRAM {self.num(g.vram_used_mb / 1000 if g.vram_used_mb else None, '{:.1f}')} GB")
-        self._chip_panel(d, _off(IDLE_TOP["gpu"], sx, sy), "GPU", GREEN,
-                         g.temp_c, g.load_pct, vram, g.power_w, "BOARD POWER",
-                         self._series("gpu.temp"), big=58, captions=True)
-
-    def _game(self, d, snap: Snapshot, sx: int, sy: int) -> None:
-        c, g, f = snap.cpu, snap.gpu, snap.frames
-
-        # ---- CPU / GPU compact (same slots as idle, tighter) ----
-        self._chip_panel(d, _off(GAME_TOP["cpu"], sx, sy), "CPU", BLUE,
-                         c.temp_c, c.load_pct,
-                         f"{self.ghz(c.clock_max_mhz)} / {self.ghz(c.clock_avg_mhz)} GHz",
-                         c.power_w, "PKG POWER", self._series("cpu.temp"),
-                         big=42, captions=False, name_size=14, pow_size=22)
-        vram_gb = g.vram_used_mb / 1000 if g.vram_used_mb else None
-        self._chip_panel(d, _off(GAME_TOP["gpu"], sx, sy), "GPU", GREEN,
-                         g.temp_c, g.load_pct, f"{self.num(g.core_mhz, '{:.0f}')} MHz",
-                         g.power_w, f"VRAM {self.num(vram_gb, '{:.1f}')} GB",
-                         self._series("gpu.temp"),
-                         big=42, captions=False, name_size=14, pow_size=22)
-
-        # ---- frame stats + frametime history ----
-        box = _off(GAME_TOP["fps"], sx, sy)
-        x0, y0, x1, y1 = box
-        cx0, cx1 = x0 + INNER, x1 - INNER
-        mid = (x0 + x1) // 2
-        self._panel(d, box)
-        self._txt(d, (cx0, y0 + 24), "FRAMES", (self.flabel, 14), DIM, "ls")
-        self._big(d, mid, y0 + 92, self.num(f.fps, "{:.0f}"), 72, TAN, "ms",
-                  f.fps is not None)
-        self._txt(d, (mid, y0 + 114), "FPS", (self.flabel, 14), DIM, "ms")
-
-        ms = self.history.last("frames.ms")
-        self._row(d, cx0, cx1, y0 + 140, left=("FRAME TIME", DIMMER, 13),
-                  right=self._value(ms, "{:.1f} ms", TAN, 20))
-        target = float(self.cfg["game"].get("frametime_target_ms", 16.7))
-        self._graph(d, cx0, y0 + 148, cx1, y0 + 176, self._series("frames.ms"),
-                    TAN, span_min=2.0, target=target, plain=not self.trends)
-
-        self._pair(d, cx0, y1 - 14, "1% LOW", self.num(f.low1_pct), DIMMER, TAN, 13, 24,
-                   present=f.low1_pct is not None)
-        self._pair(d, 0, y1 - 14, "0.1% LOW", self.num(f.low01_pct), DIMMER, TAN, 13, 24,
-                   right_edge=cx1, present=f.low01_pct is not None)
+    def blank(self) -> Image.Image:
+        """Dark frame for the state-change wipe (`output.wipe`): hides the outgoing
+        layout so its slow pixels are not mid-transition when the new frame lands.
+        Near-black PNG-compresses to ~1 KB, so it is nearly free on TUR_USB."""
+        return Image.new("RGB", (self.w, self.h), BG)
 
     # ---------- burn-in exercise sweep --------------------------------------------
     def sweep(self, progress: float) -> Image.Image:
