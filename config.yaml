@@ -5,12 +5,22 @@ display:
   # Once hardware arrives set revision to the right protocol:
   #   SIMU = simulated display (web preview on http://localhost:5678)
   #   C    = Turing Smart Screen 5" (classic)      TUR_USB = newer TURZX USB models
-  revision: SIMU
+  # Connected unit (2026-09-23): enumerates as a built-in USB2.0 hub whose awake
+  # side is the CDC-ACM gadget 1d6b:0106 (serial 20080411) = COM port, with the
+  # sleeping side 1A86:CA21 "UsbMonitor"/"CT21INCH" used to wake it. That pairing
+  # is exactly what library/lcd/lcd_comm_rev_c.py auto-detects, so revision C.
+  revision: C
   com_port: AUTO
   # portrait/native panel dims (rotated to landscape below). 5" Turing = 480x800
   portrait_width: 480
   portrait_height: 800
   orientation: landscape
+  # Reboot the panel on every start. Off: the app handshakes first and only reaches
+  # for a reboot if the screen does not answer, because that reboot's write blocks
+  # forever on a panel whose USB endpoint has stopped draining - which looks like a
+  # broken app and is only fixable by pulling the cable. Set true to restore the
+  # vendor's always-reboot order.
+  reset_on_start: false
   brightness_idle: 45     # %
   brightness_game: 70     # %
   brightness_dim: 12      # % when nobody has touched the PC for a while
@@ -65,6 +75,32 @@ game:
   exit_after_s: 25
   # dashed reference line in the in-game frametime graph (16.7 ms = 60 fps)
   frametime_target_ms: 16.7
+  # Present-based detection: GAME when the foreground process is actually
+  # presenting frames (needs the `frames` source below, i.e. admin). The window
+  # heuristic above remains the fallback for light games under the present
+  # threshold and whenever ETW is unavailable.
+  present_detection: true
+
+# Real frame telemetry (fps / frametime / 1%/0.1% low) per process, from the
+# GameTechDev PresentMon ETW stream — zero injection, works for DX/Vulkan/GL/UWP.
+# Requires Administrator (ETW kernel session); without it the panel honestly
+# shows "--". Fetch the pinned binary once:
+#   powershell -File tools\fetch_presentmon.ps1
+frames:
+  source: auto          # auto | off
+  path: vendor/presentmon/presentmon.exe
+  min_present_fps: 24   # presenting at/above this ⇒ the process "is a game"
+  window_s: 60          # percentile window for the low counts
+  # Only frames the OS attributed to a display are counted — the honest "fps".
+  # But attribution is the OS/driver's call: where the flip path isn't attributed
+  # this flag filters everything away, so it has to be switchable.
+  exclude_dropped: true
+  # ETW session role. Same role = take the session over from the previous run of
+  # itself; a different role = capture alongside it. Empty means "main".
+  role:
+  # Diagnostic: write the raw capture here instead of streaming it. Frame stats
+  # are off by design in this mode — the file is the artifact (tools/ab_capture.ps1).
+  output_file:
 
 burnin:
   shift_every_min: 5       # global pixel-shift of the layout

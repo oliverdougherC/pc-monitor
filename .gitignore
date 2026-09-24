@@ -18,3 +18,12 @@ shots/
 /vendor/*
 !/vendor/README.md
 !/vendor/LOCK.txt
+
+# PresentMon: the binary is a download (tools/fetch_presentmon.ps1), but its
+# sha256 pin and provenance have to be tracked - with only LOCK.txt gone, a fresh
+# clone cannot tell which build it should have, and `-Verify` has nothing to
+# check against. Re-including the directory first is not optional: git cannot
+# un-ignore a file that lives under an excluded one.
+!/vendor/presentmon/
+/vendor/presentmon/*
+!/vendor/presentmon/LOCK.txt

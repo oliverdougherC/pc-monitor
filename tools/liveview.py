@@ -36,9 +36,9 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 ROOT = Path(__file__).resolve().parent.parent
-for _p in (str(ROOT), str(ROOT / "vendor" / "turing-smart-screen-python")):
+for _p in (str(ROOT / "vendor" / "turing-smart-screen-python"), str(ROOT)):
     if _p not in sys.path:
-        sys.path.insert(0, _p)
+        sys.path.insert(0, _p)  # ROOT last => ROOT wins name collisions (vendor has its own main.py)
 
 import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw, ImageEnhance  # noqa: E402
@@ -47,10 +47,12 @@ from app import config as cfgmod  # noqa: E402
 from app import history as history_mod  # noqa: E402
 from app import layout as layout_mod  # noqa: E402
 from app import power as power_mod  # noqa: E402
+from app.frames import FrameMonitor  # noqa: E402  (role="liveview": its own ETW session, so it coexists with main.py)
 from app.output import _runs  # noqa: E402  (same band-merge logic as the real pusher)
 from app.sensors import demo as demo_mod  # noqa: E402
 from app.sensors import make_hub  # noqa: E402
 from app.sensors.demo import DemoBackend  # noqa: E402
+from app.steamid import SteamIdentity  # noqa: E402
 
 STATES = ("idle", "game")
 # hot-reload order matters: each module keeps references to the ones before it
@@ -129,11 +131,19 @@ function tick(){
   for (const s of ['idle','game']) document.getElementById('img-'+s).src = q(s);
   fetch('/api/status?n='+S.n).then(r=>r.json()).then(j=>{
     const ago = j.reloaded ? Math.round((j.now - j.reloaded)) : null;
+    const f = j.frames || {};
+    let fseg;
+    if (f.source === 'demo') fseg = '';
+    else if (f.source === 'off') fseg = ' · frames <b>off</b>';
+    else if (f.name) fseg = ` · frames <b>${f.name}</b>` + (f.appid ? ` [${f.appid}]` : '') +
+                            ` <b>${Math.round(f.fps || 0)} fps</b>`;
+    else if (f.ok) fseg = ` · frames <i>live, nothing presenting</i>`;
+    else fseg = ` · frames <span style="color:#c98b93">${f.error || 'starting'}</span>`;
     document.getElementById('status').innerHTML =
       `backend <b>${j.backend}</b> · tick <b>${j.tick}</b> · ` +
       `hot-reloads <b>${j.reloads}</b>` + (ago===null?'':` (${ago}s ago)`) +
       ` · render <b>${j.render_ms} ms</b> · trend <b>${j.trend_s}s</b>` +
-      ` · watching <b>${j.watched}</b> files`;
+      ` · watching <b>${j.watched}</b> files` + fseg;
     for (const s of ['idle','game']) {
       const d = j.push[s] || {};
       document.getElementById('d-'+s).textContent =
@@ -252,12 +262,21 @@ def synth_frames(snap, t: float) -> None:
 class Engine:
     """Ticks telemetry, hot-reloads the layout code, keeps both frames."""
 
-    def __init__(self, cfg, backend: str, hz: float, synth: bool):
+    def __init__(self, cfg, backend: str, hz: float, synth: bool,
+                 frames_source: str = "auto"):
         self.cfg = cfg
         self.hz = hz
         self.backend = backend
         self.synth = synth
         self.demo = backend == "demo"
+        # real present-stream frame stats for the game pane (needs admin);
+        # the game pane follows the busiest presenting process, preferring a
+        # Steam-identified one — that IS the point of running it with --backend auto
+        self.frames_mon = None
+        self.steam = SteamIdentity()
+        self.frames_info: dict = {"source": "demo" if self.demo else frames_source}
+        if not self.demo and frames_source != "off":
+            self.frames_mon = FrameMonitor(cfg, role="liveview")
         self.lock = threading.Lock()
         self.base: dict[tuple[str, int], Image.Image] = {}
         self.prev: dict[str, np.ndarray | None] = {s: None for s in STATES}
@@ -363,11 +382,36 @@ class Engine:
         else:
             sg = self.hub_game.tick()
             si = sg
-            if self.synth:
-                synth_frames(sg, t)
+            self._fill_frames(sg, t)
         for s in {id(si): si, id(sg): sg}.values():
             s.power_total_w, _ = power_mod.estimate(s, self.cfg)
         return si, sg
+
+    def _fill_frames(self, sg, t: float) -> None:
+        """Game pane frame stats: the live ETW present stream when it's up —
+        following the busiest presenting process, preferring a Steam-identified
+        one — else the old synthetic placeholder (dev only), else honest --."""
+        info: dict = {"source": "off"}
+        mon = self.frames_mon
+        if mon is not None:
+            info = {"source": "auto", "ok": mon.ok, "error": mon.error}
+            if mon.ok:
+                pres = mon.presenters()
+                info["n_presenters"] = len(pres)
+                if pres:
+                    pid, pr = max(pres.items(),
+                                  key=lambda kv: (self.steam.is_steam_game(kv[0]),
+                                                  kv[1].fps))
+                    fs = mon.stats(pid)
+                    if fs is not None:
+                        sg.frames = fs
+                        info.update(pid=pid, name=pr.name, appid=self.steam.appid(pid),
+                                    fps=round(float(fs.fps or 0.0), 1))
+                        self.frames_info = info
+                        return
+        self.frames_info = info
+        if self.synth:
+            synth_frames(sg, t)
 
     def step(self) -> None:
         self._maybe_reload()
@@ -430,6 +474,7 @@ class Engine:
                 "render_ms": self.render_ms, "push": self.diff, "swap": self.swap,
                 "trend_s": round(self.samples / max(self.hz, 0.001)),
                 "trends": bool(self.cfg["layout"].get("trend_bands", True)),
+                "frames": self.frames_info,
                 "error": self.error, "uptime_s": round(time.time() - self.started, 1),
                 "watched": len(WATCH_FILES),
             }
@@ -445,8 +490,8 @@ def importlib_reload(mod):
         raise RuntimeError(tb) from None
 
 
-def run(cfg, backend, hz, port, synth) -> None:
-    engine = Engine(cfg, backend, hz, synth)
+def run(cfg, backend, hz, port, synth, frames_source="auto") -> None:
+    engine = Engine(cfg, backend, hz, synth, frames_source)
 
     # first tick on the main thread so the page always has something to show
     try:
@@ -546,13 +591,15 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=5680)
     ap.add_argument("--hz", type=float, default=1.0, help="render ticks/second")
     ap.add_argument("--synth-fps", default="auto", choices=["auto", "on", "off"],
-                    help="fill frame stats when the backend has none (game layout)")
+                    help="fake frame stats when the real stream has none (dev only)")
+    ap.add_argument("--frames-source", default="auto", choices=["auto", "off"],
+                    help="auto = PresentMon ETW for real per-process frame stats (needs admin)")
     args = ap.parse_args()
 
     cfg = cfgmod.load(args.config)
     backend = args.backend.lower()
     synth = args.synth_fps == "on" or (args.synth_fps == "auto" and backend != "demo")
-    run(cfg, backend, args.hz, args.port, synth)
+    run(cfg, backend, args.hz, args.port, synth, args.frames_source)
 
 
 if __name__ == "__main__":

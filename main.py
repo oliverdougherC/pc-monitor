@@ -10,54 +10,32 @@ Run:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "vendor" / "turing-smart-screen-python"))
 
 from app import config as cfgmod
 from app.burnin import BurnIn
+from app.display import app_log, make_lcd
+from app.frames import FrameMonitor
 from app.gamewatch import GameWatch
 from app.layout import Layout
 from app.output import DiffPusher, wipe, wipe_supported
 from app.power import estimate
 from app.sensors import make_hub
+from app.steamid import SteamIdentity
 
 
-def make_lcd(cfg: dict):
-    rev = str(cfg["display"]["revision"]).upper()
-    w, h = int(cfg["display"]["portrait_width"]), int(cfg["display"]["portrait_height"])
-    port = cfg["display"]["com_port"]
-
-    from library.lcd.lcd_comm import Orientation  # noqa: F401 (kept for symmetry)
-    if rev == "SIMU":
-        from library.lcd.lcd_simulated import LcdSimulated
-        lcd = LcdSimulated(display_width=w, display_height=h)
-    else:
-        cls_map = {
-            "A": ("library.lcd.lcd_comm_rev_a", "LcdCommRevA"),
-            "B": ("library.lcd.lcd_comm_rev_b", "LcdCommRevB"),
-            "C": ("library.lcd.lcd_comm_rev_c", "LcdCommRevC"),
-            "D": ("library.lcd.lcd_comm_rev_d", "LcdCommRevD"),
-            "TUR_USB": ("library.lcd.lcd_comm_turing_usb", "LcdCommTuringUSB"),
-            "WEACT_A": ("library.lcd.lcd_comm_weact_a", "LcdCommWeActA"),
-            "WEACT_B": ("library.lcd.lcd_comm_weact_b", "LcdCommWeActB"),
-        }
-        if rev not in cls_map:
-            raise SystemExit(f"unknown display revision: {rev}")
-        import importlib
-        mod = importlib.import_module(cls_map[rev][0])
-        lcd = getattr(mod, cls_map[rev][1])(com_port=port, display_width=w, display_height=h)
-
-    lcd.Reset()
-    lcd.InitializeComm()
-    if str(cfg["display"]["orientation"]).lower() == "landscape":
-        from library.lcd.lcd_comm import Orientation
-        lcd.SetOrientation(Orientation.LANDSCAPE)
-    return lcd
+def status(msg: str) -> None:
+    """Report something worth reading: print() for a console run, and log.log,
+    because the scheduled task runs pythonw.exe, where sys.stdout is None and
+    every print() silently vanishes."""
+    print(msg)
+    app_log(msg)
 
 
 def main() -> None:
@@ -76,9 +54,29 @@ def main() -> None:
     watch = GameWatch(cfg)
     burn = BurnIn(cfg)
 
+    # real per-process present telemetry (ETW, needs admin); degrades to None/{}
+    frames_mon = FrameMonitor(cfg) if str(cfg["frames"].get("source", "auto")) != "off" else None
+    steam = SteamIdentity()
+    if frames_mon is not None:
+        import atexit
+        atexit.register(frames_mon.close)  # don't leave an orphaned ETW session behind
+        if frames_mon.error:
+            status(f"[frames] {frames_mon.error} — frame stats off, legacy detection only")
+
     dump_mode = bool(args.dump)
     lcd = None if dump_mode else make_lcd(cfg)
     pusher = None if dump_mode else DiffPusher(lcd)
+    panel = "headless dump" if dump_mode else f"{lcd.get_width()}x{lcd.get_height()}"
+    if frames_mon is None:
+        frames_desc = "off"
+    elif frames_mon.output_file:
+        frames_desc = "file-capture"
+        status(f"[frames] raw capture → {frames_mon.output_file}; frame stats off by design")
+    else:
+        frames_desc = "starting"
+    status(f"[start] pid={os.getpid()} ppid={os.getppid()} backend={type(hub.backend).__name__} "
+           f"revision={cfg['display']['revision']} port={cfg['display']['com_port']} panel={panel} "
+           f"frames={frames_desc} interval={cfg['sensors']['interval_s']}s")
     last_shift = burn.shift()
     # idle→game reflow is hidden by a dark frame; serial boards can't afford it
     can_wipe = not dump_mode and wipe_supported(cfg["display"]["revision"], cfg)
@@ -93,15 +91,52 @@ def main() -> None:
     time.sleep(0.2)
 
     tick_dt = time.monotonic()
+    frames_reported = frames_mon is None
+    frames_warned: str | None = None
+    min_gpu = float(cfg["game"]["min_gpu_load"])
     while True:
         t0 = time.monotonic()
         snap = hub.tick()
         dt = t0 - tick_dt
         tick_dt = t0
 
-        state = args.force_state or watch.tick(snap, dt)
+        presenters = frames_mon.presenters() if frames_mon is not None else None
+        if frames_mon is not None and not frames_reported:
+            if frames_mon.ok:
+                status("[frames] presentmon session live — present-based detection on"
+                       + ("" if frames_mon.job_error is None else
+                          # the child can outlive a hard kill of this process; harmless
+                          # across restarts (the session is taken over), worth knowing
+                          f" (child not in a kill-on-exit job, winerr={frames_mon.job_error})"))
+                frames_reported = True
+            elif frames_mon.error:
+                status(f"[frames] {frames_mon.error} — frame stats off, legacy detection only")
+                frames_reported = True
+        if frames_mon is not None:
+            # A dead stream is only news while something is drawing: a still
+            # desktop presents no frames, and that is not a fault.
+            busy = bool(presenters) or (snap.gpu.load_pct or 0.0) >= min_gpu
+            frames_mon.observe(busy, dt)
+            warn = frames_mon.stream_warning()
+            if warn and warn != frames_warned:
+                frames_warned = warn
+                status(warn)
+
+        state = args.force_state or watch.tick(snap, dt, presenters=presenters, steam=steam)
+        if state == watch.GAME and frames_mon is not None and watch.game_pid is not None:
+            fs = frames_mon.stats(watch.game_pid)
+            if fs is not None:
+                snap.frames = fs
         state_changed = prev_state is not None and state != prev_state
         prev_state = state
+        if state_changed:
+            # which detector fired, and on what — the one line to read when the
+            # panel is in the wrong mode (see README: frame stats & game detection).
+            # `frames=no` here means the panel will read `--`: `snap.frames` is
+            # always the dataclass, so only its fps field can say whether the
+            # present stream actually filled it in.
+            status(f"[state] {watch.state} pid={watch.game_pid} steam={watch.steam_appid} "
+                   f"frames={'no' if snap.frames.fps is None else f'{snap.frames.fps:.0f}'}")
         if demo is not None:
             demo.game = state == "game"
 

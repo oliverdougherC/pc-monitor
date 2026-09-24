@@ -15,6 +15,11 @@ DEFAULTS = {
         "portrait_width": 480,
         "portrait_height": 800,
         "orientation": "landscape",
+        # Reboot the panel on every start, the way the vendored examples do. Off by
+        # default: a screen that answers HELLO gets a full repaint a second later
+        # anyway, and that reboot's blocking write is what hangs when the panel's
+        # USB endpoint has stopped draining (see app/display.py).
+        "reset_on_start": False,
         "brightness_idle": 45,
         "brightness_game": 70,
         "brightness_dim": 12,
@@ -30,6 +35,18 @@ DEFAULTS = {
         "fullscreen_heuristic": True, "min_gpu_load": 10,
         "enter_after_s": 4, "exit_after_s": 25,
         "frametime_target_ms": 16.7,   # dashed reference line in the frametime graph
+        "present_detection": True,     # foreground-PID-is-presenting detection
+                                       # (needs frames.source working; else legacy heuristic)
+    },
+    "frames": {
+        "source": "auto",              # auto | off (off = no ETW child, panel shows --)
+        "path": "vendor/presentmon/presentmon.exe",
+        "min_present_fps": 24,         # presenting >= this ⇒ "is rendering a game"
+        "window_s": 60,                # frametime ring length = lows/percentile window
+        "exclude_dropped": True,       # count only frames that reached the screen
+        "role": "",                    # ETW session role ("" = "main"; A/B runs)
+        "extra_args": [],              # extra presentmon args (diagnostics / A-B)
+        "output_file": "",             # diagnostic: raw CSV to file, frame stats off
     },
     "burnin": {"shift_every_min": 5, "exercise_every_h": 8, "exercise_s": 12},
     "layout": {
