@@ -96,8 +96,16 @@ class LhmBackend:
             if not ok:
                 continue
             v = self._objs[idx].Value
-            if v is not None and v == v:
-                out.append(float(v))
+            if v is None or v != v:
+                continue
+            v = float(v)
+            # Without admin there is no ring0 driver, and LHM happily creates its
+            # CPU temp/power/clock sensors reporting 0.0. A bright "0°" is a lie —
+            # non-positive readings for these types are "missing", so the panel
+            # draws its honest dim "--" instead. (Load legitimately reads 0.)
+            if sensor_type in ("Temperature", "Power", "Clock") and v <= 0:
+                continue
+            out.append(v)
         return out
 
     def _first(self, hw_types, sensor_type, names: tuple[str, ...], exclude=()):
