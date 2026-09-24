@@ -1,8 +1,8 @@
 """Debug helper: dump every hardware + sensor LibreHardwareMonitor sees.
 Run elevated and redirect to a file to see what ring0 exposes."""
 import sys, time
-sys.path.insert(0, ".")
-sys.path.insert(0, "vendor/turing-smart-screen-python")
+sys.path.insert(0, ".")  # our tree first: vendor has its own main.py
+sys.path.append("vendor/turing-smart-screen-python")
 from app import config as cfgmod
 from app.sensors.lhm import LhmBackend
 

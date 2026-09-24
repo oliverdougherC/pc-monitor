@@ -1,7 +1,7 @@
 """Debug helper: print what the selected sensor backend actually reports."""
 import sys, time
-sys.path.insert(0, ".")
-sys.path.insert(0, "vendor/turing-smart-screen-python")
+sys.path.insert(0, ".")  # our tree first: vendor has its own main.py
+sys.path.append("vendor/turing-smart-screen-python")
 from app import config as cfgmod
 from app.sensors import make_hub
 from app.power import estimate
