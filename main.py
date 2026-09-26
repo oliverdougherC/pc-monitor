@@ -376,9 +376,12 @@ def main() -> None:
         if demo is not None:
             demo.game = state == "game"
 
-        total, _ = g.run("power-model", lambda: estimate(snap, cfg), (None, None))
-        if total is not None:
-            snap.power_total_w = total
+        # The estimate can legitimately carry no total (an unreadable component is
+        # not zero watts); storing that None is the point: the snapshot keeps
+        # saying unavailable/partial instead of holding an old watt figure.
+        est = g.run("power-model", lambda: estimate(snap, cfg), None)
+        if est is not None:
+            snap.power_total_w = est.total_w
 
         # ---- the one light decision: dark? bright? warm? ----------------------
         # The night read touches files owned by another process (CloudStore rewrites

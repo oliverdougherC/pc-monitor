@@ -49,6 +49,16 @@ DEFAULTS = {
     "power": {
         "base_w": 34, "rail_overhead_pct": 9, "cpu_tdp": 170, "gpu_tdp": 575,
         "gradient_min_w": 50, "gradient_max_w": 1000, "gradient_gamma": 0.75,
+        # A whole-system number is only as whole as its inputs: with a CPU or
+        # GPU reading completely missing, the strip shows "-- W partial" (or
+        # unavailable) instead of a total that silently excludes it. Set false
+        # to accept a known-components-only figure as a floor - the panel will
+        # still label it "partial".
+        "require_complete": True,
+        # Older than this and the snapshot behind the number is labelled
+        # "stale": a sensor tick that failed leaves the loop reusing the last
+        # snapshot, and yesterday's watts must not pose as this second's.
+        "max_age_s": 8.0,
         # Follow the machine, not just the idle timer: dark while it is asleep, while
         # the session is locked, and (by default) whenever Windows has turned the
         # displays off. Turn these off if you want the panel to stay lit through

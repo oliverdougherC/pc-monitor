@@ -384,7 +384,7 @@ class Engine:
             si = sg
             self._fill_frames(sg, t)
         for s in {id(si): si, id(sg): sg}.values():
-            s.power_total_w, _ = power_mod.estimate(s, self.cfg)
+            s.power_total_w = power_mod.estimate(s, self.cfg).total_w
         return si, sg
 
     def _fill_frames(self, sg, t: float) -> None:

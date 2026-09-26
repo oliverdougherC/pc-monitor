@@ -38,6 +38,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\lights_selftest.py         # what the panel does about each of those
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
 .venv\Scripts\python tools\panel_link_selftest.py     # link survives raise/hang, rebuilds, walks its device ladder
+.venv\Scripts\python tools\power_estimate_selftest.py  # missing sensors never become a low "measured" total
 .venv\Scripts\python tools\fault_selftest.py          # nothing outside the per-tick guard (AST-checked)
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
 ```
@@ -61,7 +62,7 @@ state, how many bands a partial panel update would need (same math as
 | `app/sensors/` | backends: `lhm` (LibreHardwareMonitorLib via pythonnet, full fidelity incl. package power & per-core clocks), `fallback` (psutil+NVML, no admin), `demo` |
 | `app/frames.py` | real fps/frametime/1%–0.1% low per process: spawns PresentMon (ETW, admin), parses the present stream, answers "who is rendering" and "at what frame rate", and *holds* a stopped game's last number (marked stale) instead of inventing one |
 | `app/steamid.py` | Steam identity: `SteamAppId`/`SteamGameId` env vars → which pids are Steam games + AppID (enrichment, never the detection core) |
-| `app/power.py` | total-watt estimate (base+cpu+gpu) & green→red 50–1000 W gradient |
+| `app/power.py` | total-watt estimate (base+cpu+gpu) that carries its own provenance (measured/modelled/partial/stale) & green->red 50-1000 W gradient |
 | `app/gamewatch.py` | idle/game state, scored by confidence (STRONG/MED/LEGACY/NONE) with a **locked frame target** an alt-tab cannot steal; hysteresis per tier |
 | `app/layout.py` | 800×480 rendering: permanent top half + mode strip, trend bands, worst-case-fit type, night-mode LUT applied to the finished frame |
 | `app/history.py` | bounded ring buffers feeding the trend bands |
@@ -76,6 +77,7 @@ state, how many bands a partial panel update would need (same math as
 | `tools/hoststate_selftest.py` | no admin: replays power/session broadcasts through the real state machine (sleep, monitor timeout, lock, frozen-loop fallback, slow start) |
 | `tools/nightlight_probe.py` | prints what Windows actually stores; `--selftest` replays the captured blobs, `--watch 30` follows a manual toggle |
 | `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the disable/enable journaling (including "a refused disable is never followed by an enable") |
+| `tools/power_estimate_selftest.py` | the power model + strip across every input shape: all sensors missing, one side missing, complete measured, load-only modelling, stale data and recovery - no missing-data case may render as an apparently-measured low total, with the drawn text and units asserted, not just the model |
 | `tools/lights_selftest.py` | the light decision end to end: sleep, displays-off, idle, dim, precedence, the night cap and LUT, and a rendered frame measured before/after the warmth |
 | `tools/fault_selftest.py` | the per-tick guard: fallback + one log line per fault, `SystemExit` contained, Ctrl-C not — plus an AST pass that fails if any subsystem call in the loop has escaped the guard |
 | `tools/hoststate_probe.py` | live watcher at 2 Hz: what each power/session event did to the state (`--trace` for raw window messages) |

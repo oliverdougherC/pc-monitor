@@ -18,7 +18,10 @@ Design rules:
   bottom edge. Gaps (None) are drawn as gaps, never interpolated.
 - type sizes are chosen for the WORST-CASE string per slot, so a value can
   never collide with its neighbour, and never changes size while it updates.
-- total system power always in the bottom strip, green→red over 50W→1000W.
+- total system power always in the bottom strip, green->red over 50W->1000W,
+  with one provenance word beside it ("measured input", "modelled input",
+  "partial", "stale", "unavailable"): a bare watt figure is only ever drawn
+  when the estimate is whole; otherwise the strip says so.
 - geometry lives in the *_BOX tables; content is inset by INNER and every line
   is placed by baseline, so rows stay aligned when fonts change.
 """
@@ -29,7 +32,7 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 
 from app.history import History
-from app.power import power_color, power_watts_for_display
+from app.power import estimate, power_color
 from app.snapshot import Snapshot
 
 BG = (9, 11, 15)
@@ -419,7 +422,11 @@ class Layout:
         self._panel(d, box)
         self._txt(d, (cx0, y0 + 24), "TOTAL POWER", (self.flabel, 14), DIM, "ls")
 
-        w = power_watts_for_display(snap, self.cfg)
+        # Recomputed from the snapshot's fields, never read back out of
+        # `snap.power_total_w`: what the panel may show is a question about the
+        # sensors, and the stored figure is one answer the loop already gave.
+        est = estimate(snap, self.cfg)
+        w = est.total_w
         gx0, gx1 = x0 + 160, x0 + 544
         if w is None:
             self._txt(d, (gx0, y0 + 24), "-- W", (self.fsmall, 14), DIMMER, "ls")
@@ -437,6 +444,12 @@ class Layout:
             self._txt(d, (gx1, y0 + 31), f"{hi:.0f}", (self.fsmall, 11), DIMMER, "rs")
             self._txt(d, (x0 + 676, y0 + 30), f"{w:.0f}", (self.fval, 34), col, "rs")
             self._txt(d, (x0 + 684, y0 + 30), "W", (self.fsmall, 18), col, "ls")
+        # The provenance word rides the caption row whether or not a number was
+        # drawn: "34 W" with nothing beside it is exactly the sentence that
+        # fooled the user when every sensor was dead, and "-- W" alone does not
+        # say whether that is "no panel data" or "some data, not enough".
+        self._txt(d, ((gx0 + gx1) // 2, y0 + 31), est.status,
+                  (self.fsmall, 11), DIMMER, "ms")
         self._txt(d, (cx1, y0 + 26), time.strftime("%H:%M"), (self.fsmall, 17), DIM, "rs")
 
     # ---------- state layouts ----------------------------------------------------
