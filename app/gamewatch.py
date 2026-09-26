@@ -147,7 +147,11 @@ class GameWatch:
 
     def __init__(self, cfg: dict):
         self.cfg = cfg["game"]
-        det = cfg.get("detection", {})
+        # The detection block lives *inside* `game:` in config.yaml; reading it off
+        # the root silently found nothing and every knob below - strong-enter time,
+        # dead-exit time, switch silence, the GPU score, the non-game list - fell
+        # back to these hard-coded values no matter what the user set.
+        det = self.cfg.get("detection") or {}
         self.state = self.IDLE
         self.game_pid: int | None = None
         self.game_name: str | None = None
@@ -156,6 +160,11 @@ class GameWatch:
         self.switches = 0                   # lock changes, for the log
         self.enter_after_s = float(self.cfg["enter_after_s"])
         self.exit_after_s = float(self.cfg["exit_after_s"])
+        # "fullscreen inference": the window heuristic (foreground window covering
+        # its monitor, borderless, GPU busy) is the only evidence there is when the
+        # present stream is off or dead, and the last-resort candidate otherwise.
+        # Documented under game.fullscreen_heuristic; now actually honoured.
+        self.fullscreen_heuristic = bool(self.cfg.get("fullscreen_heuristic", True))
         # A STRONG candidate needs only long enough to be sure it is not a flicker
         # of focus: one second, against the old flat four.
         self.enter_strong_s = float(det.get("enter_strong_s",
@@ -257,6 +266,17 @@ class GameWatch:
         """
         fg_pid, fg_name, covers, borderless, snap = ctx
         if presenters is None:
+            if not self.fullscreen_heuristic:
+                # No present stream, and the user turned off the one other way to
+                # infer a game: nothing can be seen, so count the silence honestly
+                # and let go - never hold a lock on evidence we were told not to use.
+                self._quiet_s += dt
+                self.evidence = (f"no present stream and fullscreen_heuristic is off "
+                                 f"({self._quiet_s:.0f}s)")
+                if self._quiet_s >= self.exit_after_s:
+                    self._release("no present stream and the window heuristic is off")
+                    return False
+                return True
             busy = (snap.gpu.load_pct is not None
                     and snap.gpu.load_pct >= float(self.cfg["min_gpu_load"]))
             same = fg_pid == self.game_pid and covers and borderless and busy
@@ -349,7 +369,8 @@ class GameWatch:
         cand = None
         if presenters and self.cfg.get("present_detection", True):
             cand = self._best(presenters, fg_pid or -1, fg_name, covers, steam, ignore)
-        if cand is None and fg_pid is not None and fg_pid != self._self_pid \
+        if cand is None and self.fullscreen_heuristic \
+                and fg_pid is not None and fg_pid != self._self_pid \
                 and fg_name not in ignore \
                 and not self._is_non_game(fg_name) and covers and borderless:
             gpu = snap.gpu

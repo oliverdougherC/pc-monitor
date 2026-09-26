@@ -63,6 +63,9 @@ CASES = [
      "geometry at the value extremes: collisions and panel overflow", "fonts", None),
     ("fault", ["tools/fault_selftest.py"],
      "per-tick guard contains faults; AST pass over the loop", None, None),
+    ("config_schema", ["tools/config_schema_selftest.py"],
+     "config knobs reach their consumers; bad values die at load naming the key",
+     None, None),
 ]
 
 

@@ -39,6 +39,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
 .venv\Scripts\python tools\panel_link_selftest.py     # link survives raise/hang, rebuilds, walks its device ladder
 .venv\Scripts\python tools\fault_selftest.py          # nothing outside the per-tick guard (AST-checked)
+.venv\Scripts\python tools\config_schema_selftest.py  # knobs reach consumers; bad values die at load, key named
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
 ```
 
@@ -78,6 +79,7 @@ state, how many bands a partial panel update would need (same math as
 | `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the disable/enable journaling (including "a refused disable is never followed by an enable") |
 | `tools/lights_selftest.py` | the light decision end to end: sleep, displays-off, idle, dim, precedence, the night cap and LUT, and a rendered frame measured before/after the warmth |
 | `tools/fault_selftest.py` | the per-tick guard: fallback + one log line per fault, `SystemExit` contained, Ctrl-C not — plus an AST pass that fails if any subsystem call in the loop has escaped the guard |
+| `tools/config_schema_selftest.py` | no admin: every behavioural knob is driven through the real YAML load into its real consumer (GameWatch, BurnIn, Layout, the wipe and the gradient), and every value class that used to reach the loop (zero intervals, bad brightness, equal gradient ends, wrong shapes, bad geometry) must now stop at `load()` naming its key |
 | `tools/hoststate_probe.py` | live watcher at 2 Hz: what each power/session event did to the state (`--trace` for raw window messages) |
 | `tools/screen_wake_probe.py` | raw serial HELLO / TURNON / RESTART: is the panel deaf, and does anything bring it back |
 | `tools/presentmon_matrix.py` | elevated: A/Bs the capture invocations (drop filter, tracking, `--v1_metrics`, name reuse) |
