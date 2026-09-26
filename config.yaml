@@ -1,5 +1,9 @@
 # PC Monitor - desk display config
 # NOTE: keys are consumed by app/config.py; missing keys fall back to defaults there.
+# Values are checked against that file's schema when the app starts: a wrong type,
+# range or enum stops the app with every bad key named, instead of failing later
+# inside the render loop. A live reload that does not validate is refused and the
+# last-known-good config keeps running.
 
 display:
   # Once hardware arrives set revision to the right protocol:
