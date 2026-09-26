@@ -120,6 +120,79 @@ def _u32() -> ctypes.WinDLL:
 
 
 # ------------------------------------------------------------- cheap host polls
+class _LastInputInfo(ctypes.Structure):
+    """`LASTINPUTINFO`: a size and a tick, both DWORDs of the boot clock.
+
+    Named at module scope because the read and its types belong together, and the
+    types are the point: ctypes hands an unannotated call back as a C `int`, so a
+    `DWORD` read through the default is the same bit pattern read two different ways.
+    """
+    _fields_ = [("cbSize", ctypes.c_uint32), ("dwTime", ctypes.c_uint32)]
+
+
+if NT:
+    # Declared once, for the same reason. `GetLastInputInfo` takes a pointer to the
+    # structure above and returns a BOOL; `GetTickCount64` returns a ULONGLONG, and
+    # the default signed `int` truncates it - which is how the idle clock came to
+    # report a desk that had been up for a month as one somebody had just typed on.
+    ctypes.windll.user32.GetLastInputInfo.restype = ctypes.c_bool
+    ctypes.windll.user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LastInputInfo)]
+    ctypes.windll.kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+    ctypes.windll.kernel32.GetTickCount64.argtypes = []
+
+
+def last_input_tick() -> int | None:
+    """The boot tick the last keyboard/mouse input arrived on, or None if unreadable.
+
+    The raw 32-bit `dwTime`, deliberately: it is half of a subtraction, and the other
+    half has to be read on the same clock for the difference to mean anything, so the
+    two are kept apart until `idle_seconds` puts them together.
+    """
+    if not NT:
+        return None
+    try:
+        info = _LastInputInfo()
+        info.cbSize = ctypes.sizeof(info)
+        if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return int(info.dwTime)
+    except Exception:  # noqa: BLE001 - a missing idle clock must not break the loop
+        pass
+    return None
+
+
+def uptime_ms() -> int:
+    """Milliseconds the boot clock has been running: `GetTickCount64`.
+
+    The 64-bit form, because `dwTime` is a 32-bit window onto this same counter, and
+    only a clock long enough to say *which* window that tick came from can put an age
+    on it. (The 32-bit `GetTickCount` is also the value ctypes' default return type
+    signs: it turns negative at 24.9 days of uptime and stays there for the next 24.8
+    - half of every boot, in other words.)
+    """
+    return int(ctypes.windll.kernel32.GetTickCount64())
+
+
+def input_age_ms(last: int, now: int) -> int | None:
+    """Milliseconds between a 32-bit boot tick and the 64-bit boot clock `now`.
+
+    `last` is the low half of the counter `now` was read from, so the age is the
+    distance to the newest value with that low half which is not in the future: put
+    back as many whole 2^32 windows as fit between the two. Subtracting them as they
+    come is wrong twice over - the signed reading of the tick count goes negative at
+    24.9 days and the DWORD itself wraps at 49.7 - and clamping the answer at zero, as
+    this used to, converts both boundaries into "somebody just typed". That is the one
+    answer the panel acts on by *not* going dark, and the one that reads as proof of a
+    wake to whatever is waiting out a suspend.
+
+    None when the reads disagree about which way the clock runs: an input tick ahead
+    of the clock that just read it is an unanswerable question, not an input that
+    happened this instant.
+    """
+    if now < last:
+        return None
+    return now - (last + (((now - last) >> 32) << 32))
+
+
 def idle_seconds() -> float | None:
     """Seconds since the last keyboard/mouse input, or None where unanswerable.
 
@@ -128,19 +201,14 @@ def idle_seconds() -> float | None:
     things to the wake rule below, where *proof* of input is what says the machine is
     awake again.
     """
-    if not NT:
+    last = last_input_tick()
+    if last is None:
         return None
     try:
-        class LastInputInfo(ctypes.Structure):
-            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
-
-        info = LastInputInfo()
-        info.cbSize = ctypes.sizeof(info)
-        if ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
-            return max(0.0, (ctypes.windll.kernel32.GetTickCount() - info.dwTime) / 1000.0)
+        age = input_age_ms(last, uptime_ms())
     except Exception:  # noqa: BLE001 - a missing idle clock must not break the loop
-        pass
-    return None
+        return None
+    return None if age is None else age / 1000.0
 
 
 def on_ac() -> bool:
