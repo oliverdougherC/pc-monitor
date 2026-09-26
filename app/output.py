@@ -6,9 +6,18 @@ numpy, and send back the smallest set of horizontal bands that changed.
 - Static labels: never re-sent.
 - A changing digit: a few hundred bytes instead of a full frame.
 - Mode switch / shift animation: falls back to one full-frame push.
+
+The shadow framebuffer is a promise about the panel's memory, so it is kept
+only when the panel actually acknowledged the bytes: `push()` commits after
+every band returned True on the same connection generation, and a failed,
+partial, timed-out or relink-interrupted update leaves a full frame pending
+instead. A frame that never reached the screen must not make its twin
+skippable, and bands that half-arrived must not make the missing ones look
+unchanged.
 """
 from __future__ import annotations
 
+import threading
 import time
 
 import numpy as np
@@ -54,14 +63,45 @@ class DiffPusher:
         self.prev: np.ndarray | None = None
         self.merge_gap = merge_gap
         self.full_fraction = full_fraction
+        # Guards the two fields that together form the transaction: the shadow
+        # frame and the invalidation counter. A relink runs `invalidate()` on a
+        # background thread while a push is in flight; whichever order the two
+        # writes land in, "invalidated after the bytes were sent" has to win.
+        self._lock = threading.Lock()
+        self._invalidations = 0
 
-    def push(self, img) -> None:
+    @property
+    def generation(self):
+        """The transport's connection generation, or None if it does not count.
+
+        A generation is the identity of one bring-up: `PanelLink` bumps it every
+        time it rebuilds, so a push that began and ended on the same one spoke to
+        the same live connection the whole way through.
+        """
+        return getattr(self.lcd, "generation", None)
+
+    def push(self, img) -> bool:
+        """Send what changed. True only when the panel acknowledged every byte.
+
+        The acknowledgement is an explicit True from the transport: `PanelLink`
+        answers with one; a raw vendor driver answers with None, and a swallowed
+        vendor error is not a display. `prev` is committed only if the push
+        completed on the generation it started on and nothing invalidated it in
+        flight; otherwise the next push is a full frame, because we can no longer
+        say what the panel is holding.
+        """
         new = np.asarray(img, dtype=np.uint8)
-        if self.prev is not None and self.prev.shape == new.shape:
-            changed = np.any(new != self.prev, axis=2)
+        gen = self.generation
+        with self._lock:
+            prev = self.prev
+            invalidations = self._invalidations
+        if prev is not None and prev.shape == new.shape:
+            changed = np.any(new != prev, axis=2)
             frac = changed.mean()
             if frac == 0.0:
-                return
+                # Nothing to send: the frame is on the screen *if* the cache
+                # still believes so, and the commit re-reads that belief.
+                return self._commit(new, gen, invalidations)
             if frac <= self.full_fraction:
                 row_idx = np.flatnonzero(changed.any(axis=1))
                 bands = _runs(row_idx)
@@ -77,12 +117,33 @@ class DiffPusher:
                         col_idx = np.flatnonzero(changed[y0:y1].any(axis=0))
                         x0, x1 = int(col_idx[0]), int(col_idx[-1]) + 1
                         crop = img.crop((x0, y0, x1, y1))
-                        self.lcd.DisplayPILImage(crop, x0, y0)
-                    self.prev = new
-                    return
-        self.lcd.DisplayPILImage(img, 0, 0)
-        self.prev = new
+                        if self.lcd.DisplayPILImage(crop, x0, y0) is not True:
+                            # A band short of a whole update: the panel holds a
+                            # frame that is neither the old one nor the new one,
+                            # so nothing smaller than a full frame can fix it.
+                            return self._discard()
+                    return self._commit(new, gen, invalidations)
+        if self.lcd.DisplayPILImage(img, 0, 0) is not True:
+            return self._discard()
+        return self._commit(new, gen, invalidations)
+
+    def _commit(self, new, gen, invalidations: int) -> bool:
+        """Publish the shadow frame, unless the world moved while it was sent."""
+        with self._lock:
+            if self._invalidations != invalidations or self.generation != gen:
+                self.prev = None
+                return False
+            self.prev = new
+            return True
+
+    def _discard(self) -> bool:
+        """The update did not land: the next push must repaint everything."""
+        with self._lock:
+            self.prev = None
+        return False
 
     def invalidate(self) -> None:
         """Force next push to be a full frame."""
-        self.prev = None
+        with self._lock:
+            self._invalidations += 1
+            self.prev = None
