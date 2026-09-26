@@ -17,6 +17,12 @@ Each case asserts what the *loop* would act on: is the panel dark, and is there
 a resume edge to consume (which is what reconnects the COM port and restarts the
 ETW capture). The gap case is the one that proves the fallback: with no events at
 all, a frozen process must still produce exactly one resume edge.
+
+The last-input clock is scripted (`FakeInputClock`), which is what makes this file
+a gate instead of a report on the desk: it used to read the live `GetLastInputInfo`,
+so it failed while a human was at the keyboard and passed while nobody was. The
+suspend cases turn on *when* the input happened relative to the suspend request, and
+a live clock cannot be asked what it reported three seconds before the click.
 """
 import ctypes
 import sys
@@ -49,10 +55,72 @@ def setting(guid: bytes, value: int):
     return (ctypes_byte * 24)(*guid, *bytes([4, 0, 0, 0]), *value.to_bytes(4, "little"))
 
 
+class FakeInputClock:
+    """The desk's last-input clock, scripted: no case may depend on this keyboard.
+
+    `hoststate` reads exactly one function for this, `idle_seconds`, and measures
+    elapsed time by the `dt` the loop hands `tick()` - so the fake answers the read
+    from a scripted instant and is advanced by `tick()` below, by the same `dt`. That
+    leaves the arithmetic under test untouched and removes the live call: the desk
+    ages when the loop says time passed, and only then.
+
+    `quiet(s)` is an input that happened `s` seconds ago and nothing since; `typing()`
+    is somebody touching the keyboard now; `unknown()` is `GetLastInputInfo` failing,
+    which has to stay a different answer from "input this instant".
+    """
+
+    def __init__(self) -> None:
+        self.t = 1_000.0                    # arbitrary origin; only differences are read
+        self.last_input = 1_000.0           # an empty desk, until a case says otherwise
+        self.known = True
+        self._real = hs.idle_seconds
+
+    def install(self) -> None:
+        hs.idle_seconds = self.read
+
+    def remove(self) -> None:
+        hs.idle_seconds = self._real
+
+    def reset(self) -> None:
+        self.t = 1_000.0
+        self.last_input = 1_000.0
+        self.known = True
+
+    def read(self) -> float | None:
+        return None if not self.known else max(0.0, self.t - self.last_input)
+
+    def quiet(self, s: float) -> None:
+        self.last_input = self.t - float(s)
+
+    def typing(self, s: float = 0.2) -> None:
+        self.quiet(s)
+
+    def unknown(self) -> None:
+        self.known = False
+
+
+CLOCK = FakeInputClock()
+
+
 def new_state() -> HostState:
     """A HostState with the event *window* off: the cases below drive `_dispatch`
-    directly, and a live window would race real broadcasts against the script."""
+    directly, and a live window would race real broadcasts against the script.
+
+    Each one starts on a desk nobody has touched for an hour; a case that wants
+    fresher input says so, which is the whole point of pinning it.
+    """
+    CLOCK.reset()
     return HostState(gap_s=1.0, poll_s=3600.0, events=False)
+
+
+def tick(h: HostState, dt: float = 1.0) -> None:
+    """Age the scripted desk and tick the state over the same interval.
+
+    The state's only measure of elapsed time is the `dt` the loop hands it, so a desk
+    that did not age along with it would be reporting input that never happened.
+    """
+    CLOCK.t += dt
+    h.tick(dt)
 
 
 def case_suspend_resume() -> None:
@@ -123,12 +191,12 @@ def case_gap_without_events() -> None:
     print("case: frozen with no events (the fallback that has to work)")
     h = new_state()
     h._ev.error = "no window station"
-    h.tick(1.0)                                    # the loop's first tick: primes
+    tick(h)                                     # the loop's first tick: primes
     h._tick_now = time.monotonic() - 400.0
-    h.tick(1.0)
+    tick(h)
     check("gap raises an edge", h.take_resume(), "gap:400s")
     check("and clears the sleep flag", h.asleep, False)
-    h.tick(1.0)
+    tick(h)
     check("a normal tick raises nothing", h.resume, None)
     h.close()
 
@@ -141,11 +209,11 @@ def case_slow_start_is_not_a_suspend() -> None:
     # relinks the panel and restarts the ETW capture for no reason.
     h = new_state()
     h._tick_now = time.monotonic() - 36.0
-    h.tick(1.0)
+    tick(h)
     check("no edge on the first tick", h.resume, None)
     check("state untouched", h.asleep, False)
     h._tick_now = time.monotonic() - 36.0
-    h.tick(1.0)
+    tick(h)
     check("but the next tick does see a freeze", bool(h.take_resume()), True)
     h.close()
 
@@ -153,10 +221,10 @@ def case_slow_start_is_not_a_suspend() -> None:
 def case_gap_after_event_suspend() -> None:
     print("case: asleep by event, woken by gap (no resume message arrived)")
     h = new_state()
-    h.tick(1.0)                                    # prime, like the real loop
+    tick(h)                                     # prime, like the real loop
     h._on_event(WM_POWERBROADCAST, PBT_APMQUERYSUSPEND, 0)
     h._tick_now = time.monotonic() - 60.0
-    h.tick(1.0)
+    tick(h)
     check("asleep flag gone", h.asleep, False)
     check("gap reason recorded", h.last_event, "gap 60s")
     edge = h.take_resume()
@@ -165,79 +233,137 @@ def case_gap_after_event_suspend() -> None:
 
 
 def case_input_proves_awake() -> None:
-    print("case: fresh input proves the machine is awake (an aborted sleep)")
-    real = hs.idle_seconds
+    print("case: only input that came *after* the request proves the machine is awake")
+    # This case used to assert the opposite - that any reading under two seconds old
+    # ended the suspend - and the click on Start -> Sleep is exactly that, so the
+    # click cancelled the request it had just made: the loop got a resume edge, the
+    # panel was relit and relinked on its way into a suspend, and the desk lost the
+    # one moment at which the screen could still be switched off. The question is
+    # ordering, not age.
     h = new_state()
-    h2 = new_state()
-    try:
-        hs.idle_seconds = lambda: 0.3          # somebody is at the keyboard
-        h._on_event(WM_POWERBROADCAST, PBT_APMQUERYSUSPEND, 0)
-        check("dark on the suspend query", h.asleep, True)
-        h.tick(1.0)
-        check("input cleared the flag", h.asleep, False)
-        check("named for the evidence", h.take_resume(), "input-after-suspend")
-        # An unanswerable idle clock must not be read as "just typed": that would
-        # clear the sleep flag on every tick wherever GetLastInputInfo is unavailable.
-        hs.idle_seconds = lambda: None
-        h2._on_event(WM_POWERBROADCAST, PBT_APMQUERYSUSPEND, 0)
-        h2.tick(1.0)
-        check("unknown idle clock does not fake a wake", h2.asleep, True)
-        check("idle_s still usable for the screen-off rule", h2.idle_s >= 0.0, True)
-    finally:
-        hs.idle_seconds = real
+    CLOCK.typing()                          # the click that invoked Sleep
+    h._on_event(WM_POWERBROADCAST, PBT_APMQUERYSUSPEND, 0)
+    check("dark on the suspend query", h.asleep, True)
+    tick(h)                                 # the loop wakes on the event and ticks
+    check("the click that asked for the sleep is not a wake", h.asleep, True)
+    check("nothing is queued for the loop", h.resume, None)
+    check("the request is outstanding", h.suspend_pending, True)
+    check("screen-off wins while it is outstanding", "pending-suspend" in h.summary(),
+          True)
+    tick(h)                                 # the same click, now two seconds old
+    check("ageing the same input does not make it new", h.asleep, True)
+    check("idle is still reported for the idle rule", round(h.idle_s, 1), 2.2)
+    h._on_event(WM_POWERBROADCAST, PBT_APMSUSPEND, 0)
+    tick(h)
+    check("still dark at SUSPEND", h.asleep, True)
+    check("and still outstanding", h.suspend_pending, True)
+    h._on_event(WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0)
+    check("the resume message ends it", (h.asleep, h.suspend_pending), (False, False))
+    check("named for the message", h.take_resume(), "resume:0x12")
+    check("the request label is gone", "pending-suspend" in h.summary(), False)
     h.close()
-    h2.close()
+
+
+def case_aborted_sleep_resolves_on_new_input() -> None:
+    print("case: a sleep that never happened is resolved by input that came after it")
+    # Lid closed then reopened, or a suspend that failed to take: no resume message
+    # is ever going to arrive, so the input fallback is the only thing that can bring
+    # the panel back - and it has to be input that moved the clock forward, not the
+    # input that was already the newest thing the desk had done.
+    h = new_state()
+    CLOCK.quiet(0.3)                        # the click that invoked Sleep
+    h._on_event(WM_POWERBROADCAST, PBT_APMQUERYSUSPEND, 0)
+    tick(h)
+    check("the request stands", h.asleep, True)
+    check("and nothing is queued", h.resume, None)
+    CLOCK.typing()                          # somebody really is back at the desk
+    tick(h)
+    check("input after the request ends it", h.asleep, False)
+    check("and the request with it", h.suspend_pending, False)
+    check("named for the evidence", h.take_resume(), "input-after-suspend")
+    check("the edge is one-shot", h.take_resume(), None)
+    # A second sleep asks the same question from scratch: the keystroke that answered
+    # the first one is pre-request input now.
+    h._on_event(WM_POWERBROADCAST, PBT_APMQUERYSUSPEND, 0)
+    tick(h)
+    check("re-armed: the last keystroke no longer counts", h.asleep, True)
+    check("outstanding again", h.suspend_pending, True)
+    tick(h)
+    CLOCK.typing()
+    tick(h)
+    check("and new input answers it again", h.asleep, False)
+    h.close()
+
+
+def case_unreadable_input_clock() -> None:
+    print("case: an input clock that cannot be read proves nothing, either way")
+    h = new_state()
+    CLOCK.unknown()
+    h._on_event(WM_POWERBROADCAST, PBT_APMQUERYSUSPEND, 0)
+    tick(h)
+    check("unknown input does not fake a wake", h.asleep, True)
+    check("nor cancel the request", h.suspend_pending, True)
+    check("idle_s still usable for the screen-off rule", h.idle_s >= 0.0, True)
+    check("summary says the clock is unknown", "idle=-" in h.summary(), True)
+    # A clock that comes back has only pre-request input to report, and anchoring on
+    # it is not the same as being woken by it.
+    CLOCK.known = True
+    CLOCK.quiet(5.0)
+    tick(h)
+    check("a returning clock cannot cancel with old input", h.asleep, True)
+    CLOCK.typing()
+    tick(h)
+    check("input newer than the anchor can", h.asleep, False)
+    check("and clears the request", h.suspend_pending, False)
+    h.close()
 
 
 def case_monitor_seed() -> None:
     print("case: a start-up while the screens are already off can still know it")
-    real_idle = hs.idle_seconds
     h = new_state()
     h2 = new_state()
-    try:
-        # The real query, on the real machine: this is the one part of the seed that
-        # cannot be simulated, and it is what `monitor=?` at start-up is otherwise
-        # paying for. 0 (never) or a missing powercfg both return None.
-        timeout = h._display_timeout_s()
-        check("powercfg gives a timeout or nothing", timeout is None
-              or (isinstance(timeout, float) and timeout > 0), True)
-        print(f"    this desk: display timeout = {timeout}")
+    # The real query, on the real machine: this is the one part of the seed that
+    # cannot be simulated, and it is what `monitor=?` at start-up is otherwise
+    # paying for. 0 (never) or a missing powercfg both return None.
+    timeout = h._display_timeout_s()
+    check("powercfg gives a timeout or nothing", timeout is None
+          or (isinstance(timeout, float) and timeout > 0), True)
+    print(f"    this desk: display timeout = {timeout}")
 
-        hs.idle_seconds = lambda: 12_700.0          # hours since anyone was here
-        h._display_timeout_s = lambda: 300.0
-        why = h.seed_monitor()
-        check("derived off", (h.monitor_on, h.monitor_seeded), (False, True))
-        check("and says how it knows", "300s" in why and "12700s" in why, True)
-        check("summary admits the guess", "(seed)" in h.summary(), True)
-        check("seeding twice changes nothing", h.seed_monitor().startswith("no seed"),
-              True)
+    CLOCK.quiet(12_700.0)                       # hours since anyone was here
+    h._display_timeout_s = lambda: 300.0
+    why = h.seed_monitor()
+    check("derived off", (h.monitor_on, h.monitor_seeded), (False, True))
+    check("and says how it knows", "300s" in why and "12700s" in why, True)
+    check("summary admits the guess", "(seed)" in h.summary(), True)
+    check("seeding twice changes nothing", h.seed_monitor().startswith("no seed"),
+          True)
 
-        # An event wins over the derivation, and demotes the label.
-        buf = setting(bytes(hs.GUID_CONSOLE_DISPLAY_STATE), 1)
-        h._on_event(WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, ctypes.addressof(buf))
-        check("a real notification overrides it", (h.monitor_on, h.monitor_seeded),
-              (True, False))
-        check("and the label goes away", "(seed)" in h.summary(), False)
+    # An event wins over the derivation, and demotes the label.
+    buf = setting(bytes(hs.GUID_CONSOLE_DISPLAY_STATE), 1)
+    h._on_event(WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, ctypes.addressof(buf))
+    check("a real notification overrides it", (h.monitor_on, h.monitor_seeded),
+          (True, False))
+    check("and the label goes away", "(seed)" in h.summary(), False)
 
-        # A seeded "off" must never be what keeps the panel dark while the user types.
-        h3 = new_state()
-        h3._display_timeout_s = lambda: 300.0
-        h3.seed_monitor()                            # idle still 12 700 → off
-        check("seeded off", h3.monitor_on, False)
-        hs.idle_seconds = lambda: 0.4
-        h3.tick(1.0)
-        check("input beats a guessed off", (h3.monitor_on, h3.monitor_seeded),
-              (True, False))
-        check("named for the evidence", h3.last_event, "input-after-seed")
-        h3.close()
+    # A seeded "off" must never be what keeps the panel dark while the user types.
+    h3 = new_state()
+    CLOCK.quiet(12_700.0)
+    h3._display_timeout_s = lambda: 300.0
+    h3.seed_monitor()                            # idle 12 700 s against 300 s -> off
+    check("seeded off", h3.monitor_on, False)
+    CLOCK.typing(0.4)
+    tick(h3)
+    check("input beats a guessed off", (h3.monitor_on, h3.monitor_seeded),
+          (True, False))
+    check("named for the evidence", h3.last_event, "input-after-seed")
+    h3.close()
 
-        # Nothing to derive from: a scheme where the screens never time out.
-        hs.idle_seconds = lambda: 12_700.0
-        h2._display_timeout_s = lambda: None
-        check("no timeout, no claim", h2.seed_monitor().startswith("no seed"), True)
-        check("state stays unknown", h2.monitor_on, None)
-    finally:
-        hs.idle_seconds = real_idle
+    # Nothing to derive from: a scheme where the screens never time out.
+    CLOCK.quiet(12_700.0)
+    h2._display_timeout_s = lambda: None
+    check("no timeout, no claim", h2.seed_monitor().startswith("no seed"), True)
+    check("state stays unknown", h2.monitor_on, None)
     h.close()
     h2.close()
 
@@ -245,7 +371,7 @@ def case_monitor_seed() -> None:
 def case_wake_flag() -> None:
     print("case: the loop's wait wakes on an event")
     h = new_state()
-    h.tick(1.0)                          # tick() arms the flag
+    tick(h)                                # tick() arms the flag
     check("armed by tick", h.event.is_set(), False)
     h._on_event(WM_POWERBROADCAST, PBT_APMSUSPEND, 0)
     check("set by the message", h.event.is_set(), True)
@@ -253,7 +379,7 @@ def case_wake_flag() -> None:
     # wait() only reports; a tick consumes, because the tick is what reads the
     # state the message changed. Without that order a message landing between the
     # read and the wait would be swallowed for a whole interval.
-    h.tick(1.0)
+    tick(h)
     t0 = time.monotonic()
     check("wait times out once the tick has read it", h.wait(0.15), False)
     check("and actually waited", time.monotonic() - t0 > 0.1, True)
@@ -261,12 +387,18 @@ def case_wake_flag() -> None:
 
 
 def main() -> int:
-    for fn in (case_suspend_resume, case_monitor, case_lock, case_display_change,
-               case_gap_without_events, case_slow_start_is_not_a_suspend,
-               case_gap_after_event_suspend, case_input_proves_awake,
-               case_monitor_seed, case_wake_flag):
-        fn()
-        print()
+    CLOCK.install()                        # nothing below reads this desk's keyboard
+    print("last-input clock: scripted\n")
+    try:
+        for fn in (case_suspend_resume, case_monitor, case_lock, case_display_change,
+                   case_gap_without_events, case_slow_start_is_not_a_suspend,
+                   case_gap_after_event_suspend, case_input_proves_awake,
+                   case_aborted_sleep_resolves_on_new_input,
+                   case_unreadable_input_clock, case_monitor_seed, case_wake_flag):
+            fn()
+            print()
+    finally:
+        CLOCK.remove()
     print("SELFTEST PASSED" if not fails else f"SELFTEST FAILED: {fails}")
     return 1 if fails else 0
 

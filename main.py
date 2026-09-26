@@ -305,7 +305,14 @@ def main() -> None:
         # A resume is the only moment everything downstream has to be re-made: the
         # COM port came back (or has not yet), the panel rebooted into portrait, the
         # ETW session is a husk, and the game we locked onto was frozen mid-frame.
-        reason = g.run("take-resume", host.take_resume, None)
+        # Held, not acted on, while a suspend request is still outstanding: a relink
+        # spends the milliseconds the panel has left before the bus loses power on a
+        # port that is about to vanish, and the light decision is dark regardless.
+        # The edge stays armed until it is consumed, so the tick after the request
+        # resolves - by a resume message, or by input newer than the request - is the
+        # one that does the work.
+        reason = (None if host.suspend_pending
+                  else g.run("take-resume", host.take_resume, None))
         if reason and not dump_mode:
             status(f"[resume] {reason} — {g.text('host.summary', host.summary)}")
             # Each recovery on its own: a relink that raises must not also leave the
