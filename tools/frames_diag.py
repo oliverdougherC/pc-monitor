@@ -47,7 +47,7 @@ class DiagMonitor(FrameMonitor):
         self.header: list[str] = []
         self.raw_rows: list[str] = []
 
-    def _read_stream(self, proc):
+    def _read_stream(self, proc, gen=None):   # gen: per-spawn guard, see app/frames.py
         import csv, io
         stream = io.TextIOWrapper(proc.stdout, encoding="utf-8-sig",
                                   errors="replace", newline="")

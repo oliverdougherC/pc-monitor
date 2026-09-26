@@ -40,9 +40,17 @@ import numpy as np
 from app.snapshot import FrameStats
 
 _HEADER_TIMEOUT_S = 10.0        # no CSV header by then → presentmon failed to start
+_SCHEMA_TIMEOUT_S = 10.0        # rows arriving, none parseable, this long → not our schema
+_WATCH_POLL_S = 1.0             # how often the supervisor looks at progress on its own;
+                                # the recovery latency after a stall is ± this
+_READER_JOIN_S = 5.0            # every wait on a child we just killed is bounded: a
+_KILL_WAIT_S = 5.0              # wedged child must not wedge the supervisor with it
+_MISSING_EXE_RETRY_S = 30.0     # a missing executable is retried at a low rate — the
+                                # fetch script can land it at any time without a restart
 _MAX_SAMPLES = 12000            # 60 s at 200 Hz
 _PID_EXPIRE_S = 30.0
-_STREAM_SILENT_S = 20.0         # header up but no rows for this long → say so in the log
+_STREAM_SILENT_S = 20.0         # rendering evidence with no usable row for this long →
+                                # warn, and it is also what the supervisor restarts on
 _SESSION_SETTLE_S = 2.5         # grace after stopping a previous run's session, see _reclaim_session
 _RESTART_MAX_S = 60.0           # backoff ceiling for a capture that keeps dying
 _HEALTHY_S = 120.0              # alive this long with rows → the streak of failures resets
@@ -284,11 +292,30 @@ class FrameMonitor:
         self._stop = threading.Event()
         self._proc: subprocess.Popen | None = None
         self._out: list[str] = []                             # stray output lines (for error text)
+        # Generation bookkeeping (issue #10): "stalled since the last good row"
+        # is a per-spawn question, so rows/parsed/silence belong to a
+        # generation and restart with it, identified by _gen so a reader still
+        # parked on the previous child's pipe cannot write into fresh counters.
+        self._gen = 0
+        self._phase = "starting"  # supervisor phase; `state` turns it into a word
+        self._missing_reported = False  # the supervisor reports an absent exe once
+                                        # per transition, not once per retry — and
+                                        # reports nothing at all when __init__
+                                        # already said it, so the thread racing a
+                                        # parse test cannot rewrite what it wrote
+        self._schema_bad = False  # header arrived, but it can never yield a number
+        self._first_row = 0.0     # monotonic time of this generation's first data row
+        self._last_parse = 0.0    # monotonic time of the last row we could ingest
 
         if not os.path.exists(self._exe):
             self.error = (f"presentmon not found: {self._exe} — "
-                          f"run: powershell -File tools\\fetch_presentmon.ps1")
-            return
+                          f"run: powershell -File tools\\fetch_presentmon.ps1 "
+                          f"(retrying every {_MISSING_EXE_RETRY_S:.0f}s)")
+            # Not a `return`: the supervisor notices the missing file, reports
+            # it, and retries at a low rate, so running the fetch script later
+            # recovers the capture without restarting the app.
+            self._phase = "missing-exe"
+            self._missing_reported = True
         threading.Thread(target=self._supervise, daemon=True).start()
 
     # ---------------------------------------------------------------- lifecycle
@@ -351,42 +378,163 @@ class FrameMonitor:
         cycle. In both cases the capture comes back on its own if asked again in a few
         seconds, and a panel that shows `--` for the rest of the afternoon because one
         spawn failed is a worse outcome than a child that retries quietly.
+
+        The reader runs on a thread of its own because the failure that matters is
+        the child that stays alive and stops being useful: a header that never
+        arrives blocks the read forever, and a supervisor that shares the reader's
+        stack is blocked with it — the old code had `_HEADER_TIMEOUT_S` defined and
+        could never enforce it. This loop only ever looks at timestamps and counters,
+        and every wait it takes on a child it just killed is bounded.
         """
         while not self._stop.is_set():
+            if not os.path.exists(self._exe):
+                # Transition-only reporting, tracked on the supervisor's own
+                # flag: __init__ already said this once when the exe was absent
+                # at construction, and rewriting the error every retry would
+                # look like a new fault — and, from a thread that starts before
+                # the caller finishes constructing, overwrite what the caller
+                # just said. A later disappearance is news and gets reported.
+                if not self._missing_reported:
+                    self.ok = False
+                    self.error = (f"presentmon not found: {self._exe} — "
+                                  f"run: powershell -File tools\\fetch_presentmon.ps1 "
+                                  f"(retrying every {_MISSING_EXE_RETRY_S:.0f}s)")
+                    self._phase = "missing-exe"
+                    self._missing_reported = True
+                if self._stop.wait(_MISSING_EXE_RETRY_S):
+                    return
+                continue
+            self._missing_reported = False   # it is back; a future loss is news again
+            self._phase = "starting"
             t_start = time.monotonic()
             try:
                 proc = self._spawn()
             except OSError as e:
                 self._fail(f"could not start presentmon: {e}")
+                self._phase = "backoff"
                 if self._stop.wait(_RESTART_MAX_S):
                     return
                 continue
             self.starts += 1
             self._proc = proc
-            try:
-                self._read_stream(proc)
-            except Exception:  # noqa: BLE001 - never let a parse bug kill the stream silently
-                pass
-            rc = proc.wait()
+            gen = self._gen + 1
+            self._begin_generation(gen)
+            reader = threading.Thread(target=self._reader_loop, args=(proc, gen),
+                                      daemon=True)
+            reader.start()
+            self._phase = "watching"
+            stall = None
+            while not self._stop.is_set():
+                if self._stop.wait(_WATCH_POLL_S):
+                    break
+                if self._restart_req:
+                    break
+                if proc.poll() is not None:
+                    break
+                stall = self._stall_reason()
+                if stall:
+                    break
             if self._stop.is_set():
+                if proc.poll() is None:      # close() raced this spawn
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
                 return
-            alive = time.monotonic() - t_start
             if self._restart_req:
                 self._restart_req = False
                 self.restarts += 1
                 self._streak = 0
                 self.error = None
                 continue
-            if alive > _HEALTHY_S:
+            alive = time.monotonic() - t_start
+            if stall:
+                # A live child that stopped being useful. The reader is parked on
+                # a pipe that will never fill again, so killing the child is what
+                # frees it; neither wait may run past its bound, or one wedged
+                # capture becomes a wedged supervisor.
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+            reader.join(_READER_JOIN_S)
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=_KILL_WAIT_S)
+                except subprocess.TimeoutExpired:
+                    pass      # the kill-on-close job object is the backstop
+            if alive > _HEALTHY_S and self.parsed:
                 self._streak = 0          # it worked; whatever broke now starts fresh
             self._streak += 1
             delay = min(_RESTART_MAX_S, 2.0 ** min(self._streak, 6))
             self.ok = False
-            tail = " | ".join(self._out[-3:]) or f"exit code {rc}"
-            self.error = (f"presentmon exited after {alive:.0f}s: {tail} — retrying in "
-                          f"{delay:.0f}s (attempt {self._streak})")
+            self._phase = "backoff"
+            if stall:
+                self.error = (f"presentmon {stall} — restarting in {delay:.0f}s "
+                              f"(attempt {self._streak})")
+            else:
+                tail = " | ".join(self._out[-3:]) or f"exit code {proc.poll()}"
+                self.error = (f"presentmon exited after {alive:.0f}s: {tail} — retrying in "
+                              f"{delay:.0f}s (attempt {self._streak})")
             if self._stop.wait(delay):
                 return
+
+    def _begin_generation(self, gen: int) -> None:
+        """Start a generation: the new child's stream is measured from zero.
+
+        Inheriting rows/parsed/silence across a restart is what made the old
+        detector blind — one early row disarmed it for the life of the process —
+        so every per-generation counter is reset here, together with the
+        identity a stale reader checks against before it touches anything.
+        """
+        self._gen = gen
+        self.rows = self.parsed = 0
+        self.header = []
+        self._out = []
+        self._schema_bad = False
+        self._first_row = 0.0
+        self._last_parse = 0.0
+        self.silent_busy_s = 0.0
+        self.ok = False
+        self.error = None
+
+    def _reader_loop(self, proc: subprocess.Popen, gen: int) -> None:
+        try:
+            self._read_stream(proc, gen)
+        except Exception:  # noqa: BLE001 - never let a parse bug kill the stream silently
+            pass
+
+    def _stall_reason(self) -> str | None:
+        """Why this generation is no longer usable, or None while it still is.
+
+        Runs on the supervisor thread next to a reader that may be blocked
+        forever, so it decides from timestamps and counters alone — never by
+        asking the child or the reader anything. The silence clause requires
+        evidence of rendering: a still desktop presents nothing and is not a
+        fault, and restarting a child over it would be a restart loop against
+        an idle machine.
+        """
+        if self.output_file:
+            # Diagnostic mode writes the CSV to a file, so our pipe legitimately
+            # carries no header and no rows: there is no stream here to police,
+            # and the child must be left alone exactly as before.
+            return None
+        now = time.monotonic()
+        if not self.header:
+            if now - self._spawned > _HEADER_TIMEOUT_S:
+                return (f"printed no CSV header within {_HEADER_TIMEOUT_S:.0f}s "
+                        f"(args: {' '.join(self.last_args)})")
+            return None
+        if self._schema_bad:
+            return (f"header has no {_TIME_COL} column, so no row can ever be "
+                    f"parsed (columns: {','.join(self.header)})")
+        if self.rows and not self.parsed and now - self._first_row > _SCHEMA_TIMEOUT_S:
+            return (f"{self.rows} rows arrived and none parsed — no usable "
+                    f"{_TIME_COL} values")
+        if self.silent_busy_s > _STREAM_SILENT_S:
+            return (f"no usable rows for {_STREAM_SILENT_S:.0f}s while something "
+                    f"was rendering (rows {self.rows}, parsed {self.parsed})")
+        return None
 
     def restart(self, reason: str = "") -> None:
         """Throw the capture away and open a clean one. Called after a resume.
@@ -414,12 +562,14 @@ class FrameMonitor:
         if reason:
             self.error = f"restarting capture after {reason}"
 
-    def _read_stream(self, proc: subprocess.Popen) -> None:
+    def _read_stream(self, proc: subprocess.Popen, gen: int | None = None) -> None:
         stream = io.TextIOWrapper(proc.stdout, encoding="utf-8-sig",
                                   errors="replace", newline="")
         reader = csv.reader(stream)
         idx: dict[str, int] | None = None
         for row in reader:
+            if gen is not None and gen != self._gen:
+                return        # a newer generation owns the counters now
             if not row:
                 continue
             if idx is None:
@@ -431,14 +581,25 @@ class FrameMonitor:
                 # column-name question and this is the evidence that answers it.
                 idx = {name: i for i, name in enumerate(row)}
                 self.header = row
-                self.ok = True
+                # …but it does not prove the stream is *usable*. `ok` used to
+                # latch on seeing ProcessID alone, so a header without the
+                # millisecond clock — a stream that can never produce a number —
+                # reported as live forever. Health follows evidence of parsed
+                # frames from here on, and the supervisor restarts on the rest.
+                self._schema_bad = _TIME_COL not in idx
+                self.ok = not self._schema_bad
                 self.error = None
                 continue
             self.rows += 1
-            self._last_row = time.monotonic()
-            self._ingest(row, idx)
+            now = time.monotonic()
+            if self._first_row == 0.0:
+                self._first_row = now
+            self._last_row = now
+            if self._ingest(row, idx):
+                self._last_parse = now
+                self.silent_busy_s = 0.0   # usable row: the silence window restarts
 
-    def _ingest(self, row: list[str], idx: dict[str, int]) -> None:
+    def _ingest(self, row: list[str], idx: dict[str, int]) -> bool:
         # Time by name, never by position: the pre-name-lookup version read
         # row[-1], which on this header is MsClickToPhotonLatency — a mostly-empty
         # unrelated column, which is how "fps never appears" survived as long as
@@ -450,9 +611,9 @@ class FrameMonitor:
             pid = int(row[idx["ProcessID"]])
             t = float(row[i]) if i is not None and i < len(row) else None
         except (ValueError, IndexError):
-            return
+            return False
         if t is None:
-            return
+            return False
         between = self._f(row, idx, "MsBetweenPresents")
         display = self._f(row, idx, "MsBetweenDisplayChange")
         swap = row[idx["SwapChainAddress"]] if "SwapChainAddress" in idx else "-"
@@ -477,6 +638,7 @@ class FrameMonitor:
             if ring is None:
                 ring = self._rings[key] = deque(maxlen=_MAX_SAMPLES)
             ring.append((t, between, display, now, gpu, mode))
+        return True
 
     @staticmethod
     def _f(row: list[str], idx: dict[str, int], col: str) -> float | None:
@@ -497,14 +659,51 @@ class FrameMonitor:
         self.error = msg
 
     # ----------------------------------------------------------------- liveness
+    @property
+    def state(self) -> str:
+        """One word for what the capture is doing, for logs and for tests.
+
+        `ok` answers "can we use this stream"; this answers "why or why not",
+        and the two must not be collapsed into each other again — that is how
+        a stalled child kept reporting as live. The states are deliberately
+        few and each names its own recovery: starting (the header deadline is
+        running), healthy (usable rows recently), idle (quiet, but nothing is
+        rendering, which is a still desktop and not a fault), stale (rendering
+        with no usable rows), bad-schema (this CSV can never yield a number),
+        missing-exe and retrying (between attempts, bounded backoff).
+        """
+        # Checked against the filesystem, not just the phase: a parse test that
+        # points at an absent exe with no supervisor running stays honest, and
+        # an exe that reappeared mid-retry is no longer "missing".
+        if self._phase == "missing-exe" and not os.path.exists(self._exe):
+            return "missing-exe"
+        if self._phase == "backoff":
+            return "retrying"
+        if not self.header:
+            return "starting"
+        if self._schema_bad:
+            return "bad-schema"
+        if self.rows and not self.parsed \
+                and time.monotonic() - self._first_row > _SCHEMA_TIMEOUT_S:
+            return "bad-schema"
+        if self.silent_busy_s > _STREAM_SILENT_S:
+            return "stale"
+        if self.parsed and time.monotonic() - self._last_parse <= _STREAM_SILENT_S:
+            return "healthy"
+        return "idle"
+
     def observe(self, busy: bool, dt: float) -> None:
         """Accumulate "the machine is drawing and we are seeing nothing".
 
         A present stream with nothing in it is normal on a still desktop — DWM
         presents no frames when nothing changes — so the only silence worth
-        reporting is silence while something is visibly rendering.
+        reporting is silence while something is visibly rendering. The window
+        restarts at every usable row (see `_read_stream`), not at "no row has
+        ever arrived": the old `rows == 0` condition meant a single early row
+        disarmed the detector for the life of the process, which is exactly
+        the one-row-then-hang shape a wedged ETW session shows.
         """
-        self.silent_busy_s = self.silent_busy_s + dt if (busy and self.rows == 0) else 0.0
+        self.silent_busy_s = self.silent_busy_s + dt if busy else 0.0
 
     def stream_warning(self) -> str | None:
         """One honest sentence when the capture is up but useless; None if healthy.

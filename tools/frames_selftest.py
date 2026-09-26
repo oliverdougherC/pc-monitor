@@ -122,11 +122,12 @@ class _Stub:
 
 def replay(blob: bytes) -> FrameMonitor:
     cfg = cfgmod.load()
-    # A missing binary keeps __init__ from spawning anything: this is a parse
+    # A missing binary keeps the supervisor from ever spawning: this is a parse
     # test, and the real presentmon needs elevation it must not depend on.
     cfg["frames"]["path"] = "does-not-exist.exe"
     m = FrameMonitor(cfg, role="selftest")
     m.error = None
+    m._phase = "watching"             # state() is about the stream, not the absent exe
     # Pretend the child came up 30 s ago: the liveness guards stay quiet until a
     # stream has had a chance to say something, which is the point of them.
     m._spawned = time.monotonic() - 30.0
@@ -172,7 +173,12 @@ def main() -> int:
 
     print("\ncase 2: 1.x column shape — time is not where the parser looks")
     legacy = replay(synth(V1_HEADER, "QPCTime"))
-    check("header seen", legacy.ok, True)
+    check("header seen", bool(legacy.header), True)
+    # A header without the millisecond clock can never produce a number, so it
+    # is not a live capture: `ok` used to latch True on ProcessID alone and the
+    # heartbeat called this `live` forever (issue #10).
+    check("ok (must be False: no CPUStartQPCTimeInMs)", legacy.ok, False)
+    check("state", legacy.state, "bad-schema")
     check("rows arrived", legacy.rows, 180)
     check("parsed (must be 0: no CPUStartQPCTimeInMs column)", legacy.parsed, 0)
     legacy.silent_busy_s = 99.0
