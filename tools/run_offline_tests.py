@@ -5,7 +5,7 @@
     .venv\Scripts\python tools\run_offline_tests.py --only panel_link
 
 The selftests are the contract — "everything behavioural has an offline proof
-that needs neither admin nor hardware" — but eight separate commands are eight
+that needs neither admin nor hardware" — but nine separate commands are nine
 chances to forget one, and a change cannot be judged by whoever remembers to
 run them. This runner is what CI calls and what a contributor runs before
 pushing: each selftest stays a separate process (its own `sys.path`, its own
@@ -53,6 +53,9 @@ CASES = [
      "reads the live GetLastInputInfo clock, so it fails whenever a human is at the "
      "keyboard and passes when nobody is: it gates the desk, not the code. "
      "Pinning that clock is issue #4, which should drop this advisory flag."),
+    ("wake_gap", ["tools/wake_gap_selftest.py"],
+     "the wake-gap rule on main.py's own dt: one recovery per freeze, none per slow rebuild",
+     None, None),
     ("nightlight", ["tools/nightlight_probe.py", "--selftest"],
      "CloudStore night-mode decode, pinned to captured blobs", None, None),
     ("panel_link", ["tools/panel_link_selftest.py"],

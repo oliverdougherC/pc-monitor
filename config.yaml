@@ -90,7 +90,10 @@ power:
   # value `(seed)` until a real notification replaces it.
   seed_monitor: true
   # A tick gap bigger than this means the process was frozen: the panel link is
-  # rebuilt, the ETW capture is restarted, and the game lock is dropped.
+  # rebuilt, the ETW capture is restarted, and the game lock is dropped. Time the loop
+  # accounts for as its own work is not a gap — a half-minute panel rebuild is this
+  # process being busy, not the machine having been asleep — and the rule is measured
+  # against `sensors.interval_s`, not against the elapsed time it is judging.
   wake_gap_s: 5.0
 
 # Night mode: the panel follows YOUR night mode instead of owning a schedule.

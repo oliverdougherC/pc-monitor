@@ -26,7 +26,11 @@ Two deliberately redundant sources:
      is the same for all three, so it raises the same resume edge. It is also the
      belt to the window's braces — a broadcast is best effort, and a process
      frozen across a suspend never sees the pre-suspend query — but it cannot lie
-     about time.
+     about time. What it can do is be *read* wrongly, so the caller also says how much
+     of the gap it spent executing (`work_s`), and only the rest counts as a freeze:
+     the loop grinding away at a half-minute panel rebuild is this process being busy,
+     which is the opposite of the machine having been asleep, and the difference is
+     what stops a recovery from being caused by the recovery.
 
 Everything degrades on purpose. No window station (a service, a headless run, a
 non-NT platform) and the event layer reports "off", the gap watchdog and the
@@ -318,6 +322,14 @@ class EventWindow:
 
 
 # --------------------------------------------------------------------- the state
+# How many expected ticks may pass before the loop's own gap counts as a freeze. The
+# multiple belongs to the *cadence the loop was asked to keep*, never to the elapsed
+# time being judged: a healthy loop parks for about one cadence, so anything under a
+# few cadences is the app being slow rather than the machine being asleep — and
+# `gap_s` stays the floor, so a 1 Hz loop still declares a freeze after five seconds.
+GAP_TOLERANCE = 3.0
+
+
 class HostState:
     """One refreshed view of the machine, per tick.
 
@@ -327,8 +339,13 @@ class HostState:
     while the panel enumerates.
     """
 
-    def __init__(self, gap_s: float = 5.0, poll_s: float = 5.0, events: bool = True) -> None:
+    def __init__(self, gap_s: float = 5.0, poll_s: float = 5.0,
+                 cadence_s: float = 1.0, events: bool = True) -> None:
         self.gap_s = float(gap_s)
+        # What the caller says a tick is *supposed* to cost. The gap watchdog needs an
+        # expectation to judge against; without one it has nothing but the number it is
+        # measuring, which is how a 30-second suspend came to be compared with 90.
+        self.cadence_s = float(cadence_s)
         self.poll_s = float(poll_s)
         self.asleep = False
         self.asleep_reason = ""
@@ -558,8 +575,16 @@ class HostState:
         return self.monitor_seed
 
     # -- polling -------------------------------------------------------------
-    def tick(self, dt: float) -> None:
-        """Refresh derived state and raise the resume edge. Once per loop tick."""
+    def tick(self, dt: float, work_s: float | None = None) -> None:
+        """Refresh derived state and raise the resume edge. Once per loop tick.
+
+        `dt` is the caller's elapsed time since its previous tick — the clamped one,
+        `main.elapsed_dt` — and it drives the interval counters and nothing else.
+        `work_s` is how much of that elapsed time the caller spent *executing*; the
+        gap measured here minus that is time this process did not run at all, which is
+        the one thing a gap can evidence. A caller that cannot say (the probe, which
+        sleeps between its own ticks) leaves it None and the whole gap stands.
+        """
         # Clear *before* reading: a message that lands during the tick then leaves
         # the flag set, and the wait after this tick returns at once instead of
         # sleeping through an event nobody read.
@@ -587,7 +612,18 @@ class HostState:
             self.monitor_on = True
             self.monitor_seeded = False
             self.last_event = "input-after-seed"
-        if self._primed and gap > max(self.gap_s, 3.0 * max(dt, 0.1)):
+        # Judged against the cadence the loop was asked to keep, never against a multiple
+        # of the elapsed time under test. main.py hands this function its own elapsed
+        # dt, so `gap > 3 * dt` asked a 30-second suspend to outweigh 90 seconds and
+        # announced nothing: past the dt clamp the threshold stopped rising, which left
+        # the configured five-second fallback able to fire only beyond three minutes.
+        # What is left after the caller's own work is subtracted is time this process
+        # did not run — and subtracting it is also what keeps the threshold, now that
+        # it no longer moves with the gap, from reading a slow link rebuild as the wake
+        # it was recovering from and asking for the rebuild all over again.
+        unaccounted = gap if work_s is None else gap - min(max(work_s, 0.0), gap)
+        threshold = max(self.gap_s, GAP_TOLERANCE * self.cadence_s)
+        if self._primed and unaccounted > threshold:
             # Frozen: asleep, hibernating, or starved. Whichever it was, the panel
             # and the ETW child cannot be trusted until they have been re-made.
             self.last_event = f"gap {gap:.0f}s"
