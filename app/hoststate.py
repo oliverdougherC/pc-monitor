@@ -31,7 +31,9 @@ Two deliberately redundant sources:
 Everything degrades on purpose. No window station (a service, a headless run, a
 non-NT platform) and the event layer reports "off", the gap watchdog and the
 idle timeout keep working, and `summary()` prints which sources are live, so
-log.log always says which of the three the panel is currently trusting.
+log.log always says which of the three the panel is currently trusting. The same
+is true of an event layer that *had* a window and lost one: `summary()` says what
+is live now rather than what came up at start-up, and `tick()` puts the pump back.
 """
 from __future__ import annotations
 
@@ -97,26 +99,129 @@ _WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_void_p, ctypes.c_uint,
                               ctypes.c_size_t, ctypes.c_ssize_t) if NT else None
 
 
-def _u32() -> ctypes.WinDLL:
-    """user32 with LRESULT/WPARAM/LPARAM typed, once.
+WS_POPUP = 0x80000000
+ERROR_CLASS_ALREADY_EXISTS = 1410       # ERROR_CLASS_ALREADY_EXISTS: re-registering is fine
+CLASS_NAME = "PCMonitorHostState"
 
-    Not decoration: lParam is a *signed* pointer-sized value (messages arrive with
-    -1 in it), so without `argtypes` ctypes refuses to hand it to a `c_void_p`
-    parameter and DefWindowProc raises OverflowError on every routed message.
+
+class Native:
+    """Every foreign call this module makes, declared once, from the SDK signatures.
+
+    The declarations are not decoration, and the ones that used to be missing were
+    not harmless. ctypes hands an undeclared foreign return back as a C `long`, and
+    on x64 a handle is pointer-sized: `GetModuleHandleW` returns the executable's
+    image base and `CreateWindowExW` returns the new HWND, so left undeclared both
+    come back as the *low half* of the value, sign extended. Every later use of
+    that value - registering for notifications, posting the WM_QUIT that ends the
+    pump, destroying the window - then acts on a window that does not exist, and
+    the calls fail in a thread nobody is watching, so the panel reports event
+    sources it no longer has. The same is why `lParam` is a *signed* pointer-sized
+    value (messages arrive with -1 in it): without `argtypes` ctypes refuses to
+    hand it to a `c_void_p` parameter and DefWindowProc raises OverflowError on
+    every routed message.
+
+    The DLLs are ours rather than `ctypes.windll` so that `use_last_error` applies:
+    ctypes then saves the error for *this* thread after each foreign call, and
+    `ctypes.get_last_error()` reads it back without whatever Python did in between
+    having run another API call over the top of it.
     """
-    u = ctypes.windll.user32
-    u.DefWindowProcW.restype = ctypes.c_ssize_t
-    u.DefWindowProcW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
-                                 ctypes.c_size_t, ctypes.c_ssize_t]
-    u.PeekMessageW.restype = ctypes.c_bool
-    u.PeekMessageW.argtypes = [ctypes.POINTER(_Msg), ctypes.c_void_p,
-                               ctypes.c_uint, ctypes.c_uint, ctypes.c_uint]
-    u.PostMessageW.restype = ctypes.c_bool
-    u.PostMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint,
-                               ctypes.c_size_t, ctypes.c_ssize_t]
-    u.TranslateMessage.argtypes = [ctypes.POINTER(_Msg)]
-    u.DispatchMessageW.argtypes = [ctypes.POINTER(_Msg)]
-    return u
+
+    def __init__(self) -> None:
+        u = self.user32 = ctypes.WinDLL("user32", use_last_error=True)
+        k = self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        vp, up, sp = ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ssize_t
+        i32, u32, b32 = ctypes.c_int, ctypes.c_uint32, ctypes.c_long
+
+        # the pump
+        u.DefWindowProcW.restype = sp
+        u.DefWindowProcW.argtypes = [vp, u32, up, sp]
+        u.PeekMessageW.restype = b32          # BOOL: -1 is a real answer, not True
+        u.PeekMessageW.argtypes = [ctypes.POINTER(_Msg), vp, u32, u32, u32]
+        u.PostMessageW.restype = b32
+        u.PostMessageW.argtypes = [vp, u32, up, sp]
+        u.TranslateMessage.restype = b32
+        u.TranslateMessage.argtypes = [ctypes.POINTER(_Msg)]
+        u.DispatchMessageW.restype = sp
+        u.DispatchMessageW.argtypes = [ctypes.POINTER(_Msg)]
+
+        # the window itself
+        k.GetModuleHandleW.restype = vp                    # HMODULE
+        k.GetModuleHandleW.argtypes = [ctypes.c_wchar_p]
+        u.RegisterClassExW.restype = ctypes.c_uint16       # ATOM
+        u.RegisterClassExW.argtypes = [ctypes.POINTER(_WndClass)]
+        u.CreateWindowExW.restype = vp                     # HWND
+        u.CreateWindowExW.argtypes = [u32, ctypes.c_wchar_p, ctypes.c_wchar_p, u32,
+                                      i32, i32, i32, i32, vp, vp, vp, vp]
+        u.DestroyWindow.restype = b32
+        u.DestroyWindow.argtypes = [vp]
+        u.UnregisterClassW.restype = b32
+        u.UnregisterClassW.argtypes = [ctypes.c_wchar_p, vp]
+
+        # the notifications
+        u.RegisterPowerSettingNotification.restype = vp    # HPOWERNOTIFY
+        u.RegisterPowerSettingNotification.argtypes = [vp,
+                                                       ctypes.POINTER(ctypes.c_ubyte * 16),
+                                                       u32]     # LPCGUID: the 16 bytes themselves
+        u.UnregisterPowerSettingNotification.restype = b32
+        u.UnregisterPowerSettingNotification.argtypes = [vp]   # the handle, not the HWND
+
+        # The surface this module actually calls, bound to the declared objects
+        # above: one place to read the whole ABI, and the seam a test stands in
+        # for when it needs handles that nobody has to earn.
+        for name in ("DefWindowProcW", "DispatchMessageW", "PeekMessageW",
+                     "PostMessageW", "TranslateMessage", "CreateWindowExW",
+                     "DestroyWindow", "RegisterClassExW", "UnregisterClassW",
+                     "RegisterPowerSettingNotification",
+                     "UnregisterPowerSettingNotification"):
+            setattr(self, name, getattr(u, name))
+        self.GetModuleHandleW = k.GetModuleHandleW
+
+        # wtsapi32 is not on every SKU, and losing it costs lock events and nothing
+        # else, so it is allowed to be absent here rather than taking the window down.
+        self.WTSRegisterSessionNotification = None
+        self.WTSUnRegisterSessionNotification = None
+        try:
+            w = self.wtsapi32 = ctypes.WinDLL("wtsapi32", use_last_error=True)
+            w.WTSRegisterSessionNotification.restype = b32
+            w.WTSRegisterSessionNotification.argtypes = [vp, u32]
+            w.WTSUnRegisterSessionNotification.restype = b32
+            w.WTSUnRegisterSessionNotification.argtypes = [vp]
+            self.WTSRegisterSessionNotification = w.WTSRegisterSessionNotification
+            self.WTSUnRegisterSessionNotification = w.WTSUnRegisterSessionNotification
+        except Exception:  # noqa: BLE001 - no session api costs lock events, nothing else
+            self.wtsapi32 = None
+
+    def last_error(self) -> int:
+        return ctypes.get_last_error()
+
+    def register_session(self, hwnd: int) -> bool:
+        if self.WTSRegisterSessionNotification is None:
+            return False
+        try:
+            return bool(self.WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def unregister_session(self, hwnd: int) -> None:
+        if self.WTSUnRegisterSessionNotification is not None:
+            self.WTSUnRegisterSessionNotification(hwnd)
+
+
+_native: Native | None = None
+
+
+def native() -> Native:
+    """The declared native calls, built once per process.
+
+    A function rather than a module-level object because it has to be swappable:
+    tools/eventwindow_selftest.py puts a fake in here, and that is the only honest
+    way to test a lifecycle whose real handles arrive from a window station and a
+    suspend nobody can schedule.
+    """
+    global _native
+    if _native is None:
+        _native = Native()
+    return _native
 
 
 # ------------------------------------------------------------- cheap host polls
@@ -206,115 +311,213 @@ class EventWindow:
     PeekMessage on a 50 ms poll rather than GetMessage: a blocking GetMessage
     needs a posted WM_QUIT to exit, and a thread that cannot exit keeps the
     interpreter alive at shutdown. Polling makes `close()` deterministic.
+
+    The thread is a *service* now, not a one-shot: `supervise()` brings it back
+    when it stops, which is the only way a pump that died at 3 a.m. does not leave
+    the panel trusting a source it no longer has until the next reboot.
     """
 
-    def __init__(self, sink) -> None:
+    def __init__(self, sink, api: Native | None = None, repair_s: float = 30.0) -> None:
         self.sink = sink
+        self.api = api or native()
         self.hwnd: int | None = None
         self.error: str | None = None
         self.reg_console = self.reg_monitor = self.reg_session = False
-        self._keep: list = []
+        self.repairs = 0
+        self.repair_s = float(repair_s)
+        # The HPOWERNOTIFY handles Windows gave back, in the order they arrived.
+        # These are the only things `UnregisterPowerSettingNotification` accepts,
+        # so they are kept rather than reduced to a bool.
+        self._notify: list[int] = []
+        # One callback for the life of the object: the window class holds the raw
+        # function pointer, so a proc that is garbage collected while its class is
+        # still registered takes the process down on the next message routed to any
+        # window of that class - including a window made by a later restart.
+        self._proc = None
+        self._hinstance: int | None = None
         self._stop = threading.Event()
+        self._up = threading.Event()         # built and registered, or failed trying
+        self._down = threading.Event()       # the pump has exited and torn down
         self._thread: threading.Thread | None = None
+        self._last_repair = 0.0
 
+    # -- health ----------------------------------------------------------------
+    @property
+    def live(self) -> bool:
+        """Is there a window right now that Windows can send to?"""
+        return bool(self.hwnd)
+
+    @property
+    def dead(self) -> bool:
+        """Started once and no longer pumping: the state the loop has to react to."""
+        return self._thread is not None and self._down.is_set()
+
+    # -- lifecycle -------------------------------------------------------------
     def start(self, wait_s: float = 3.0) -> bool:
         if not NT:
             self.error = "not Windows"
             return False
         self._thread = threading.Thread(target=self._run, daemon=True, name="host-events")
         self._thread.start()
-        deadline = time.monotonic() + wait_s
-        while time.monotonic() < deadline:
-            if self.hwnd or self.error:
-                break
-            time.sleep(0.02)
-        if not self.hwnd:
+        # Waiting on the build's own event, not on `hwnd`: the handle is published
+        # as soon as the window exists so that teardown can find it, and readiness
+        # means the notifications are registered too. Acting on the first is the
+        # same as acting on neither.
+        if not self._up.wait(wait_s):
             self.error = self.error or "event thread never came up"
-        return bool(self.hwnd)
+        return bool(self.hwnd) and not self.error
 
-    def close(self) -> None:
+    def close(self, join_s: float = 2.0) -> None:
+        """Stop the pump and wait for it: teardown runs on *its* thread, and a
+        caller that does not join cannot say the handles have been released."""
         self._stop.set()
         if self.hwnd:
             try:
-                ctypes.windll.user32.PostMessageW(self.hwnd, WM_QUIT, 0, 0)
+                self.api.PostMessageW(self.hwnd, WM_QUIT, 0, 0)
             except Exception:  # noqa: BLE001
                 pass
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(join_s)
+
+    def supervise(self, wait_s: float = 1.0) -> bool:
+        """Rebuild the pump if it stopped. True when events are running now.
+
+        Called from the loop's tick because nothing else is watching this thread.
+        `repair_s` keeps a machine that will not take a window at all (no window
+        station, a service session) from rebuilding on every tick: the answer is
+        still said, just not sixty times a minute.
+        """
+        if not self.dead:
+            return bool(self.hwnd)
+        now = time.monotonic()
+        if now - self._last_repair < self.repair_s:
+            return False
+        self._last_repair = now
+        return self.restart(wait_s)
+
+    def restart(self, wait_s: float = 3.0) -> bool:
+        """Run the whole lifecycle again, one window and one set of registrations.
+
+        `close()` joins first, so a pump that is wedged rather than dead is found
+        out here: two live pumps would mean two windows of the same class and two
+        of every notification, i.e. every event delivered twice to one sink.
+        """
+        self.close()
+        if self._thread is not None and self._thread.is_alive():
+            # Stuck rather than dead, and a stuck thread cannot be killed: building
+            # now would put a second window of this class on the same broadcasts.
+            # It retires itself as soon as the call it is in returns, and the next
+            # `supervise()` finds it properly dead.
+            self.error = "event thread is wedged, not rebuilding"
+            return False
+        self.repairs += 1
+        self.error = None
+        self._up.clear()
+        self._down.clear()
+        self._stop.clear()
+        return self.start(wait_s)
 
     # -- thread body ---------------------------------------------------------
     def _run(self) -> None:
         try:
             self._build()
+            self._up.set()                # ready: window *and* registrations
+            self._pump()
         except Exception as e:  # noqa: BLE001 - the event layer is optional by design
             self.error = f"{type(e).__name__}: {e}"
-            return
-        u = _u32()
+        finally:
+            # Teardown here, not after the loop: a pump that raises on its third
+            # PeekMessageW used to leave its window, its registrations and its
+            # callback alive with nobody left to close them, and every restart then
+            # added another set.
+            self._up.set()                # a failed build must still release start()
+            self._teardown()
+            self._down.set()
+
+    def _pump(self) -> None:
+        a = self.api
         msg = _Msg()
         while not self._stop.is_set():
-            got = u.PeekMessageW(ctypes.byref(msg), 0, 0, 0, 1)   # PM_REMOVE
+            got = a.PeekMessageW(ctypes.byref(msg), 0, 0, 0, 1)   # PM_REMOVE
             if got == 0:
                 time.sleep(0.05)
                 continue
-            if got == -1 or msg.message == WM_QUIT:
+            if got < 0:
+                # A failed PeekMessageW is not a reason to go quiet: say so, and
+                # let `supervise()` put the pump back.
+                raise OSError(f"PeekMessageW: {a.last_error()}")
+            if msg.message == WM_QUIT:
                 break
-            u.TranslateMessage(ctypes.byref(msg))
-            u.DispatchMessageW(ctypes.byref(msg))
-        self._teardown()
+            a.TranslateMessage(ctypes.byref(msg))
+            a.DispatchMessageW(ctypes.byref(msg))
 
     def _build(self) -> None:
-        u, k = _u32(), ctypes.windll.kernel32
-
-        def wnd_proc(hwnd, msg, wparam, lparam):        # noqa: ANN001
-            try:
-                self.sink(int(msg), int(wparam), int(lparam))
-            except Exception:  # noqa: BLE001 - a handler bug must not kill the pump
-                pass
-            return u.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-        proc = _WNDPROC(wnd_proc)
-        self._keep.append(proc)
-        name = "PCMonitorHostState"
+        a = self.api
+        if self._proc is None:
+            def wnd_proc(hwnd, msg, wparam, lparam):        # noqa: ANN001
+                try:
+                    self.sink(int(msg), int(wparam), int(lparam))
+                except Exception:  # noqa: BLE001 - a handler bug must not kill the pump
+                    pass
+                return a.DefWindowProcW(hwnd, msg, wparam, lparam)
+            self._proc = _WNDPROC(wnd_proc)
+        self._hinstance = a.GetModuleHandleW(None)
         wc = _WndClass()
         wc.cbSize = ctypes.sizeof(wc)
-        wc.lpfnWndProc = ctypes.cast(proc, ctypes.c_void_p)
-        wc.hInstance = k.GetModuleHandleW(None)
-        wc.lpszClassName = name
-        if not u.RegisterClassExW(ctypes.byref(wc)) and ctypes.GetLastError() != 1410:
-            raise OSError(f"RegisterClassExW: {ctypes.GetLastError()}")
-        hwnd = u.CreateWindowExW(0, name, "PC Monitor host state", 0x80000000,  # WS_POPUP
-                                 0, 0, 0, 0, 0, 0, wc.hInstance, None)
+        wc.lpfnWndProc = ctypes.cast(self._proc, ctypes.c_void_p)
+        wc.hInstance = self._hinstance
+        wc.lpszClassName = CLASS_NAME
+        # Re-registering an existing class is the normal case after a restart, and
+        # the class is deliberately the same one: a second name would mean a second
+        # window receiving the same broadcasts.
+        if not a.RegisterClassExW(ctypes.byref(wc)) \
+                and a.last_error() != ERROR_CLASS_ALREADY_EXISTS:
+            raise OSError(f"RegisterClassExW: {a.last_error()}")
+        hwnd = a.CreateWindowExW(0, CLASS_NAME, "PC Monitor host state", WS_POPUP,
+                                 0, 0, 0, 0, 0, 0, self._hinstance, None)
         if not hwnd:
-            raise OSError(f"CreateWindowExW: {ctypes.GetLastError()}")
+            raise OSError(f"CreateWindowExW: {a.last_error()}")
         self.hwnd = hwnd
 
-        # RegisterPowerSettingNotification lives in user32 (kernel32 only on
-        # Windows CE) and returns the registration handle, 0 on failure.
-        reg = u.RegisterPowerSettingNotification
-        reg.restype = ctypes.c_void_p
-        reg.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
-        self.reg_console = bool(reg(hwnd, ctypes.byref(_guid_bytes(GUID_CONSOLE_DISPLAY_STATE)),
-                                    DEVICE_NOTIFY_WINDOW_HANDLE))
-        self.reg_monitor = bool(reg(hwnd, ctypes.byref(_guid_bytes(GUID_MONITOR_POWER_ON)),
-                                    DEVICE_NOTIFY_WINDOW_HANDLE))
-        try:
-            w = ctypes.windll.wtsapi32
-            w.WTSRegisterSessionNotification.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-            self.reg_session = bool(w.WTSRegisterSessionNotification(hwnd,
-                                                                     NOTIFY_FOR_THIS_SESSION))
-        except Exception:  # noqa: BLE001
-            self.reg_session = False
+        # RegisterPowerSettingNotification lives in user32 (kernel32 only on Windows CE).
+        # Its return value is the registration handle, not a success flag: it is the
+        # only thing the unregister call takes, so keeping it is what makes the
+        # lifecycle reversible instead of a slow leak. The two GUIDs are named locals
+        # because `byref` does not keep what it points at alive: a temporary array
+        # can be freed while the call is still reading it.
+        console_guid = _guid_bytes(GUID_CONSOLE_DISPLAY_STATE)
+        monitor_guid = _guid_bytes(GUID_MONITOR_POWER_ON)
+        console = a.RegisterPowerSettingNotification(hwnd, ctypes.byref(console_guid),
+                                                     DEVICE_NOTIFY_WINDOW_HANDLE)
+        monitor = a.RegisterPowerSettingNotification(hwnd, ctypes.byref(monitor_guid),
+                                                     DEVICE_NOTIFY_WINDOW_HANDLE)
+        self.reg_console, self.reg_monitor = bool(console), bool(monitor)
+        self._notify = [h for h in (console, monitor) if h]
+        self.reg_session = a.register_session(hwnd)
 
     def _teardown(self) -> None:
         if not self.hwnd:
             return
+        a = self.api
+        hwnd, handles, session = self.hwnd, self._notify, self.reg_session
+        self.hwnd, self._notify = None, []
+        self.reg_console = self.reg_monitor = self.reg_session = False
         try:
-            if self.reg_console or self.reg_monitor:
-                ctypes.windll.user32.UnregisterPowerSettingNotification(self.hwnd)
-            if self.reg_session:
-                ctypes.windll.wtsapi32.WTSUnRegisterSessionNotification(self.hwnd)
-            ctypes.windll.user32.DestroyWindow(self.hwnd)
-        except Exception:  # noqa: BLE001
+            # Each handle back exactly once, and it is the *notification* handle:
+            # passing the HWND back is a call that fails while the registration
+            # stays alive, so the next build quietly holds a second one.
+            for h in handles:
+                a.UnregisterPowerSettingNotification(h)
+            if session:
+                a.unregister_session(hwnd)
+        except Exception:  # noqa: BLE001 - a half-released source still must not hold the window
             pass
-        self.hwnd = None
+        finally:
+            try:
+                a.DestroyWindow(hwnd)
+            except Exception:  # noqa: BLE001
+                pass
 
 
 # --------------------------------------------------------------------- the state
@@ -341,8 +544,6 @@ class HostState:
         self.idle_known = False
         self.resume: str | None = None
         self.last_event = "-"
-        self.events: dict[str, bool] = {}
-        self.event_error = ""
         self.suspends = 0
         self.resumes = 0
         # Signalled by the event thread on every message that changes the answer.
@@ -350,18 +551,41 @@ class HostState:
         # to sleep" switches the panel off in milliseconds rather than at the top
         # of the next second — which is the only window in which it still works.
         self.event = threading.Event()
-        self._ev = EventWindow(self._on_event)
-        self.events_live = self._ev.start() if events else False
-        self.event_error = self._ev.error or ("events off (selftest)" if not events else "")
-        self.events = {"console-display": self._ev.reg_console,
-                       "monitor-power": self._ev.reg_monitor,
-                       "session": self._ev.reg_session}
         self._tick_now = time.monotonic()
         self._primed = False
         self._asleep_since = 0.0
         self._since_resume = time.monotonic()
         self._poll_left = 0.0
         self._event_lock: bool | None = None
+        # Started last, and only last: the window's thread calls `_on_event` the
+        # moment it has a window, and a handler that met a half-built object would
+        # be raising inside that thread, where nothing prints it.
+        self._events_wanted = bool(events)
+        self._closed = False
+        self._ev = EventWindow(self._on_event)
+        if events:
+            self._ev.start()
+
+    # -- health as seen by the loop ---------------------------------------------
+    # These are views of the window, never start-up copies. A copy is the reason a
+    # pump that died an hour in kept being reported as live: `summary()` printed the
+    # registrations of a window that had stopped existing, and the panel's "is the
+    # event layer there" question was answered from memory.
+    @property
+    def events_live(self) -> bool:
+        return self._ev.live
+
+    @property
+    def events(self) -> dict[str, bool]:
+        return {"console-display": self._ev.reg_console,
+                "monitor-power": self._ev.reg_monitor,
+                "session": self._ev.reg_session}
+
+    @property
+    def event_error(self) -> str:
+        if not self._events_wanted:
+            return "events off (selftest)"
+        return self._ev.error or ""
 
     # -- events --------------------------------------------------------------
     def _on_event(self, msg: int, w: int, l: int) -> None:      # noqa: E741
@@ -606,6 +830,11 @@ class HostState:
                 seen = logon_ui_running()
                 if seen is not None:
                     self.locked = seen
+        if self._events_wanted and not self._closed:
+            # The tick is the only witness this thread has. A pump that stopped
+            # taking messages leaves the panel dark-on-suspend-by-guesswork only,
+            # and `summary()` would keep naming sources that stopped answering.
+            self._ev.supervise()
 
     def take_resume(self) -> str | None:
         """Consume the resume edge (single-shot per wake)."""
@@ -649,4 +878,8 @@ class HostState:
         return s
 
     def close(self) -> None:
+        # Not supervising any more, and joined: this returns once the window is
+        # destroyed and the notification handles are back, which is what a caller
+        # shutting down (or a selftest measuring exactly-once) has to be able to ask.
+        self._closed = True
         self._ev.close()

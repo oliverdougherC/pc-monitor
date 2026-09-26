@@ -82,6 +82,35 @@ class _MONITORINFO(ctypes.Structure):
 _user32 = ctypes.windll.user32 if hasattr(ctypes, "windll") else None
 
 
+def _bind() -> None:
+    """The foreground queries, with their real signatures.
+
+    Same reason as `app/hoststate.py`: an undeclared foreign return comes back as
+    a C `long`, and an HWND is pointer-sized on x64. A truncated handle does not
+    raise here - `GetWindowRect` and `MonitorFromWindow` simply fail on a window
+    that does not exist - so `covers` and `borderless` fall to False and game
+    detection silently loses its window heuristic with no error anywhere.
+    """
+    u = _user32
+    vp = ctypes.c_void_p
+    u.GetForegroundWindow.restype = vp                       # HWND
+    u.GetForegroundWindow.argtypes = []
+    u.GetWindowRect.restype = ctypes.c_long                  # BOOL
+    u.GetWindowRect.argtypes = [vp, ctypes.POINTER(wintypes.RECT)]
+    u.MonitorFromWindow.restype = vp                         # HMONITOR
+    u.MonitorFromWindow.argtypes = [vp, ctypes.c_uint]
+    u.GetMonitorInfoW.restype = ctypes.c_long                # BOOL
+    u.GetMonitorInfoW.argtypes = [vp, ctypes.POINTER(_MONITORINFO)]
+    u.GetWindowLongW.restype = ctypes.c_long                 # LONG (GWL_STYLE fits)
+    u.GetWindowLongW.argtypes = [vp, ctypes.c_int]
+    u.GetWindowThreadProcessId.restype = ctypes.c_uint       # DWORD
+    u.GetWindowThreadProcessId.argtypes = [vp, ctypes.POINTER(wintypes.DWORD)]
+
+
+if _user32 is not None:
+    _bind()
+
+
 def _foreground_info():
     """(pid, process_name, covers_monitor, borderless) of the foreground window.
     Covers is measured against the monitor the window is actually on, so a
