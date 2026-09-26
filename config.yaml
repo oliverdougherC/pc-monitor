@@ -74,6 +74,16 @@ power:
   gradient_min_w: 50   # color: green at/below this
   gradient_max_w: 1000 # color: red at/above this
   gradient_gamma: 0.75
+  # A total is only as whole as its inputs. With a CPU or GPU reading
+  # completely missing the strip shows "-- W partial" instead of a number that
+  # silently excludes a real load (that is how a dead sensor read as 34 W idle).
+  # Set false to accept a known-components-only figure as a floor - it is still
+  # labelled "partial".
+  require_complete: true
+  # Older than this, the number on the strip is labelled "stale": a failed
+  # sensor tick leaves the loop reusing the last snapshot, and its watts are
+  # from whenever that was.
+  max_age_s: 8.0
   # --- what the panel does when the machine itself changes state -------------
   # Read from Windows power/broadcast notifications (app/hoststate.py), not guessed:
   # a hidden top-level window receives WM_POWERBROADCAST (suspend/resume), the

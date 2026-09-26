@@ -57,6 +57,8 @@ CASES = [
      "CloudStore night-mode decode, pinned to captured blobs", None, None),
     ("panel_link", ["tools/panel_link_selftest.py"],
      "link survives raise/hang, rebuilds, walks its device ladder", "vendor", None),
+    ("power_estimate", ["tools/power_estimate_selftest.py"],
+     "power totals carry provenance; unknown telemetry is never a low measured total", None, None),
     ("lights", ["tools/lights_selftest.py"],
      "the one light decision end to end, incl. a rendered night frame", "vendor", None),
     ("layout", ["tools/layout_check.py"],
