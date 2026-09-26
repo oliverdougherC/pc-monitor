@@ -220,12 +220,31 @@ class Layout:
     # ---------- formatters ------------------------------------------------------
     @staticmethod
     def rate(bps: float | None) -> str:
+        """A **byte** rate — disk I/O. Network has its own formatter: the snapshot
+        carries `net_*_bps` in bits per second, and putting those numbers through
+        this one printed `1.0 GB/s` for what was really 125 MB/s (issue #27)."""
         if bps is None:
             return "--"
         for unit, div in (("GB/s", 1e9), ("MB/s", 1e6), ("KB/s", 1e3)):
             if bps >= div:
                 return f"{bps / div:.1f} {unit}"
         return f"{bps:.0f} B/s"
+
+    @staticmethod
+    def bitrate(bps: float | None) -> str:
+        """A **bit** rate — the unit `Snapshot.net_down_bps`/`net_up_bps` carry and
+        the unit networking is quoted in, so the label and the number agree.
+
+        Decimal steps (1e3/1e6/1e9), as link speeds are. `Mbps` is the same width
+        as `MB/s`, which matters: these sit side by side in a 210 px column and
+        `tools/layout_check.py` refuses a layout that overflows it.
+        """
+        if bps is None:
+            return "--"
+        for unit, div in (("Gbps", 1e9), ("Mbps", 1e6), ("Kbps", 1e3)):
+            if bps >= div:
+                return f"{bps / div:.1f} {unit}"
+        return f"{bps:.0f} bps"
 
     @staticmethod
     def ghz(mhz: float | None) -> str:
@@ -251,10 +270,10 @@ class Layout:
             return ("--", DIMMER, max(13, int(size * 0.62)), self.fsmall)
         return (self.num(v, fmt), color, size)
 
-    def _rate_value(self, v: float | None, color, size: int):
+    def _rate_value(self, v: float | None, color, size: int, fmt=None):
         if v is None:
             return ("--", DIMMER, max(13, int(size * 0.62)), self.fsmall)
-        return (self.rate(v), color, size)
+        return ((fmt or self.rate)(v), color, size)
 
     # ---------- telemetry → history (call once per tick, before render) ---------
     def observe(self, snap: Snapshot, state: str = "idle") -> None:
@@ -339,26 +358,27 @@ class Layout:
 
     # ---------- bottom row: paired-rate panel (DISK / NETWORK) -------------------
     def _rate_panel(self, d, box, title, color, lab_a, val_a, ser_a,
-                    lab_b, val_b, ser_b) -> None:
+                    lab_b, val_b, ser_b, fmt=None) -> None:
         x0, y0, x1, y1 = box
         cx0, cx1 = x0 + INNER, x1 - INNER
         self._panel(d, box)
         self._txt(d, (cx0, y0 + 24), title, (self.flabel, 15), color, "ls")
         if not self.trends:
             # serial budget mode: no history bands at all — stacked rows spaced to
-            # fill the panel. Two side-by-side 10-char rate columns ("999.9 MB/s")
-            # would overlap in a 210 px column, so the rows stay stacked either way.
+            # fill the panel. Two side-by-side 10-char rate columns ("999.9 MB/s",
+            # and "999.9 Mbps" is the same width) would overlap in a 210 px column,
+            # so the rows stay stacked either way.
             mid = (y0 + 34 + y1 - 12) // 2
             for off, lab, val in ((mid - 34, lab_a, val_a), (mid + 46, lab_b, val_b)):
                 self._row(d, cx0, cx1, off, left=(lab, DIMMER, 14),
-                          right=self._rate_value(val, color, 26))
+                          right=self._rate_value(val, color, 26, fmt))
             d.line((cx0, mid + 4, cx1, mid + 4), fill=BORDER, width=1)
             return
         # stacked rows: caption + value on one baseline, graph under each
         for row, (lab, val, ser) in enumerate(((lab_a, val_a, ser_a), (lab_b, val_b, ser_b))):
             base = y0 + 58 + row * 80
             self._row(d, cx0, cx1, base, left=(lab, DIMMER, 14),
-                      right=self._rate_value(val, color, 26))
+                      right=self._rate_value(val, color, 26, fmt))
             self._graph(d, cx0, base + 8, cx1, base + 44, ser, color, span_min=1.0,
                         plain=not self.trends)
         d.line((cx0, y0 + 100, cx1, y0 + 100), fill=BORDER, width=1)
@@ -410,7 +430,8 @@ class Layout:
             elif key == "net":
                 self._rate_panel(d, b, "NETWORK", PINK,
                                  "DOWN", snap.net_down_bps, self._series("net.down"),
-                                 "UP", snap.net_up_bps, self._series("net.up"))
+                                 "UP", snap.net_up_bps, self._series("net.up"),
+                                 fmt=self.bitrate)
 
     # ---------- power strip ------------------------------------------------------
     def _power_strip(self, img, d, snap: Snapshot, sx: int, sy: int) -> None:

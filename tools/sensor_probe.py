@@ -18,5 +18,6 @@ print(f"cpu: load={snap.cpu.load_pct} temp={snap.cpu.temp_c} "
 print(f"gpu: load={snap.gpu.load_pct} temp={snap.gpu.temp_c} mhz={snap.gpu.core_mhz} "
       f"power={snap.gpu.power_w} vram={snap.gpu.vram_used_mb}/{snap.gpu.vram_total_mb}")
 print(f"ram: {snap.ram_used_mb}/{snap.ram_total_mb}  disk r/w={snap.disk_read_bps}/{snap.disk_write_bps}")
-print(f"net d/u={snap.net_down_bps}/{snap.net_up_bps}")
+print(f"net d/u={snap.net_down_bps}/{snap.net_up_bps} bit/s (panel: Mbps)   "
+      f"disk r/w in bytes/s")
 print(f"power total={total:.0f}W parts={ {k: round(v) for k, v in parts.items()} }")

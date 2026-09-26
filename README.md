@@ -33,6 +33,7 @@ library reports SKIP, which is never counted as coverage):
 ```
 .venv\Scripts\python tools\run_offline_tests.py       # all of the below, one exit code
 .venv\Scripts\python tools\frames_selftest.py         # fps/GPU/mode parsing, held values, stream guards
+.venv\Scripts\python tools\units_selftest.py         # counter to pixels: net in bits, disk in bytes
 .venv\Scripts\python tools\gamewatch_selftest.py      # entry speed, alt-tab keeps the game's numbers
 .venv\Scripts\python tools\hoststate_selftest.py      # sleep / displays-off / lock / frozen loop
 .venv\Scripts\python tools\lights_selftest.py         # what the panel does about each of those

@@ -43,9 +43,13 @@ class Snapshot:
     gpu: GpuStats = field(default_factory=GpuStats)
     ram_used_mb: float | None = None
     ram_total_mb: float | None = None
-    disk_read_bps: float | None = None
-    disk_write_bps: float | None = None
-    net_down_bps: float | None = None
-    net_up_bps: float | None = None
+    disk_read_bps: float | None = None      # bytes/s  (formatted by Layout.rate)
+    disk_write_bps: float | None = None     # bytes/s  (formatted by Layout.rate)
+    # Network is quoted the way links are quoted: bits per second, and formatted by
+    # Layout.bitrate. The two families differ by a factor of eight, so the suffix
+    # means the unit and not "per second" — sending them through one formatter is
+    # what printed "1.0 GB/s" for 125 MB/s (issue #27).
+    net_down_bps: float | None = None       # bits/s   (formatted by Layout.bitrate)
+    net_up_bps: float | None = None         # bits/s   (formatted by Layout.bitrate)
     frames: FrameStats = field(default_factory=FrameStats)
     power_total_w: float | None = None

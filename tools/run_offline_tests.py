@@ -46,6 +46,8 @@ VENDOR = ROOT / "vendor" / "turing-smart-screen-python"
 CASES = [
     ("frames", ["tools/frames_selftest.py"],
      "present-stream parsing: fps, GPU-busy, held values, stream guards", None, None),
+    ("units", ["tools/units_selftest.py"],
+     "counter to pixels: network stays in bits, disk stays in bytes", "fonts", None),
     ("gamewatch", ["tools/gamewatch_selftest.py"],
      "game entry/exit, alt-tab keeps the locked target, video is not a game", None, None),
     ("hoststate", ["tools/hoststate_selftest.py"],
