@@ -95,13 +95,21 @@ def main() -> int:
         from app.panel import PanelLink
         link = PanelLink(cfgmod.load(None), log=print)
         link.port = port
-        dev = link._device_id(port)
-        par = link._device_id(port, parent=True)
-        print(f"{port} → interface {dev or '(nothing found)'}")
-        print(f"{port} → parent      {par or '(nothing found)'}")
+        # Saying "this port is the panel" out loud is what the operator means by naming
+        # one here, so it is recorded as a confirmed identity - the same record the app
+        # takes from a HELLO answer, and the thing every verb below is aimed by.
+        link._capture_identity(confirmed=True)
+        ident = link._identity
+        print(f"{port} → interface {ident.interface_id if ident else link._identity_error}")
+        if ident:
+            print(f"{port} → hardware ids {'; '.join(ident.hardware_ids)}")
+            print(f"{port} → recognised panel {ident.expected}")
+        par, why = link._verified_target(parent=True)
+        print(f"{port} → parent      {par or f'(refused: {why})'}")
         if "--query" in sys.argv:
             return 0
-        print(f"restart: {link._usb_restart()}  error={link.usb_restart_error or '-'}")
+        print(f"restart: {link._usb_restart()}  error={link.usb_restart_error or '-'} "
+              f"refused={link.usb_restart_refused or '-'}")
         return 0
     print(f"opening {port} at 115200 (rtscts like the vendored driver)", flush=True)
     try:

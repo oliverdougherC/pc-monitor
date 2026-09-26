@@ -180,12 +180,16 @@ def case_ladder() -> None:
     link = PanelLink(simu_cfg(), log=lambda m: print(f"    | {m}"))
     calls: list[str] = []
     link.port = "COM9"
-    # The two things `_usb_restart` does to the outside world, replaced: which device
-    # owns the port, and what the device verbs return. Everything else is the real
-    # ladder logic — and the order of the rungs is the whole point of it.
-    link._device_id = lambda port, parent=False: (
-        "USB\\VID_1D6B&PID_0106&MI_00\\8&1" if not parent
-        else "USB\\VID_1D6B&PID_0106\\20080411")
+    # The two things `_usb_restart` does to the outside world, replaced: which device it is
+    # allowed to aim at, and what the device verbs return. Everything else is the real
+    # ladder logic — and the order of the rungs is the whole point of it. (What makes a
+    # target *verified* is `tools/panel_usb_identity_selftest.py`'s subject.)
+    link._identity = panel_mod.PanelIdentity(
+        "USB\\VID_1D6B&PID_0106&MI_00\\8&1", "COM9",
+        ("USB\\VID_1D6B&PID_0106&MI_00",), expected=True, confirmed=True)
+    link._verified_target = lambda parent=False: (
+        ("USB\\VID_1D6B&PID_0106\\20080411", "") if parent
+        else ("USB\\VID_1D6B&PID_0106&MI_00\\8&1", ""))
     link._pnputil = lambda verb, dev: (calls.append(f"{verb} {dev}"), (True, "stubbed"))[1]
     waits = []
     for _ in range(3):
@@ -270,6 +274,10 @@ def case_exhausted_notice() -> None:
     link._exhausted_notice(now)
     check("silent while rungs remain", any("exhausted" in m for m in seen), False)
     link._restart_attempts = 3
+    link._exhausted_notice(now)
+    check("a ladder that was never allowed to step claims no verdict",
+          sum("exhausted" in m for m in seen), 0)
+    link._restart_touched = 3          # three device verbs actually issued
     link._exhausted_notice(now)
     check("says it once the ladder is out", sum("exhausted" in m for m in seen), 1)
     check("and names the action", "unplug" in seen[-1], True)
