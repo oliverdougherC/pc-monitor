@@ -55,7 +55,7 @@ state, how many bands a partial panel update would need (same math as
 | `main.py` | entry: 1 Hz loop, wiring, and the per-tick guard that keeps one subsystem's raise from ending the app |
 | `app/display.py` | builds the panel object for `display.revision` (the only module that imports the vendored `library.*`) |
 | `app/panel.py` | the panel as a **link that can fail**: guarded/timed device calls, rebuild on its own clock, replays orientation+brightness, and asks Windows to restart the USB device when reopening the port cannot help |
-| `app/hoststate.py` | what the machine is doing: asleep / monitors off / locked, from `WM_POWERBROADCAST` + the console-display power setting + session notifications, with a tick-gap fallback |
+| `app/hoststate.py` | what the machine is doing: asleep / monitors off / locked, from `WM_POWERBROADCAST` + the display-status power settings + session notifications, with a tick-gap fallback |
 | `app/nightlight.py` | is the user's night mode on, and how warm: Windows Night light read out of CloudStore (CompactBinary), plus the gamma ramp as a second opinion for f.lux-style tools |
 | `app/lights.py` | the one light decision: dark? how bright? which warmth LUT? (asleep → locked → monitor-off → idle → game/idle/dim, night applied on top) |
 | `app/sensors/` | backends: `lhm` (LibreHardwareMonitorLib via pythonnet, full fidelity incl. package power & per-core clocks), `fallback` (psutil+NVML, no admin), `demo` |
@@ -296,7 +296,7 @@ panel before is that the inputs did not exist as data anywhere:
 | `asleep` | `WM_POWERBROADCAST` `QUERYSUSPEND`/`SUSPEND` → back on `RESUME`/`RESUMEAUTOMATIC` | off, and the loop stops pushing |
 | `locked` | `WTSRegisterSessionNotification` → `WTS_SESSION_LOCK`/`_UNLOCK`, reconciled against `WTSGetActiveConsoleSessionId` on every tick | off — nobody is at the desk |
 | `console-lost` | our session is still running but another one took the console (fast user switching) | off |
-| `monitor-off` | the `GUID_CONSOLE_DISPLAY_STATE` power setting (+ `GUID_MONITOR_POWER_ON`) — Windows' own display timeout, screensaver blank, or `nircmd`-style sleep | off |
+| `monitor-off` | the `GUID_SESSION_DISPLAY_STATUS` power setting, falling back to `GUID_CONSOLE_DISPLAY_STATE` and then the legacy `GUID_MONITOR_POWER_ON` — Windows' own display timeout, screensaver blank, or `nircmd`-style sleep | off |
 | `idle` | `GetLastInputInfo` past `display.screen_off_after_min` — held while a game is presenting live frames | off (as before) |
 | `dim` | quiet past `display.dim_after_s` (also held during live frames) | `brightness_dim` |
 | `lit` | otherwise | `brightness_game` in game mode, `brightness_idle` not |
@@ -570,7 +570,7 @@ problem; the awake gadget only exists once the panel has enumerated properly.
 
    ```
    [start] pid=40092 ppid=50412 backend=LhmBackend revision=C port=AUTO panel=800x480 frames=starting
-   [host] asleep=False(-) monitor=? locked=False console-lost=False idle=- events=console-display,monitor-power,session
+   [host] asleep=False(-) monitor=? locked=False console-lost=False idle=- events=session-display,console-display,monitor-power,session
    [monitor] off: idle 13424s vs 300s display timeout
    [night] night=off src=windows temp=2525K (state enabled=False schedule-now=False, changed 06:25:12; schedule=False sunset-sunrise 21:00-07:00 temp=2525K)
    [frames] presentmon session live — present-based detection on
