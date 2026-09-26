@@ -26,9 +26,12 @@ powershell -File tools\fetch_presentmon.ps1          # download + sha256-lock ve
 ```
 
 Everything behavioural has an offline proof that needs neither admin nor hardware —
-run them all before trusting a change:
+run them all before trusting a change. One command runs all of them and returns one
+exit code (this is also what CI runs; a case that cannot run for want of the vendored
+library reports SKIP, which is never counted as coverage):
 
 ```
+.venv\Scripts\python tools\run_offline_tests.py       # all of the below, one exit code
 .venv\Scripts\python tools\frames_selftest.py         # fps/GPU/mode parsing, held values, stream guards
 .venv\Scripts\python tools\gamewatch_selftest.py      # entry speed, alt-tab keeps the game's numbers
 .venv\Scripts\python tools\hoststate_selftest.py      # sleep / displays-off / lock / frozen loop
