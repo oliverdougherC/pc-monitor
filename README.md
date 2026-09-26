@@ -38,6 +38,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\lights_selftest.py         # what the panel does about each of those
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
 .venv\Scripts\python tools\panel_link_selftest.py     # link survives raise/hang, rebuilds, walks its device ladder
+.venv\Scripts\python tools\panel_recovery_selftest.py # the USB disable journal, killed at every transition
 .venv\Scripts\python tools\fault_selftest.py          # nothing outside the per-tick guard (AST-checked)
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
 ```
@@ -75,7 +76,8 @@ state, how many bands a partial panel update would need (same math as
 | `tools/gamewatch_selftest.py` | no admin: fake present streams + fake focus through the real detector — fast entry, alt-tab holds the game's numbers, quick exit on quit, video is not a game, target handover |
 | `tools/hoststate_selftest.py` | no admin: replays power/session broadcasts through the real state machine (sleep, monitor timeout, lock, frozen-loop fallback, slow start) |
 | `tools/nightlight_probe.py` | prints what Windows actually stores; `--selftest` replays the captured blobs, `--watch 30` follows a manual toggle |
-| `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the disable/enable journaling (including "a refused disable is never followed by an enable") |
+| `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the fact that the destructive rung is journaled while the device is down |
+| `tools/panel_recovery_selftest.py` | no admin: the USB disable journal against injected `os._exit` crashes at every transition, an unwritable state directory, `pnputil` wording that lies, a device node that answers in German, and a restart from a different working directory |
 | `tools/lights_selftest.py` | the light decision end to end: sleep, displays-off, idle, dim, precedence, the night cap and LUT, and a rendered frame measured before/after the warmth |
 | `tools/fault_selftest.py` | the per-tick guard: fallback + one log line per fault, `SystemExit` contained, Ctrl-C not — plus an AST pass that fails if any subsystem call in the loop has escaped the guard |
 | `tools/hoststate_probe.py` | live watcher at 2 Hz: what each power/session event did to the state (`--trace` for raw window messages) |
@@ -419,13 +421,29 @@ bring the pipe back (a read returned where the write had blocked) but HELLO came
 **empty**: pipe alive, MCU not.
 
 Rung 3 has a real hazard: a device left **disabled** stays disabled through a reboot,
-which would turn a dark panel into an absent one. So the intent is written to
-`.panel_reset_pending` before the disable, the enable is retried three times, the
-marker is deleted on success, and any start that finds the marker enables the device
-before it does anything else. If even the retries fail, the log says so in capitals and
-names the click that undoes it — because at that point the app has made the desk worse
-and must not pretend otherwise. `tools/panel_link_selftest.py` pins all four of those
-paths, including "a refused disable is never followed by an enable".
+which would turn a dark panel into an absent one. So the intent is committed to a
+recovery journal — `%LOCALAPPDATA%\PCMonitor\usb_recovery.json`, written through a temp
+file with an `fsync` and one atomic replace — *before* the disable, and the cycle is
+refused outright when that write fails: an escalation the app declined is a worse
+evening than one it cannot finish. The record moves through `disabling` → `disabled` →
+`enabling` as the cycle does, the enable is retried three times, and the record is
+deleted only when Windows says the device is no longer disabled
+(`Win32_PnPEntity.ConfigManagerErrorCode`, where 22 means disabled and 0 means working):
+`pnputil` exits 0 even when it refuses and its text is localized, so its wording is
+never the reason a record is cleared. Any bring-up that finds a record finishes the job
+first — one enable per attempt, since the retry cadence is the repetition — and a record
+that cannot be parsed is renamed `.unreadable` rather than deleted, because an unreadable
+journal is exactly the case where a device may be sitting disabled. If even the retries
+fail, the log says so in capitals and names the click that undoes it — because at that
+point the app has made the desk worse and must not pretend otherwise.
+
+The journal used to be `.panel_reset_pending` in the working directory, which was the
+bug: a run started from anywhere else could not see the previous run's debt. An old file
+left behind by an earlier version is adopted into the journal instead of dropped.
+`tools/panel_recovery_selftest.py` pins this by killing real child processes with
+`os._exit` at each transition and reading the record back from a different directory,
+and `tools/panel_link_selftest.py` pins the ladder's order and that rung 3 is journaled
+while the device is down.
 
 Honest limit, measured the same night: both restarts were run against this wedged panel
 and it stayed deaf — pnputil reported success, the device re-enumerated, HELLO still

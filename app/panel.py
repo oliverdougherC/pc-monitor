@@ -32,6 +32,9 @@ path did not have to learn about any of this.
 """
 from __future__ import annotations
 
+import json
+import os
+import string
 import subprocess
 import threading
 import time
@@ -39,11 +42,102 @@ from pathlib import Path
 
 from app.display import _HELLO_WAIT_S, _RESET_WAIT_S, ensure_vendor_path
 
-# Written before a `/disable-device` and removed after the matching `/enable-device`.
-# A device left disabled stays disabled through a reboot, so the intent has to outlive
-# this process: whoever starts next reads this and finishes the job. It sits beside
-# log.log because the app's working directory is the project (as it is for the task).
-_MARK_FILE = Path(".panel_reset_pending")
+# The recovery journal: one small file that says "this device was stopped in order to
+# be reset, and it still has to be brought back". It is written *before* the
+# `/disable-device` and removed only once Windows says the device is no longer
+# disabled, because a device left disabled stays disabled through a reboot - whoever
+# starts next has to be able to find the debt. That is why it no longer lives in the
+# working directory: a run started from anywhere else could not see the previous run's
+# record, and the name was gitignored only for the one directory that happened to be
+# current.
+#
+# LOCALAPPDATA is the same under every way this app is started (the scheduled task, a
+# console, a selftest in a temp directory), it needs no elevation to write, and it does
+# not move when the working directory does. `STATE_DIR` is the seam the offline tests
+# use: the gate must not write into a real profile, and two simulated processes have to
+# be able to share one journal.
+_STATE_DIR_NAME = "PCMonitor"
+_STATE_FILE_NAME = "usb_recovery.json"
+_LEGACY_MARK_NAME = ".panel_reset_pending"
+_JOURNAL_VERSION = 1
+STATE_DIR: Path | None = None
+
+# The device id has to survive two parsers (PowerShell's and WQL's) and pnputil's argv
+# before it reaches the kernel, so a record holding anything outside the characters a
+# real PnP instance id is made of is treated as damage rather than as a device to touch.
+_ID_CHARS = frozenset(string.ascii_letters + string.digits + "._&#-\\")
+
+# `ConfigManagerErrorCode` is the Device Manager problem code, read off the device node
+# instead of off a command's wording: 0 is "working properly" and 22 is "this device is
+# disabled". Only 22 proves the thing this journal exists to survive; only 0 proves the
+# device came back whole.
+_CM_PROB_NONE = 0
+_CM_PROB_DISABLED = 22
+
+# The bus needs a moment between the two words, and the enable is asked for more than
+# once because the first attempt against a device that is still re-enumerating fails.
+_BUS_SETTLE_S = 2.0
+_ENABLE_TRIES = 3
+_RECONCILE_LOG_S = 60.0       # how often to repeat "we still owe this device an enable"
+
+
+class RecoveryPhase:
+    """Where an in-progress USB recovery stands, as written in the journal.
+
+    Three points on one path, each recorded *before* the step it describes, so a
+    process killed anywhere along it leaves something a later process can act on:
+
+        disabling  the disable has been asked for; whether it took is not known yet
+        disabled   Windows confirmed it off the bus - the state this file exists for
+        enabling   the enable has been asked for; the confirmation is still owed
+
+    The record is deleted only on the far side of a re-enable that the device node
+    confirmed, never because a command reported success.
+    """
+
+    DISABLING = "disabling"
+    DISABLED = "disabled"
+    ENABLING = "enabling"
+
+
+def state_dir() -> Path:
+    """The stable per-application directory for state that has to outlive the process.
+
+    Nothing is created here: asking for a path should not have side effects. Whoever
+    means to write makes the directory and fails closed if it cannot.
+    """
+    if STATE_DIR is not None:
+        return Path(STATE_DIR)
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        return Path(local) / _STATE_DIR_NAME
+    profile = os.environ.get("USERPROFILE")
+    if profile:
+        return Path(profile) / "AppData" / "Local" / _STATE_DIR_NAME
+    raise OSError("no per-user state directory: LOCALAPPDATA and USERPROFILE are unset")
+
+
+def _legacy_mark_paths() -> list[Path]:
+    """Where the journal used to sit: the working directory, and the project beside it."""
+    root = Path(__file__).resolve().parent.parent
+    return [Path(_LEGACY_MARK_NAME), root / _LEGACY_MARK_NAME]
+
+
+def _is_instance_id(dev: str) -> bool:
+    """One plausible PnP instance id - the only thing worth handing to pnputil."""
+    return (bool(dev) and "\\" in dev and len(dev) <= 400 and dev == dev.strip()
+            and all(ch in _ID_CHARS for ch in dev))
+
+
+def _wql_id(dev: str) -> str:
+    """Escape an instance id for a WQL string literal inside a PowerShell literal.
+
+    WQL wants every backslash doubled; a PowerShell single-quoted literal wants every
+    quote doubled - and since WQL's own escaped quote is two quotes, one quote in the
+    id becomes four here. Getting this wrong does not raise, it silently matches a
+    different device, so it is spelled out once instead of improvised at a query.
+    """
+    return dev.replace("\\", "\\\\").replace("'", "''''")
 
 # A push of the whole 800x480 frame is ~0.82 s on revision C, so "slow" starts
 # above that; anything past _WRITE_GIVEUP_S is the endpoint that stopped draining.
@@ -95,6 +189,9 @@ class PanelLink:
         self._device = ""
         self.usb_restarts = 0
         self.usb_restart_error = ""
+        self.recovery_pending = ""    # device a USB cycle still owes an enable
+        self.recovery_error = ""      # last journal or device-state problem
+        self._last_reconcile_log = 0.0
         self._brightness: int | None = None
         self._screen_on: bool | None = None
         self.needs_full = True       # panel memory is not trustworthy yet
@@ -154,10 +251,11 @@ class PanelLink:
         `ok` is False, so there is nothing to guard during the attempt.
         """
         ensure_vendor_path()
-        if _MARK_FILE.exists():
-            # Somebody (probably an earlier us) stopped this device to reset it and did
-            # not finish the job. Fix that before complaining that it will not answer.
-            self._heal_disabled()
+        # Before anything asks why the panel is silent: a device an earlier attempt
+        # left disabled *is* an answer, and finishing that job is not something to do
+        # later - the alternative is spending the recovery ladder fighting a device we
+        # ourselves switched off.
+        self._reconcile_recovery()
         from library.lcd.lcd_comm import Orientation   # noqa: F401 (per attempt)
         import importlib
 
@@ -536,9 +634,12 @@ class PanelLink:
 
         1. restart the CDC interface (`…&MI_00`) — re-initialises the serial pipe;
         2. restart the composite device above it — the software unplug/replug;
-        3. disable and re-enable that device — the strongest thing software can do to
+        3. disable and re-enable that device - the strongest thing software can do to
            the port, and the only rung that can leave the device *disabled*, so it is
-           bracketed by a marker file and a start-up heal (see `_power_cycle`).
+           bracketed by the recovery journal (see `_disable_and_enable`). Stopping a
+           driver is not an electrical power cycle: the panel keeps its 5 V rail
+           through a disabled port on a self-powered hub, which is why this rung is
+           allowed to fail and to say so rather than being logged as a reboot.
 
         Measured on this desk: the interface restart brought the pipe back (a read
         returned where the write had blocked) but HELLO came back empty — pipe alive,
@@ -564,8 +665,8 @@ class PanelLink:
         self._restart_attempts += 1     # how long to wait for the next rung
         self._restart_depth += 1        # next time, aim one rung higher
         if depth >= 2:
-            ok, line = self._power_cycle(dev)
-            did = "power-cycled the panel's USB device"
+            ok, line = self._disable_and_enable(dev)
+            did = "disabled and re-enabled the panel's USB device"
         else:
             ok, line = self._pnputil("/restart-device", dev)
             did = f"restarted the panel's USB {'device' if parent else 'port'}"
@@ -593,66 +694,361 @@ class PanelLink:
         line = (out.splitlines() or [f"exit {r.returncode}"])[-1][:140]
         return (r.returncode == 0 and not bad), line
 
-    def _power_cycle(self, dev: str) -> tuple[bool, str]:
+    def _device_state(self, dev: str) -> str:
+        """What Windows says about this one device instance: on | off | degraded |
+        absent | unknown.
+
+        The answer comes off the device node rather than off what a command printed:
+        pnputil exits 0 even when it refuses, and its wording is localized, so text
+        cannot be the reason a recovery record gets deleted. The query matches the
+        exact instance id and not a name pattern, because the question is about this
+        device and not about a second one that happens to be named similarly.
+
+        `degraded` is a node that is there, is not disabled, and is reporting some
+        other problem: the debt is paid even though the panel may still be unusable,
+        because this record's only promise is that we did not leave the device
+        switched off. `unknown` keeps the record alive - an unanswered question is not
+        a confirmation of one.
+        """
+        if not _is_instance_id(dev):
+            return "unknown"
+        ps = ("$f = 'DeviceID=' + [char]39 + '" + _wql_id(dev) + "' + [char]39;"
+              " $d = @(Get-CimInstance Win32_PnPEntity -Filter $f);"
+              " if ($d.Count -eq 0) { 'PANELSTATE absent' }"
+              " elseif ($d.Count -gt 1) { 'PANELSTATE ambiguous' }"
+              " else { 'PANELSTATE ' + [string]$d[0].Present + ' '"
+              " + [string]$d[0].ConfigManagerErrorCode }")
+        try:
+            r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
+                                "-Command", ps], capture_output=True, text=True,
+                               timeout=60)
+        except Exception as e:  # noqa: BLE001 - unreadable is a state, not a crash
+            self.recovery_error = f"state query: {type(e).__name__}: {e}"
+            return "unknown"
+        for line in reversed((r.stdout or "").splitlines()):
+            line = line.strip()
+            if not line.startswith("PANELSTATE "):
+                continue
+            fields = line.split()[1:]
+            if fields == ["absent"]:
+                return "absent"
+            if fields == ["ambiguous"]:
+                self.recovery_error = f"{dev}: several nodes answer to one instance id"
+                return "unknown"
+            if len(fields) == 2 and fields[1].lstrip("-").isdigit():
+                code = int(fields[1])
+                if code == _CM_PROB_DISABLED:
+                    return "off"
+                if code == _CM_PROB_NONE:
+                    return "on" if fields[0] == "True" else "degraded"
+                return "degraded"
+            break
+        self.recovery_error = f"the device-state query for {dev} said nothing usable"
+        return "unknown"
+
+    # ---------------------------------------------------- the recovery journal
+    def _journal_path(self) -> Path:
+        return state_dir() / _STATE_FILE_NAME
+
+    def _journal_name(self) -> str:
+        """Where the journal lives, for a log line - even when that path is the fault."""
+        try:
+            return str(self._journal_path())
+        except OSError:
+            return _STATE_FILE_NAME
+
+    def _stamp(self) -> str:
+        """UTC at second resolution: the journal is read by a later process, possibly
+        after a reboot, so the clock it happened to be written on must not matter."""
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+    def _new_record(self, dev: str, phase: str) -> dict:
+        return {"version": _JOURNAL_VERSION, "phase": phase, "device_id": dev,
+                "port": self.port or "", "pid": os.getpid(),
+                "written_at": self._stamp()}
+
+    def _write_record(self, record: dict) -> str:
+        """Put the journal on disk; "" means it is there, anything else is why not.
+
+        Temp file, fsync, then one atomic replace: a crash anywhere in here leaves
+        either the previous record or this one, never a half-written file the next
+        process cannot read. Windows gives no way to force a directory entry, so the
+        replace is the last step that can be durable - everything before it has
+        already been pushed out of the cache.
+        """
+        try:
+            d = state_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            tmp = d / (_STATE_FILE_NAME + ".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(record, fh, sort_keys=True)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, d / _STATE_FILE_NAME)
+        except OSError as e:  # noqa: BLE001 - the caller decides how loud to be
+            self.recovery_error = f"write: {type(e).__name__}: {e}"
+            return self.recovery_error
+        self.recovery_error = ""
+        return ""
+
+    def _read_record(self) -> tuple[dict | None, str]:
+        """The pending recovery, and why there is no readable one.
+
+        The two halves are different answers: (None, "") means nothing is owed, while
+        (None, reason) means a record is sitting there that cannot be trusted - which
+        is never treated as "nothing owed", because an unreadable journal is exactly
+        the case where a device may have been left disabled.
+        """
+        try:
+            raw = self._journal_path().read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None, ""
+        except OSError as e:  # noqa: BLE001
+            return None, f"read: {type(e).__name__}: {e}"
+        try:
+            rec = json.loads(raw)
+        except ValueError as e:  # noqa: BLE001
+            return None, f"not JSON: {type(e).__name__}"
+        if not isinstance(rec, dict):
+            return None, "not an object"
+        if rec.get("version") != _JOURNAL_VERSION:
+            return None, f"version {rec.get('version')!r} is not {_JOURNAL_VERSION}"
+        dev = rec.get("device_id")
+        if not isinstance(dev, str) or not _is_instance_id(dev):
+            return None, "no usable device instance id"
+        if rec.get("phase") not in (RecoveryPhase.DISABLING, RecoveryPhase.DISABLED,
+                                    RecoveryPhase.ENABLING):
+            return None, f"unknown phase {rec.get('phase')!r}"
+        return rec, ""
+
+    def _pending_recovery(self) -> str:
+        """The device a recovery still owes an enable, or "" when nothing is owed."""
+        rec, _ = self._read_record()
+        return rec["device_id"] if rec else ""
+
+    def _record_phase(self, dev: str, phase: str) -> str:
+        """Move the journal to the next phase, keeping the time the cycle started.
+
+        A failed write is reported and never swallowed: past this point this process
+        may be the only thing that knows the device is off the bus.
+        """
+        rec, _ = self._read_record()
+        if not rec or rec.get("device_id") != dev:
+            rec = self._new_record(dev, phase)
+        else:
+            rec["phase"] = phase
+            rec["port"] = self.port or rec.get("port", "")
+        rec["written_at"] = self._stamp()
+        rec["pid"] = os.getpid()
+        reason = self._write_record(rec)
+        if reason:
+            self.log(f"[panel] the recovery journal for {dev} could not be updated "
+                     f"({reason}) - the device may be left disabled with nothing on "
+                     f"disk saying so")
+        return reason
+
+    def _clear_journal(self, dev: str) -> None:
+        """The debt is paid: the device node itself says it is no longer disabled.
+
+        Only `_device_state` gets to decide that. pnputil's wording never does - it
+        exits 0 when it refuses, and on a localized system the words are not English.
+        """
+        try:
+            self._journal_path().unlink(missing_ok=True)
+        except OSError as e:  # noqa: BLE001
+            self.recovery_error = f"clear: {type(e).__name__}: {e}"
+            self.log(f"[panel] {dev} is back but the recovery record could not be "
+                     f"removed ({self.recovery_error}); it is re-checked and cleared "
+                     f"again on the next bring-up")
+            return
+        self.recovery_pending = ""
+        self.log(f"[panel] {dev} confirmed enabled again - recovery record cleared")
+
+    def _quarantine(self, path: Path, why: str) -> None:
+        """Move a record that cannot be read aside, instead of deleting it.
+
+        An unreadable journal is the exact case where a device may have been left
+        disabled, so its bytes stay on disk for a person; renaming it is what stops the
+        same unreadable file being re-read on every bring-up, and it says in the name
+        that something here was not finished.
+        """
+        aside = path.with_name(path.name + ".unreadable")
+        self.recovery_error = f"{path.name}: {why}"
+        try:
+            os.replace(path, aside)
+        except OSError as e:  # noqa: BLE001
+            self.recovery_error = f"quarantine: {type(e).__name__}: {e}"
+            return
+        self.log(f"[panel] the recovery record at {path} could not be read ({why}); it "
+                 f"is kept as {aside.name} rather than deleted. If the panel's USB "
+                 f"device is disabled in Device Manager, enable it - a disabled device "
+                 f"stays disabled through a reboot.")
+
+    def _adopt_legacy_mark(self) -> None:
+        """Carry in the journal from before it had a stable home.
+
+        `.panel_reset_pending` sat in the working directory, so a debt recorded by a
+        run started from elsewhere was invisible to the run that had to finish it. An
+        old file is adopted rather than dropped: it is the only memory that a device is
+        sitting disabled, and it holds a bare id with no phase, which is read as the
+        cautious one - confirmed disabled.
+        """
+        for legacy in _legacy_mark_paths():
+            try:
+                dev = legacy.read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+            if not dev:
+                try:
+                    legacy.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
+            if not _is_instance_id(dev):
+                self._quarantine(legacy, f"{dev!r} is not a device instance id")
+                continue
+            owed = self._pending_recovery()
+            if owed and owed != dev:
+                self._quarantine(legacy, f"{owed} is already owed an enable")
+                continue
+            if not owed:
+                self._write_record(self._new_record(dev, RecoveryPhase.DISABLED))
+                self.log(f"[panel] adopted the recovery record for {dev} from {legacy} "
+                         f"into {self._journal_name()}")
+            try:
+                legacy.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _enable_and_confirm(self, dev: str, tries: int) -> tuple[bool, str]:
+        """Ask for the enable, and let the device node - not pnputil - say whether it took.
+
+        (True, ...) means Windows says the device is off the disabled list. False means
+        the record stays: the enable either failed or its effect could not be read, and
+        both leave a device that might still be off the bus.
+        """
+        last = "not attempted"
+        for attempt in range(max(1, tries)):
+            self._record_phase(dev, RecoveryPhase.ENABLING)
+            ok, last = self._pnputil("/enable-device", dev)
+            if not ok:
+                self.recovery_error = f"enable: {last}"
+            state = self._device_state(dev)
+            if state in ("on", "degraded"):
+                return True, last
+            if attempt + 1 < tries:
+                time.sleep(_BUS_SETTLE_S)     # re-enumeration is not instant
+        return False, last
+
+    def _disable_and_enable(self, dev: str) -> tuple[bool, str]:
         """Disable, then re-enable: take the device off the bus and put it back.
 
         `/restart-device` re-initialises the driver stack while the device stays
-        claimed; disabling tears it down and re-enabling re-enumerates it, which is as
-        close to pulling the plug as an OS will let a program get.
+        claimed; disabling tears it down and re-enabling re-enumerates it. That is the
+        strongest thing software can do to the port, and it is *not* an electrical power
+        cycle - a self-powered hub keeps the panel's rail up while its port is disabled
+        - so it is reported as what it is, and it is never counted as a fix on its own.
 
-        The risk is the gap between the two words: a device left disabled stays
-        disabled **through a reboot**, which would turn a dark panel into an absent one.
-        So the intent is written down before the disable (`_MARK_FILE`) and the enable
-        is retried; if even that fails, the log says what to click, because the app has
-        then genuinely made the desk worse and must not pretend otherwise.
+        The two words are not one action, and the gap between them is the whole risk: a
+        device left disabled stays disabled **through a reboot**. So the intent is
+        committed to the journal before the first pnputil call, and the cycle is refused
+        outright when that write fails - a declined escalation is a worse evening than
+        one we cannot finish. Nothing deletes the record except the device node saying
+        it is no longer disabled, and the finally below makes sure a raise part-way
+        through leaves the record behind instead of clearing it.
         """
-        ok, line = self._pnputil("/disable-device", dev)
-        if not ok:
-            return False, f"disable: {line}"      # never re-enable what we did not stop
+        if not _is_instance_id(dev):
+            return False, f"refusing to touch {dev!r}: not a usable device instance id"
+        owed = self._pending_recovery()
+        if owed:
+            return False, (f"{owed} is still owed an enable from an earlier attempt; "
+                           f"finishing that comes before another device cycle")
+        reason = self._write_record(self._new_record(dev, RecoveryPhase.DISABLING))
+        if reason:
+            self.log("[panel] NOT disabling the device: the recovery journal could not "
+                     f"be written ({reason}). A device left disabled stays disabled "
+                     f"through a reboot, so this rung is skipped; the journal belongs "
+                     f"at {self._journal_name()}")
+            return False, f"journal: {reason}"
+        self.recovery_pending = dev
+        paid = False                    # the node says the device is no longer disabled
+        last = ""
         try:
-            _MARK_FILE.write_text(dev + "\n", encoding="utf-8")
-        except OSError:
-            pass   # the marker is the safety net; the enable below is the real step
-        time.sleep(2.0)                # the hub needs a moment to drop it
-        last = line
-        for _ in range(3):
-            ok, last = self._pnputil("/enable-device", dev)
-            if ok:
-                try:
-                    _MARK_FILE.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                return True, last
-            time.sleep(2.0)
-        self.log(f"[panel] COULD NOT RE-ENABLE the panel's USB device ({dev}): {last} — "
-                 f"Device Manager → USB → enable it, or replug the screen. "
-                 f"A disabled device stays disabled through a reboot.")
-        return False, f"enable: {last}"
+            ok, last = self._pnputil("/disable-device", dev)
+            state = self._device_state(dev)
+            if state == "on":
+                # The node says it is still enabled: whatever pnputil printed, there is
+                # no stopped device to bring back, so nothing is owed and nothing hurt.
+                paid = True
+                return False, f"disable did not take effect ({last})"
+            # off / degraded / absent / unknown: assume the stop happened. Enabling a
+            # device that was never stopped is a no-op; missing one that was is the bug.
+            if not ok:
+                # pnputil said no and the node has not contradicted it - the device may
+                # already have been stopped by something else. The enable is owed to it
+                # either way, so this is a note about the wording and not a reason to
+                # stop here and leave the device down.
+                self.recovery_error = f"disable: {last}"
+            self._record_phase(dev, RecoveryPhase.DISABLED)
+            self.log(f"[panel] {dev} disabled for a bus cycle - the recovery record at "
+                     f"{self._journal_name()} stays until the device is confirmed back")
+            time.sleep(_BUS_SETTLE_S)        # the hub needs a moment to drop it
+            paid, last = self._enable_and_confirm(dev, _ENABLE_TRIES)
+            return paid, last
+        finally:
+            if paid:
+                self._clear_journal(dev)
+            else:
+                self._record_phase(dev, RecoveryPhase.DISABLED)
+                self.recovery_pending = dev
+                self.log(f"[panel] COULD NOT CONFIRM {dev} is enabled again ({last}) - "
+                         f"the recovery record stays at {self._journal_name()} and the "
+                         f"next bring-up retries. Device Manager -> USB -> enable it, "
+                         f"or replug the screen. A disabled device stays disabled "
+                         f"through a reboot.")
 
-    def _heal_disabled(self) -> None:
-        """If a previous run left the device disabled (crash between the two words),
-        enable it before anything else. The marker file is the whole memory: this may
-        be a different process, or the first tick after a boot."""
-        try:
-            dev = _MARK_FILE.read_text(encoding="utf-8").strip()
-        except OSError:
-            return
-        if not dev:
-            try:
-                _MARK_FILE.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return
-        self.log(f"[panel] a previous run left {dev} disabled — enabling it")
-        ok, line = self._pnputil("/enable-device", dev)
+    def _reconcile_recovery(self) -> bool:
+        """Finish a recovery that was started earlier - possibly by a process that died.
+
+        Reached from every bring-up, which is what makes a crash survivable: the record
+        is on disk before the disable, so the debt outlives whoever incurred it, and
+        this is where it gets paid. One enable per call, because the caller's own retry
+        cadence is the repetition - a device that needs a dozen tries is asked a dozen
+        times over a dozen attempts instead of in one blocking burst.
+
+        True means nothing is owed. False means the record is still there, and while it is
+        the reason is logged again every `_RECONCILE_LOG_S` and `summary()` carries the
+        device id: a half-finished recovery must not be a secret kept from whoever ends
+        up reading the log.
+        """
+        self._adopt_legacy_mark()
+        rec, why = self._read_record()
+        if rec is None:
+            if why:
+                try:
+                    self._quarantine(self._journal_path(), why)
+                except OSError as e:  # noqa: BLE001 - nowhere to put it, so say so
+                    self.recovery_error = f"state directory: {type(e).__name__}: {e}"
+            self.recovery_pending = ""
+            return not why
+        dev = rec["device_id"]
+        self.recovery_pending = dev
+        state = self._device_state(dev)
+        if state in ("on", "degraded"):
+            self._clear_journal(dev)
+            return True
+        ok, last = self._enable_and_confirm(dev, 1)
         if ok:
-            try:
-                _MARK_FILE.unlink(missing_ok=True)
-            except OSError:
-                pass
-            self.log("[panel] device re-enabled")
-        else:
-            self.log(f"[panel] still could not enable {dev}: {line}")
+            self._clear_journal(dev)
+            return True
+        now = time.monotonic()
+        if now - self._last_reconcile_log > _RECONCILE_LOG_S:
+            self._last_reconcile_log = now
+            self.log(f"[panel] still owes {dev} an enable (record says {rec['phase']}, "
+                     f"written {rec.get('written_at', '?')}, device reads {state}): "
+                     f"{last} - keeping {_STATE_FILE_NAME} and asking again on every "
+                     f"bring-up")
+        return False
 
     def close(self) -> None:
         with self._lock:
@@ -674,6 +1070,10 @@ class PanelLink:
             s += f" usb_restarts={self.usb_restarts}"
         elif self.usb_restart_error:
             s += f" usb_restart={self.usb_restart_error}"
+        if self.recovery_pending:
+            s += f" recovery_pending={self.recovery_pending}"
+        elif self.recovery_error:
+            s += f" journal={self.recovery_error}"
         if self.errors or self.slow_writes:
             s += f" errors={self.errors} slow={self.slow_writes}"
         return s

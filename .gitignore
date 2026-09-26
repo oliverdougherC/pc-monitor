@@ -9,6 +9,9 @@ probe.txt
 lhm_dump.txt
 # Journal of an in-progress USB disable/enable (app/panel.py). Transient, machine
 # specific, and its presence means "a device needs re-enabling" - never a source file.
+# It now lives under %LOCALAPPDATA%\PCMonitor; this name is kept ignored because it is
+# where the journal used to be written, and a leftover from an older run must never be
+# committed by whoever happens to clean up after one.
 .panel_reset_pending
 
 # theme/render scratch
