@@ -318,6 +318,14 @@ class EventWindow:
 
 
 # --------------------------------------------------------------------- the state
+# How far the reported age of the last input has to beat what time alone would have
+# made of it before it counts as *new* input. The idle clock and the loop's own
+# accounting of the tick are separate sources reconciled once per read, so a fraction
+# of a second of disagreement between them is measurement noise; half a second of
+# real movement is not.
+INPUT_PROGRESS_S = 0.5
+
+
 class HostState:
     """One refreshed view of the machine, per tick.
 
@@ -325,6 +333,16 @@ class HostState:
     wake/gap/display-change and then clears itself, so the loop reconnects the
     panel and restarts the capture exactly once per wake instead of every tick
     while the panel enumerates.
+
+    A suspend is tracked twice, on purpose: `asleep` is the belief the light decision
+    acts on, and `suspend_pending` is the *request* Windows made that nothing has
+    answered yet. The rule used to be "any input younger than two seconds proves a
+    wake", and the click on Start -> Sleep is exactly that, so the click cancelled the
+    request it had just made. Answering one now takes an answer - a resume message,
+    the loop having been frozen across the suspend, or input that moved the clock
+    forward *from the request* - and while a request is outstanding the loop holds a
+    resume edge rather than spending the milliseconds before the bus loses power on
+    rebuilding the link.
     """
 
     def __init__(self, gap_s: float = 5.0, poll_s: float = 5.0, events: bool = True) -> None:
@@ -332,6 +350,12 @@ class HostState:
         self.poll_s = float(poll_s)
         self.asleep = False
         self.asleep_reason = ""
+        # A suspend is tracked as a request as well as a belief: `asleep` is what the
+        # light decision acts on, `suspend_pending` that Windows has not answered the
+        # request yet, and `_input_age` the last read of the input clock an answer is
+        # judged against. See `_request_suspend`.
+        self.suspend_pending = False
+        self._input_age: float | None = None
         self.monitor_on: bool | None = None      # None = nothing has said yet
         self.monitor_seeded = False              # the current value is a derivation
         self.monitor_seed = ""                   # …and how it was arrived at
@@ -377,10 +401,10 @@ class HostState:
         if msg == WM_POWERBROADCAST:
             if w in (PBT_APMQUERYSUSPEND, PBT_APMQUERYUSERSUSPEND):
                 # The last instant at which we can still switch the panel off.
-                self._enter_asleep("query-suspend")
+                self._request_suspend("query-suspend")
                 self.last_event = "suspend-query"
             elif w == PBT_APMSUSPEND or w == PBT_APMUSERSUSPEND:
-                self._enter_asleep("suspend")
+                self._request_suspend("suspend")
                 self.last_event = "suspend"
             elif w in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMUSERRESUME):
                 self._exit_asleep(f"resume:{w:#x}")
@@ -450,12 +474,47 @@ class HostState:
         if on:
             self.resume = self.resume or f"{which}-display-on"
 
-    def _enter_asleep(self, why: str) -> None:
+    def _request_suspend(self, why: str) -> None:
+        """Windows has asked to suspend (or has done it): nothing may light the panel.
+
+        This is a *request*, and it stays outstanding until something answers it. The
+        rule used to be "any reading of the input clock under two seconds old proves a
+        wake", and the click on Start -> Sleep is exactly that: the click cancelled the
+        very request it made, the loop got a resume edge, and the panel was relit and
+        relinked on its way into a suspend.
+
+        So the request arms `_note_input` with a first reading of the clock, and only a
+        reading that moved forward from there answers it. The read may fail; a missing
+        clock is not an answer either, and the anchor simply waits for one it can use.
+        """
         if not self.asleep:
             self.suspends += 1
             self._asleep_since = time.monotonic()
         self.asleep = True
         self.asleep_reason = why
+        self.suspend_pending = True
+        self._input_age = idle_seconds()
+
+    def _note_input(self, seen: float | None, dt: float) -> bool:
+        """Has the input clock moved forward since the last time it was read?
+
+        A reading taken `dt` after the previous one is `dt` older if nothing happened,
+        so a reading *younger* than that - by more than the slack between the idle
+        clock and the loop's own accounting of the tick - is a keystroke that came
+        after the request, which is the only input that can answer a sleep that was
+        aborted after the query (lid closed then reopened, a suspend that failed to
+        take) when no resume message is ever going to arrive.
+
+        The first reading after a request only anchors. Whatever it reports belongs to
+        a desk that had not been asked to sleep yet, and the click that asked for it
+        keeps reporting "just now" for two seconds afterwards.
+        """
+        if seen is None:
+            self._input_age = None      # unreadable: nothing to judge the next by
+            return False
+        prev = self._input_age
+        self._input_age = seen
+        return prev is not None and seen + INPUT_PROGRESS_S < prev + dt
 
     def _exit_asleep(self, why: str) -> None:
         was = self.asleep
@@ -463,6 +522,8 @@ class HostState:
             self.resumes += 1
         self.asleep = False
         self.asleep_reason = ""
+        self.suspend_pending = False
+        self._input_age = None
         # A wake arrives before anyone knows the display state, and
         # PBT_APMRESUMEAUTOMATIC lands while the screen is still dark: after a
         # real sleep, drop the monitor flag to unknown rather than guessing on,
@@ -570,14 +631,6 @@ class HostState:
         seen = idle_seconds()
         self.idle_known = seen is not None
         self.idle_s = seen if seen is not None else 0.0
-        if self.asleep and self.idle_known and self.idle_s < 2.0:
-            # Nobody types while the machine is suspended, so fresh input is proof it
-            # is awake — the belt to the resume message's braces. Without it, a sleep
-            # that was aborted after the suspend query (lid closed then reopened, a
-            # sleep that failed to take) could leave the panel dark on a live desktop
-            # with no event left to save it.
-            self.last_event = "input after suspend"
-            self._exit_asleep(self.resume or "input-after-suspend")
         if self.monitor_seeded and self.idle_known and self.idle_s < 2.0:
             # Fresh input means somebody is at the desk, and on Windows any input
             # brings the displays back — so a monitor state that was only *derived*
@@ -590,10 +643,27 @@ class HostState:
         if self._primed and gap > max(self.gap_s, 3.0 * max(dt, 0.1)):
             # Frozen: asleep, hibernating, or starved. Whichever it was, the panel
             # and the ETW child cannot be trusted until they have been re-made.
+            #
+            # Decided before the input rule, and deliberately so. A frozen loop is
+            # the one piece of evidence here that cannot be confused by the two clocks
+            # disagreeing - after a real sleep the idle clock has not aged at all while
+            # the loop's has aged by the whole suspend - so it answers for the suspend
+            # it swallowed, and the panel-off intent ends with a resume edge named for
+            # what actually happened rather than for a keystroke nobody made.
             self.last_event = f"gap {gap:.0f}s"
             why = (f"wake-after-{self.asleep_reason}" if self.asleep
                    else f"gap:{gap:.0f}s")
             self._exit_asleep(self.resume or why)
+        if self.suspend_pending and self._note_input(seen, dt):
+            # Nobody types while the machine is suspended, so input that moved the
+            # clock *forward from the request* is proof it is awake again - the belt
+            # to the resume message's braces, and the only answer available when a
+            # sleep was aborted after the query (lid closed then reopened, a suspend
+            # that failed to take) and no resume message is coming. What it must not be
+            # is a small *age*: the click that invoked Sleep is input, and every
+            # reading for the next two seconds says so.
+            self.last_event = "input after suspend"
+            self._exit_asleep(self.resume or "input-after-suspend")
         # The first tick has no history to compare against: construction-to-first-tick
         # includes the panel bring-up, which takes half a minute when the screen is
         # deaf — and that is a slow start, not a suspend. Proven here: a deaf panel
@@ -642,6 +712,12 @@ class HostState:
         s = (f"asleep={self.asleep}({self.asleep_reason or '-'}) monitor={on} "
              f"locked={self.locked} console-lost={self.console_lost} "
              f"idle={idle} events={live}")
+        # Worth its own field even though a request always darkens the panel today:
+        # it is the difference between "asleep, and Windows has not asked for anything
+        # back yet" and "asleep on an outstanding request the loop is holding a resume
+        # edge against", and the log is where that gets read the next morning.
+        if self.suspend_pending:
+            s += " pending-suspend"
         if self.event_error:
             s += f" event-error={self.event_error}"
         if self.suspends or self.resumes:

@@ -49,10 +49,7 @@ CASES = [
     ("gamewatch", ["tools/gamewatch_selftest.py"],
      "game entry/exit, alt-tab keeps the locked target, video is not a game", None, None),
     ("hoststate", ["tools/hoststate_selftest.py"],
-     "sleep / displays-off / lock / frozen-loop fallback in the state machine", None,
-     "reads the live GetLastInputInfo clock, so it fails whenever a human is at the "
-     "keyboard and passes when nobody is: it gates the desk, not the code. "
-     "Pinning that clock is issue #4, which should drop this advisory flag."),
+     "sleep / displays-off / lock / frozen-loop fallback in the state machine", None, None),
     ("nightlight", ["tools/nightlight_probe.py", "--selftest"],
      "CloudStore night-mode decode, pinned to captured blobs", None, None),
     ("panel_link", ["tools/panel_link_selftest.py"],
