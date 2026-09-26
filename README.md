@@ -37,6 +37,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\hoststate_selftest.py      # sleep / displays-off / lock / frozen loop
 .venv\Scripts\python tools\lights_selftest.py         # what the panel does about each of those
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
+.venv\Scripts\python tools\gamma_ramp_selftest.py   # the ramp read hits the DLL that exports the call
 .venv\Scripts\python tools\panel_link_selftest.py     # link survives raise/hang, rebuilds, walks its device ladder
 .venv\Scripts\python tools\fault_selftest.py          # nothing outside the per-tick guard (AST-checked)
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
@@ -75,6 +76,7 @@ state, how many bands a partial panel update would need (same math as
 | `tools/gamewatch_selftest.py` | no admin: fake present streams + fake focus through the real detector — fast entry, alt-tab holds the game's numbers, quick exit on quit, video is not a game, target handover |
 | `tools/hoststate_selftest.py` | no admin: replays power/session broadcasts through the real state machine (sleep, monitor timeout, lock, frozen-loop fallback, slow start) |
 | `tools/nightlight_probe.py` | prints what Windows actually stores; `--selftest` replays the captured blobs, `--watch 30` follows a manual toggle |
+| `tools/gamma_ramp_selftest.py` | no admin: the gamma-ramp read against fakes that only export what User32/Gdi32 really export — right DLL, declared handles, DC always released, and a failure that stays a stated reason instead of a fake neutral |
 | `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the disable/enable journaling (including "a refused disable is never followed by an enable") |
 | `tools/lights_selftest.py` | the light decision end to end: sleep, displays-off, idle, dim, precedence, the night cap and LUT, and a rendered frame measured before/after the warmth |
 | `tools/fault_selftest.py` | the per-tick guard: fallback + one log line per fault, `SystemExit` contained, Ctrl-C not — plus an AST pass that fails if any subsystem call in the loop has escaped the guard |

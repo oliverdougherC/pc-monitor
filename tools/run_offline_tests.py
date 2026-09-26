@@ -55,6 +55,8 @@ CASES = [
      "Pinning that clock is issue #4, which should drop this advisory flag."),
     ("nightlight", ["tools/nightlight_probe.py", "--selftest"],
      "CloudStore night-mode decode, pinned to captured blobs", None, None),
+    ("gamma_ramp", ["tools/gamma_ramp_selftest.py"],
+     "gamma-ramp read: right DLL, declared handles, reasons not fake neutrals", None, None),
     ("panel_link", ["tools/panel_link_selftest.py"],
      "link survives raise/hang, rebuilds, walks its device ladder", "vendor", None),
     ("lights", ["tools/lights_selftest.py"],
