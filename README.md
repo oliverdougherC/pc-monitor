@@ -34,6 +34,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\run_offline_tests.py       # all of the below, one exit code
 .venv\Scripts\python tools\frames_selftest.py         # fps/GPU/mode parsing, held values, stream guards
 .venv\Scripts\python tools\gamewatch_selftest.py      # entry speed, alt-tab keeps the game's numbers
+.venv\Scripts\python tools\steamid_selftest.py        # Steam identity vs the environment psutil really returns
 .venv\Scripts\python tools\hoststate_selftest.py      # sleep / displays-off / lock / frozen loop
 .venv\Scripts\python tools\lights_selftest.py         # what the panel does about each of those
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
@@ -60,7 +61,7 @@ state, how many bands a partial panel update would need (same math as
 | `app/lights.py` | the one light decision: dark? how bright? which warmth LUT? (asleep → locked → monitor-off → idle → game/idle/dim, night applied on top) |
 | `app/sensors/` | backends: `lhm` (LibreHardwareMonitorLib via pythonnet, full fidelity incl. package power & per-core clocks), `fallback` (psutil+NVML, no admin), `demo` |
 | `app/frames.py` | real fps/frametime/1%–0.1% low per process: spawns PresentMon (ETW, admin), parses the present stream, answers "who is rendering" and "at what frame rate", and *holds* a stopped game's last number (marked stale) instead of inventing one |
-| `app/steamid.py` | Steam identity: `SteamAppId`/`SteamGameId` env vars → which pids are Steam games + AppID (enrichment, never the detection core) |
+| `app/steamid.py` | Steam identity: `SteamAppId`/`SteamGameId` env vars → which pids are Steam games + AppID (enrichment, never the detection core); matched case-folded, because psutil hands back Windows' upper-cased environment keys |
 | `app/power.py` | total-watt estimate (base+cpu+gpu) & green→red 50–1000 W gradient |
 | `app/gamewatch.py` | idle/game state, scored by confidence (STRONG/MED/LEGACY/NONE) with a **locked frame target** an alt-tab cannot steal; hysteresis per tier |
 | `app/layout.py` | 800×480 rendering: permanent top half + mode strip, trend bands, worst-case-fit type, night-mode LUT applied to the finished frame |
@@ -74,6 +75,7 @@ state, how many bands a partial panel update would need (same math as
 | `tools/frames_selftest.py` | no admin: replays synthetic present streams through the real parser; fps math, GPU-busy/mode parsing, the held-value window, and the silence/column guards |
 | `tools/gamewatch_selftest.py` | no admin: fake present streams + fake focus through the real detector — fast entry, alt-tab holds the game's numbers, quick exit on quit, video is not a game, target handover |
 | `tools/hoststate_selftest.py` | no admin: replays power/session broadcasts through the real state machine (sleep, monitor timeout, lock, frozen-loop fallback, slow start) |
+| `tools/steamid_selftest.py` | no admin, no Steam: the identity lookup against the environment dictionaries psutil actually returns (upper-cased on Windows), plus one live child process and the vanished-process case |
 | `tools/nightlight_probe.py` | prints what Windows actually stores; `--selftest` replays the captured blobs, `--watch 30` follows a manual toggle |
 | `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the disable/enable journaling (including "a refused disable is never followed by an enable") |
 | `tools/lights_selftest.py` | the light decision end to end: sleep, displays-off, idle, dim, precedence, the night cap and LUT, and a rendered frame measured before/after the warmth |
