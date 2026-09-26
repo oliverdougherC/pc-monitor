@@ -17,12 +17,14 @@ here in an ad-hoc way now belongs to a module that can be tested without a panel
   app/gamewatch  which process is the game            (locked target)
   app/frames     its frame rate, or its last one      (held, marked stale)
   app/panel      the USB link, including its failures
+  app/recovery   what an event asks for, and where the waiting happens
 
 Sleep is the reason for that shape. The loop freezes when the machine sleeps, so
 "turn the panel off when the PC sleeps" cannot be a rule evaluated after the fact —
 it has to be an event that wakes us. Hence `host.wait()` below instead of
-`time.sleep()`, and a resume path that rebuilds the panel link and the ETW capture
-rather than assuming the world is as we left it.
+`time.sleep()`, and a resume path that re-makes the panel link and the ETW capture
+rather than assuming the world is as we left it - asking for that work instead of
+doing it here, because a bring-up is tens of seconds and the loop cannot spend them.
 """
 from __future__ import annotations
 
@@ -49,6 +51,7 @@ from app.nightlight import NightLight                  # noqa: E402
 from app.output import DiffPusher, wipe, wipe_supported   # noqa: E402
 from app.panel import PanelLink                        # noqa: E402
 from app.power import estimate                         # noqa: E402
+from app.recovery import REFRESH, WAKE, Recovery       # noqa: E402
 from app.sensors import make_hub                       # noqa: E402
 from app.steamid import SteamIdentity                  # noqa: E402
 
@@ -199,6 +202,7 @@ def main() -> None:
 
     panel = None
     pusher = None
+    recovery = None
     dump_mode = bool(args.dump)
 
     def _shutdown() -> None:
@@ -207,6 +211,13 @@ def main() -> None:
             host.close()
         except Exception:  # noqa: BLE001
             pass
+        if recovery is not None:
+            # Before the link: the worker calls into it, and a thread that is still
+            # calling into a closed device is a fault line in the log on the way out.
+            try:
+                recovery.close()
+            except Exception:  # noqa: BLE001
+                pass
         if panel is not None:
             try:
                 panel.close()
@@ -225,6 +236,11 @@ def main() -> None:
             status(f"[panel] no screen on start ({panel.down_reason}) — continuing anyway, "
                    f"the loop keeps retrying every 10 s; plug it in and it will come up")
         panel_desc = f"{panel.get_width()}x{panel.get_height()}"
+        # Who decides what an event costs. The link is already built by now, so the
+        # coordinator starts from a known state; its worker thread is what runs the
+        # link's maintenance and the device ladder, which is the work that used to stop
+        # this loop for tens of seconds (see app/recovery.py).
+        recovery = Recovery(panel, log=status)
     else:
         panel_desc = "headless dump"
     if frames_mon is None:
@@ -276,6 +292,7 @@ def main() -> None:
     last_err_at = 0.0
     last_light = ""
     dark_logged = ""
+    held_logged = ""                 # "waiting" while recovery is in flight
     idle_held = False
     # A heartbeat, because every other line here is conditional and the failure mode
     # of a loop that died at 4 a.m. is a panel frozen on last night's numbers with a
@@ -302,26 +319,42 @@ def main() -> None:
         tick_dt = t0
         g.run("host", lambda: host.tick(dt))
 
-        # A resume is the only moment everything downstream has to be re-made: the
-        # COM port came back (or has not yet), the panel rebooted into portrait, the
-        # ETW session is a husk, and the game we locked onto was frozen mid-frame.
-        reason = g.run("take-resume", host.take_resume, None)
-        if reason and not dump_mode:
-            status(f"[resume] {reason} — {g.text('host.summary', host.summary)}")
-            # Each recovery on its own: a relink that raises must not also leave the
-            # capture dead, or one fault becomes two.
-            if not g.run("relink", lambda: panel.relink(reason), False):
-                status("[resume] panel not answering yet; retrying in the background")
-            if frames_mon is not None:
-                g.run("capture-restart", lambda: frames_mon.restart(reason))
-                frames_reported = False      # say again whether the session came back
-            g.run("watch-reset", lambda: watch.reset(reason))
-
-        # Background link maintenance: when the screen is down this retries the port
-        # on its own clock (and, past a couple of minutes, asks Windows to restart the
-        # USB device). Cheap and immediate when it is up.
+        # Two kinds of evidence arrive from the event window, and they cost different
+        # things: a resume means the machine stopped, so everything downstream is
+        # suspect; a display or session event means the panel has something new to show
+        # and nothing else. `app/recovery.py` folds a burst of either into one request
+        # and runs the slow half on its own thread, so a notification can no longer stop
+        # this loop - which matters because the loop's own watchdog reads a long tick
+        # as a suspend, and a rebuild used to manufacture the next resume.
+        # The light state is passed in as the last decision made, which is the newest
+        # one this tick has: a rebuild that lands late applies what is wanted then.
+        wake = g.run("take-resume", host.take_resume, None)
+        display = g.run("take-refresh", host.take_refresh, None)
+        d = None
+        holds = False
         if not dump_mode:
-            g.run("panel", lambda: panel.tick())
+            if wake:
+                g.run("recovery-wake", lambda: recovery.request(WAKE, wake))
+            if display:
+                g.run("recovery-refresh", lambda: recovery.request(REFRESH, display))
+            d = g.run("recovery", lambda: recovery.tick(lit=not plan.dark), None)
+            if d is not None:
+                holds = d.holds_light
+                if d.wake:
+                    status(f"[resume] {d.wake} - {g.text('host.summary', host.summary)}")
+                    # Only a real wake throws the capture and the locked target away.
+                    # An ETW session that survived a suspend keeps its registration and
+                    # delivers nothing, and the game we locked onto was frozen mid-frame;
+                    # a monitor timing itself out is neither of those things, and used to
+                    # cost both of them plus the link.
+                    if frames_mon is not None:
+                        g.run("capture-restart", lambda: frames_mon.restart(d.wake))
+                        frames_reported = False      # say again whether the session came back
+                    g.run("watch-reset", lambda: watch.reset(d.wake))
+                elif d.repaint:
+                    status(f"[display] {display or 'repaint'} - whole frame, link kept")
+                if d.repaint:
+                    g.run("invalidate", pusher.invalidate)
 
         if dump_mode:
             presenters = g.run("presents", lambda: frames_mon.presenters()
@@ -425,15 +458,30 @@ def main() -> None:
                 if dark_logged:
                     status(f"[light] panel on again ({plan.describe()})")
                     dark_logged = ""
-                g.run("warm-lut", lambda: layout.set_warm(plan.lut))
-                g.run("brightness", lambda: panel.set_brightness(plan.brightness))
-                g.run("screen-on", lambda: panel.screen(True))
+                if holds:
+                    # Recovery is in flight. Whatever this tick would send was composed
+                    # before the event that started the rebuild, and lighting the panel
+                    # in the middle of a bring-up is the visible half of the old
+                    # behaviour. The commands resume on the next tick, with whatever is
+                    # wanted then - which is the point of handing the light state in
+                    # every tick rather than remembering it from the event.
+                    if held_logged != "waiting":
+                        held_logged = "waiting"
+                        status(f"[light] waiting on recovery ({plan.describe()}) - not "
+                               f"lighting the panel while it is being re-made")
+                else:
+                    held_logged = ""
+                    g.run("warm-lut", lambda: layout.set_warm(plan.lut))
+                    g.run("brightness", lambda: panel.set_brightness(plan.brightness))
+                    g.run("screen-on", lambda: panel.screen(True))
                 if plan.repaint:
                     g.run("invalidate", pusher.invalidate)
 
         # ---- burn-in: exercise sweep (idle, and only on a lit panel) ----------
-        if not dump_mode and not plan.dark and (burn.exercise_due(t0)
-                                                or burn.exercise_progress(t0) is not None):
+        # Not while recovery is in flight either: a sweep is a minute of deliberate
+        # full-frame pushes, and half of it would land on a panel being re-made.
+        sweeping = burn.exercise_due(t0) or burn.exercise_progress(t0) is not None
+        if not dump_mode and not plan.dark and not holds and sweeping:
             while True:
                 now = time.monotonic()
                 p = burn.exercise_progress(now)
@@ -468,7 +516,10 @@ def main() -> None:
                     return
         else:
             assert pusher is not None
-            if frame is not None and not plan.dark:
+            # `holds` is the same rule as the light commands above, on the same tick:
+            # a frame composed before the event that started the rebuild is exactly the
+            # stale intermediate frame that used to appear while the panel rebooted.
+            if frame is not None and not plan.dark and not holds:
                 if state_changed and can_wipe:
                     g.run("wipe", lambda: wipe(pusher, layout.blank(), frame, hold_s))
                 else:
@@ -501,6 +552,10 @@ def main() -> None:
                     pl = "up"
                 else:
                     pl = f"down({(panel.down_reason or '?')[:40]})"
+                # Recovery only has a line when it has done something, so the beat
+                # stays quiet on an ordinary night and says `recovery=1 pass
+                # coalesced=4 holding` on the morning when it did not.
+                rec = recovery.summary() if recovery is not None else ""
                 status(f"[beat] up={up // 60}m{up % 60:02d}s {state} "
                        f"light={light}"
                        # `capture=live` is the only positive proof the ETW child is
@@ -510,6 +565,7 @@ def main() -> None:
                        f" panel={pl}"
                        f" frames={'--' if snap.frames.fps is None else f'{snap.frames.fps:.0f}'}"
                        f"{'+held' if snap.frames.stale else ''}"
+                       f"{(' ' + rec) if rec else ''}"
                        f"{g.summary()}{f' +sensors{errors}' if errors else ''}"
                        f" | {host.summary()}")
 

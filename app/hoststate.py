@@ -321,10 +321,22 @@ class EventWindow:
 class HostState:
     """One refreshed view of the machine, per tick.
 
-    `take_resume()` is an edge, not a level: it returns a reason once after a
-    wake/gap/display-change and then clears itself, so the loop reconnects the
-    panel and restarts the capture exactly once per wake instead of every tick
-    while the panel enumerates.
+    Two edges come out of this, and which one an event raises is the whole
+    difference between a cheap repaint and a rebuild:
+
+      * `take_resume()` - the machine stopped and came back (a resume message, or a
+        loop gap long enough that it might have). Everything downstream is suspect:
+        the COM port, the panel's orientation, the ETW session, the locked game.
+      * `take_refresh()` - the *view* changed shape: a monitor came back on, the
+        session was unlocked, `WM_DISPLAYCHANGE` fired because a display arrived or a
+        driver re-moded one. The machine kept running; the panel needs a whole frame
+        and nothing more.
+
+    Both are edges, not levels: each returns its reason once and then clears itself,
+    so the loop acts once per event burst instead of every tick while the panel
+    enumerates. Raising the second kind as the first is what froze the loop - a
+    resolution change used to tear down a working link, restart the capture and drop
+    the game target, and the bring-up it waited for took tens of seconds.
     """
 
     def __init__(self, gap_s: float = 5.0, poll_s: float = 5.0, events: bool = True) -> None:
@@ -339,7 +351,8 @@ class HostState:
         self.console_lost = False
         self.idle_s = 0.0
         self.idle_known = False
-        self.resume: str | None = None
+        self.resume: str | None = None       # the machine stopped and came back
+        self.refresh: str | None = None      # the view changed shape: repaint only
         self.last_event = "-"
         self.events: dict[str, bool] = {}
         self.event_error = ""
@@ -401,27 +414,34 @@ class HostState:
                 self.last_event = f"session:{w:#x}"
                 # Unlocking means somebody is sitting at the machine and typing:
                 # the display is on, whatever the last notification said. It is
-                # also worth a repaint — the panel has been showing a locked
-                # desktop's worth of nothing.
+                # also worth a repaint - the panel has been showing a locked
+                # desktop's worth of nothing - but not a rebuild: the machine never
+                # stopped, so the COM port and the present capture are exactly as
+                # they were a moment ago.
                 self.monitor_on = True
                 self.monitor_seeded = False   # an answer, not the start-up guess
-                self.resume = self.resume or "session-unlock"
+                self.refresh = self.refresh or "session-unlock"
             elif w in (WTS_CONSOLE_DISCONNECT, WTS_SESSION_LOGOFF):
                 self.console_lost = True
                 self.last_event = f"session:{w:#x}"
             elif w == WTS_CONSOLE_CONNECT:
                 self.console_lost = False
                 self.last_event = "console-connect"
-                self.resume = self.resume or "console-connect"
+                self.refresh = self.refresh or "console-connect"
             return
         if msg == WM_DISPLAYCHANGE:
-            # A monitor arriving or leaving changes which COM port and which
-            # orientation the panel ends up with; treat it as a re-sync point.
+            # A monitor arriving or leaving changes which modes and which geometry the
+            # desktop ends up with, so the panel is redrawn from scratch - but it says
+            # nothing about the link or the capture, and this message also arrives for
+            # reasons that have no bearing on either (a second display being plugged
+            # in, a driver re-moding one, a game toggling full screen). Treating it as
+            # a resume used to rebuild the serial link and throw away a live present
+            # capture every time one went past.
             self.last_event = "display-change"
             if self.monitor_on is False:
                 self.monitor_on = True
                 self.monitor_seeded = False
-            self.resume = self.resume or "display-change"
+            self.refresh = self.refresh or "display-change"
 
     def _on_setting(self, lparam: int) -> None:      # noqa: E741
         """POWERBROADCAST_SETTING{GUID(16), DWORD len, DWORD value} at lparam."""
@@ -448,7 +468,11 @@ class HostState:
         self.monitor_seeded = False
         self.last_event = f"{which}-display-{'on' if on else 'off'}"
         if on:
-            self.resume = self.resume or f"{which}-display-on"
+            # The displays came back: worth a whole frame, and nothing beyond that.
+            # A monitor timing itself out and coming back is the commonest event of
+            # this kind on a real desk, and it never once meant the panel's link or
+            # the present capture had to be re-made.
+            self.refresh = self.refresh or f"{which}-display-on"
 
     def _enter_asleep(self, why: str) -> None:
         if not self.asleep:
@@ -615,6 +639,18 @@ class HostState:
             self._since_resume = time.monotonic()
         return r
 
+    def take_refresh(self) -> str | None:
+        """Consume the refresh edge (single-shot per burst of display events).
+
+        The cheap half of the split: a monitor coming back on, an unlock, a resolution
+        change. Whoever reads it still has to repaint the panel, and that is all -
+        `app/recovery.py` turns it into one whole frame instead of a rebuild.
+        """
+        r = self.refresh
+        if r:
+            self.refresh = None
+        return r
+
     def wait(self, timeout: float) -> bool:
         """Sleep until the next event, or `timeout`. True if an event woke us.
 
@@ -644,6 +680,11 @@ class HostState:
              f"idle={idle} events={live}")
         if self.event_error:
             s += f" event-error={self.event_error}"
+        if self.refresh:
+            # Un-repainted display events are worth seeing in the log because the
+            # symptom of a lost one is a panel showing an old desktop until somebody
+            # touches the mouse.
+            s += f" refresh={self.refresh}"
         if self.suspends or self.resumes:
             s += f" suspends={self.suspends} resumes={self.resumes}"
         return s

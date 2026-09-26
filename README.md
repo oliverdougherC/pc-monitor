@@ -35,6 +35,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\frames_selftest.py         # fps/GPU/mode parsing, held values, stream guards
 .venv\Scripts\python tools\gamewatch_selftest.py      # entry speed, alt-tab keeps the game's numbers
 .venv\Scripts\python tools\hoststate_selftest.py      # sleep / displays-off / lock / frozen loop
+.venv\Scripts\python tools\recovery_selftest.py       # recovery asks instead of blocking the loop
 .venv\Scripts\python tools\lights_selftest.py         # what the panel does about each of those
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
 .venv\Scripts\python tools\panel_link_selftest.py     # link survives raise/hang, rebuilds, walks its device ladder
@@ -74,6 +75,7 @@ state, how many bands a partial panel update would need (same math as
 | `tools/frames_selftest.py` | no admin: replays synthetic present streams through the real parser; fps math, GPU-busy/mode parsing, the held-value window, and the silence/column guards |
 | `tools/gamewatch_selftest.py` | no admin: fake present streams + fake focus through the real detector — fast entry, alt-tab holds the game's numbers, quick exit on quit, video is not a game, target handover |
 | `tools/hoststate_selftest.py` | no admin: replays power/session broadcasts through the real state machine (sleep, monitor timeout, lock, frozen-loop fallback, slow start) |
+| `tools/recovery_selftest.py` | no admin, no panel: drives recovery events at `app/recovery.py` against a link with scripted handshake and device-reset times - the loop stays responsive, a burst is one pass, a display event costs a frame, nothing is lit or pushed mid-rebuild, a replug is retried on arrival, and a wake while the panel is meant to be dark does not light it |
 | `tools/nightlight_probe.py` | prints what Windows actually stores; `--selftest` replays the captured blobs, `--watch 30` follows a manual toggle |
 | `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the disable/enable journaling (including "a refused disable is never followed by an enable") |
 | `tools/lights_selftest.py` | the light decision end to end: sleep, displays-off, idle, dim, precedence, the night cap and LUT, and a rendered frame measured before/after the warmth |
@@ -324,6 +326,24 @@ Dark means `ScreenOff` **and** no rendering: on revision C a full frame is ~0.82
 the link, so a dark panel is also the one setting that costs the bus nothing. The
 diff is invalidated on the way back, so the first frame after a wake is whole rather
 than a few bands of a picture the panel no longer has.
+
+**Two kinds of change, and only one of them rebuilds anything.** A resume means the
+machine stopped: the COM port may be gone, the panel may have rebooted into portrait,
+the ETW session may be a husk, and the game it locked onto was frozen mid-frame. A
+monitor coming back on, a session unlock or a `WM_DISPLAYCHANGE` means none of that -
+it means the panel has something new to show. `app/hoststate.py` raises a separate edge
+for each (`take_resume()` and `take_refresh()`), and `app/recovery.py` folds a burst of
+either into one request: one pass, one rebuild and only if the link is actually down,
+one whole frame. The work that may block - the bring-up, and the `pnputil` device rungs
+behind it - runs on the coordinator's thread, so a slow screen cannot stop the render
+loop any more; it used to, for tens of seconds, and the loop's own watchdog read that as
+a suspend and recovered from a sleep that had not happened. A wake that arrives while
+the panel is meant to be dark defers its rebuild until there is something to show,
+because a bring-up lights this hardware up on its own: that is how an unattended 3 a.m.
+wake-up used to end with a lit panel in a dark room. While a rebuild is outstanding the
+loop is told to hold - no brightness command, no frame - so the picture that comes back
+is the current one and not the one composed before the event. All of it is quiet in the
+log unless it happens: `recovery=1 pass coalesced=4` on the `[beat]` line.
 
 **Why events, and not polling.** The loop is frozen while the PC sleeps, so "turn the
 panel off when the PC sleeps" cannot be a rule evaluated after the fact — nothing is

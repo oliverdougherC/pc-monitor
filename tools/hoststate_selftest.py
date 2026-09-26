@@ -13,10 +13,13 @@ exact message orders observed on this desk (see hoststate_probe.py --trace):
   lock      SESSION_LOCK / SESSION_UNLOCK
   no-events a tick gap of minutes with the event window dead
 
-Each case asserts what the *loop* would act on: is the panel dark, and is there
-a resume edge to consume (which is what reconnects the COM port and restarts the
-ETW capture). The gap case is the one that proves the fallback: with no events at
-all, a frozen process must still produce exactly one resume edge.
+Each case asserts what the *loop* would act on: is the panel dark, and which of the
+two edges is there to consume. `take_resume()` is the expensive one - the machine
+stopped, so the COM port, the panel's orientation and the ETW capture all have to be
+re-made - and `take_refresh()` is the cheap one: the display or the session changed
+shape and the panel needs a whole frame, nothing else. Telling them apart is the
+subject of the display cases below. The gap case is the one that proves the fallback:
+with no events at all, a frozen process must still produce exactly one resume edge.
 """
 import ctypes
 import sys
@@ -29,8 +32,9 @@ from app.hoststate import (PBT_APMSUSPEND, PBT_APMQUERYSUSPEND,  # noqa: E402
                            PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND,
                            PBT_POWERSETTINGCHANGE, WM_DISPLAYCHANGE,
                            WM_POWERBROADCAST, WM_WTSSESSION_CHANGE,
-                           WTS_CONSOLE_DISCONNECT, WTS_SESSION_LOCK,
-                           WTS_SESSION_LOGOFF, WTS_SESSION_UNLOCK, HostState)
+                           WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT,
+                           WTS_SESSION_LOCK, WTS_SESSION_LOGOFF,
+                           WTS_SESSION_UNLOCK, HostState)
 
 sys.stdout.reconfigure(errors="replace")
 
@@ -69,10 +73,13 @@ def case_suspend_resume() -> None:
     check("resume edge", h.take_resume(), "resume:0x12")
     check("edge is one-shot", h.take_resume(), None)
     check("resumes counted", h.resumes, 1)
-    # The unlock and the display come up after RESUMEAUTOMATIC.
+    # The unlock and the display come up after RESUMEAUTOMATIC. They arrive on the
+    # cheap edge: the machine is already awake by then, so there is nothing left to
+    # re-make - only a panel that has been showing a locked desktop.
     h._on_event(WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK, 0)
     check("unlocked", h.locked, False)
-    check("unlock re-arms", h.take_resume(), "session-unlock")
+    check("unlock asks for a repaint", h.take_refresh(), "session-unlock")
+    check("and not for a rebuild", h.take_resume(), None)
     h._on_event(WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, 0)   # wrong-payload path
     h.close()
 
@@ -89,7 +96,8 @@ def case_monitor() -> None:
         buf = setting(bytes(guid), 1)
         h._on_event(WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, ctypes.addressof(buf))
         check(f"{label}: monitor on seen", h.monitor_on, True)
-        check(f"{label}: back-on raises an edge", h.take_resume(), f"{label}-display-on")
+        check(f"{label}: back-on repaints", h.take_refresh(), f"{label}-display-on")
+        check(f"{label}: back-on is not a wake", h.take_resume(), None)
     # A null payload pointer must be avoided, not read: from_address(0) is an
     # access violation, and an access violation is not an exception.
     h._on_event(WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, 0)
@@ -115,7 +123,42 @@ def case_display_change() -> None:
     print("case: a display is added or removed")
     h = new_state()
     h._on_event(WM_DISPLAYCHANGE, 0, 0)
-    check("re-sync edge", h.take_resume(), "display-change")
+    check("repaint edge", h.take_refresh(), "display-change")
+    check("and no rebuild", h.take_resume(), None)
+    h.close()
+
+
+def case_display_events_are_not_resumes() -> None:
+    print("case: which events mean the machine stopped, and which only mean it moved")
+    # The whole of issue #5 hangs on this split. `WM_DISPLAYCHANGE` arrives when a
+    # second monitor is plugged in, when a driver re-modes one, and when a game toggles
+    # full screen; the console and monitor display-on notifications arrive every time
+    # the desk's screens time out and come back; an unlock arrives every time somebody
+    # comes back from lunch. None of them means the serial link died or the present
+    # capture went stale, and treating them as if they did cost a full bring-up - in the
+    # render loop - plus a discarded capture and a dropped game target.
+    h = new_state()
+    for msg, w, want in ((WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK, "session-unlock"),
+                         (WM_WTSSESSION_CHANGE, WTS_CONSOLE_CONNECT, "console-connect"),
+                         (WM_DISPLAYCHANGE, 0, "display-change")):
+        h._on_event(msg, w, 0)
+        check(f"{want}: repaint edge", h.take_refresh(), want)
+        check(f"{want}: no rebuild edge", h.take_resume(), None)
+    buf = setting(bytes(hs.GUID_CONSOLE_DISPLAY_STATE), 1)
+    h._on_event(WM_POWERBROADCAST, PBT_POWERSETTINGCHANGE, ctypes.addressof(buf))
+    check("display-on: repaint edge", h.take_refresh(), "console-display-on")
+    check("display-on: no rebuild edge", h.take_resume(), None)
+    # A burst is one edge, not five: the first reason is what gets reported, because it
+    # is the one that says what happened first.
+    for _ in range(3):
+        h._on_event(WM_DISPLAYCHANGE, 0, 0)
+    h._on_event(WM_WTSSESSION_CHANGE, WTS_SESSION_UNLOCK, 0)
+    check("a burst is one repaint edge", h.take_refresh(), "display-change")
+    check("a burst is no rebuild at all", h.take_resume(), None)
+    # And the real thing still is the real thing, whatever arrived alongside it.
+    h._on_event(WM_POWERBROADCAST, PBT_APMQUERYSUSPEND, 0)
+    h._on_event(WM_POWERBROADCAST, PBT_APMRESUMEAUTOMATIC, 0)
+    check("a real wake still re-makes", h.take_resume(), "resume:0x12")
     h.close()
 
 
@@ -262,6 +305,7 @@ def case_wake_flag() -> None:
 
 def main() -> int:
     for fn in (case_suspend_resume, case_monitor, case_lock, case_display_change,
+               case_display_events_are_not_resumes,
                case_gap_without_events, case_slow_start_is_not_a_suspend,
                case_gap_after_event_suspend, case_input_proves_awake,
                case_monitor_seed, case_wake_flag):
