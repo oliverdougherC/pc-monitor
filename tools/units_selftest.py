@@ -100,6 +100,16 @@ def sample_net(bytes_recv_delta: int, dt_s: float = 1.0) -> Snapshot:
             pass
 
 
+def fonts_present() -> bool:
+    """The renderer draws with the vendored theme fonts, and a fresh clone has
+    none (`vendor/` is a pin, not a checkout). Without them the render cases
+    cannot run, and saying SKIP is the only honest answer."""
+    try:
+        return Path(str(cfgmod.load(None).get("_fonts", ""))).is_dir()
+    except Exception:  # noqa: BLE001 - an unreadable config means unverified
+        return False
+
+
 def case_counter_to_pixels() -> None:
     print("case: what a real backend tick renders for a known amount of traffic")
     try:
@@ -160,10 +170,14 @@ def case_geometry() -> None:
 
 
 def main() -> int:
-    case_counter_to_pixels()
-    case_rate_steps()
-    case_disk_still_bytes()
-    case_geometry()
+    case_rate_steps()          # the formatters need nothing but this file
+    if fonts_present():
+        case_counter_to_pixels()
+        case_disk_still_bytes()
+        case_geometry()
+    else:
+        print("SKIP 3 render cases: vendored theme fonts absent "
+              "(tools/vendor_lock.ps1 -Fetch) - not counted as passes")
     print("\nSELFTEST " + ("PASSED" if not fails else f"FAILED: {fails}"))
     return 0 if not fails else 1
 
