@@ -51,7 +51,10 @@ def main() -> int:
     a = ap.parse_args()
 
     cfg = cfgmod.load(None)
-    hs = HostState(gap_s=float(cfg["display"].get("wake_gap_s", 5.0)))
+    # The probe drives its own cadence, so it declares it: the gap watchdog judges
+    # a freeze against the tick interval it was given, not against the gap it found.
+    hs = HostState(gap_s=float(cfg["display"].get("wake_gap_s", 5.0)),
+                   cadence_s=1.0 / a.hz)
     print(f"python {'elevated' if _admin() else 'not elevated'}  "
           f"session={console_session()}  logonui={logon_ui_running()}")
     print(f"events live={hs.events_live} {hs.events} error={hs.event_error or '-'}")

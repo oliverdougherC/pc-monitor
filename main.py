@@ -168,6 +168,27 @@ def light_text(plan) -> str:
     return f"lit {plan.brightness}{'+play' if plan.idle_held else ''}"
 
 
+DT_CAP_S = 60.0
+
+
+def elapsed_dt(prev: float, now: float) -> float:
+    """Seconds the loop has been away since its previous tick, clamped at both ends.
+
+    The lower clamp stops a clock that stepped backwards from handing every interval
+    counter a negative `dt`. The upper one is the reason this is a function and not an
+    expression: a loop that wakes from a three-hour sleep must not spend three hours
+    of it inside the idle timers, the frame-hold window or the night-mode poll.
+
+    It is deliberately *not* the wake evidence. A number that has just been capped at
+    60 s cannot say how long the machine was really asleep, and until now the same
+    number was also being used as the threshold of the gap watchdog inside
+    `app.hoststate` — which asked a 30-second suspend to outweigh 90 seconds and so
+    never fired for any ordinary sleep. The watchdog measures its own gap and compares
+    it against the polling cadence it is given; this one only feeds the counters.
+    """
+    return min(max(now - prev, 0.0), DT_CAP_S)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None)
@@ -184,7 +205,12 @@ def main() -> None:
     layout = Layout(cfg, rate_hz=1.0 / interval)
     watch = GameWatch(cfg)
     burn = BurnIn(cfg)
-    host = HostState(gap_s=float(cfg["power"].get("wake_gap_s", 5.0)))
+    # `cadence_s` is what the loop is *supposed* to take between ticks. The gap
+    # watchdog needs that expectation: judging a freeze against the elapsed time it is
+    # measuring made every ordinary suspend look like a normal tick (see
+    # `main.elapsed_dt` and `app.hoststate.tick`).
+    host = HostState(gap_s=float(cfg["power"].get("wake_gap_s", 5.0)),
+                     cadence_s=interval)
     night = NightLight(cfg, refresh_s=float(cfg["night"].get("refresh_s", 3.0)))
     lights = LightPlanner(cfg, night=night, host=host)
 
@@ -268,6 +294,9 @@ def main() -> None:
     plan = lights.tick("idle", host.idle_s, 0.0)
 
     tick_dt = time.monotonic()
+    # How long the previous tick took to run, reported to the gap watchdog below. The
+    # first tick has no previous tick, and it is exempt anyway.
+    work_s = 0.0
     frames_reported = frames_mon is None
     frames_warned: str | None = None
     min_gpu = float(cfg["game"]["min_gpu_load"])
@@ -298,9 +327,14 @@ def main() -> None:
         else:
             prev_snap = snap
 
-        dt = min(max(t0 - tick_dt, 0.0), 60.0)   # a frozen loop must not fake a long dt
+        dt = elapsed_dt(tick_dt, t0)       # a frozen loop must not fake a long dt
         tick_dt = t0
-        g.run("host", lambda: host.tick(dt))
+        # `work_s` is the part of that elapsed time this loop spent executing. The
+        # gap watchdog subtracts it from the gap it measures and treats what is left
+        # as time the process did not run at all, which is the only evidence a gap can
+        # give of a suspend — and the reason a half-minute relink of a deaf panel is
+        # not mistaken for a wake it just performed (see app/panel.py `start_build`).
+        g.run("host", lambda: host.tick(dt, work_s=work_s))
 
         # A resume is the only moment everything downstream has to be re-made: the
         # COM port came back (or has not yet), the panel rebooted into portrait, the
@@ -514,7 +548,8 @@ def main() -> None:
                        f" | {host.summary()}")
 
             g.run("beat", _beat)
-        sleep_left = interval - (time.monotonic() - t0)
+        work_s = time.monotonic() - t0        # what this tick cost: see `host.tick` above
+        sleep_left = interval - work_s
         if sleep_left > 0:
             # The event pump is ctypes calling into user32 like everything else here:
             # a raise inside it is as fatal as a raise anywhere else in the tick.
