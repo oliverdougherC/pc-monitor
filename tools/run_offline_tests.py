@@ -5,7 +5,7 @@
     .venv\Scripts\python tools\run_offline_tests.py --only panel_link
 
 The selftests are the contract — "everything behavioural has an offline proof
-that needs neither admin nor hardware" — but eight separate commands are eight
+that needs neither admin nor hardware" — but nine separate commands are nine
 chances to forget one, and a change cannot be judged by whoever remembers to
 run them. This runner is what CI calls and what a contributor runs before
 pushing: each selftest stays a separate process (its own `sys.path`, its own
@@ -57,6 +57,9 @@ CASES = [
      "CloudStore night-mode decode, pinned to captured blobs", None, None),
     ("panel_link", ["tools/panel_link_selftest.py"],
      "link survives raise/hang, rebuilds, walks its device ladder", "vendor", None),
+    ("panel_recovery", ["tools/panel_recovery_selftest.py"],
+     "USB disable journal: written first, kept through crashes, cleared by device state",
+     None, None),
     ("lights", ["tools/lights_selftest.py"],
      "the one light decision end to end, incl. a rendered night frame", "vendor", None),
     ("layout", ["tools/layout_check.py"],

@@ -23,9 +23,12 @@ display:
   reset_on_start: false
   # Last resort that does not need a hand on the cable. After 2 minutes of silence the
   # app steps through three rungs, one per attempt: restart the CDC interface, restart
-  # the composite device above it, then disable+re-enable that device (as close to
-  # pulling the plug as Windows allows; the intent is journaled in .panel_reset_pending
-  # so a crash between the two words is finished by the next start). Measured on this
+  # the composite device above it, then disable+re-enable that device. The strongest
+  # rung writes its intent to a recovery journal (%LOCALAPPDATA%\PCMonitor\
+  # usb_recovery.json) before touching the device and refuses to start if that write
+  # fails; the record is cleared only when the device node says it is no longer
+  # disabled, so a crash between the two words is finished by the next start. Note this
+  # is a driver cycle, not an electrical power cycle - VBUS stays on. Measured on this
   # desk - when the endpoint has stopped draining, the COM port still opens but the
   # first write blocks, so no command (including the vendor's RESTART) can ever be
   # delivered. Needs Administrator; without it the refusal is logged and retried.
