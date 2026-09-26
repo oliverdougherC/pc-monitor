@@ -15,10 +15,10 @@ Two deliberately redundant sources:
   1. EVENTS — a hidden **top-level** window (not a message-only one: those are
      excluded from broadcasts, which is the only thing we are here to receive)
      gets `WM_POWERBROADCAST` for suspend/resume, the power-setting
-     notifications for the console display state (the monitor), and
-     `WM_WTSSESSION_CHANGE` for the session lock. This is the only way to see a
-     suspend *before* it happens — the only moment at which the panel can still
-     be switched off by us.
+     notifications for the display (the session's own, then the console's, then
+     the legacy monitor-power one), and `WM_WTSSESSION_CHANGE` for the session
+     lock. This is the only way to see a suspend *before* it happens — the only
+     moment at which the panel can still be switched off by us.
 
   2. THE LOOP ITSELF — `tick()` measures the gap between ticks. A gap far larger
      than the tick interval means this process was frozen: asleep, hibernating,
@@ -41,6 +41,7 @@ import re
 import subprocess
 import threading
 import time
+import uuid
 
 NT = os.name == "nt"
 
@@ -54,24 +55,47 @@ PBT_POWERSETTINGCHANGE = 0x8013
 PBT_APMQUERYSUSPEND = 0x0000
 PBT_APMQUERYUSERSUSPEND = 0x000B
 PBT_APMSUSPEND = 0x0004
-PBT_APMUSERSUSPEND = 0x0006          # collides with PBT_APMRESUMECRITICAL in the headers
+PBT_APMRESUMECRITICAL = 0x0006          # WinUser.h also spells 0x6 "PBT_APMUSERSUSPEND"
 PBT_APMRESUMESUSPEND = 0x0007
 PBT_APMUSERRESUME = 0x0008
 PBT_APMRESUMEAUTOMATIC = 0x0012
 WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT = 0x1, 0x2
 WTS_REMOTE_CONNECT, WTS_REMOTE_DISCONNECT = 0x3, 0x4
+WTS_SESSION_LOGON, WTS_SESSION_LOGOFF = 0x5, 0x6
 WTS_SESSION_LOCK, WTS_SESSION_UNLOCK = 0x7, 0x8
-WTS_SESSION_LOGON, WTS_SESSION_LOGOFF = 0xA, 0xB
+WTS_SESSION_CREATE, WTS_SESSION_TERMINATE = 0xA, 0xB        # reserved, not logon/logoff
 NOTIFY_FOR_THIS_SESSION = 0x0
 DEVICE_NOTIFY_WINDOW_HANDLE = 0x0
 
-# `GUID_CONSOLE_DISPLAY_STATE` is the documented "the console display is on/off"
-# setting; `GUID_MONITOR_POWER_ON` is the older name for roughly the same thing.
-# Which one a given Windows build actually delivers is not a thing to guess at, so
-# both are registered and either counts — and tools/hoststate_probe.py prints the
-# GUID it saw, which is how this was pinned on this desk.
-GUID_CONSOLE_DISPLAY_STATE = bytes.fromhex("9da5dd6b092e2548 b2c21bb778014562")
-GUID_MONITOR_POWER_ON = bytes.fromhex("1510730210452645 99e6e5a17e1a0a1b")
+
+def _guid(text: str) -> bytes:
+    """The 16 bytes a GUID occupies in memory, from the string it is written as.
+
+    The first three fields are little-endian and the last two are not, which is what
+    `uuid.UUID(...).bytes_le` produces and the order `RegisterPowerSettingNotification`
+    wants. Deriving the bytes from the canonical string is the point: the hand-copied
+    hex that stood here was wrong for both display settings, and registering a GUID
+    that does not exist *succeeds*, so the only symptom was that the notifications
+    simply never arrived.
+    """
+    return uuid.UUID(text).bytes_le
+
+
+# The settings that can tell us the display went away, best first. Microsoft says an
+# application running in an interactive user session should use
+# `GUID_SESSION_DISPLAY_STATUS`, and that `GUID_MONITOR_POWER_ON` is superseded by the
+# console one, so the three are registered in this order and do not count equally: see
+# `DISPLAY_RANK` and `_on_setting`. The older two stay registered because on an older
+# build they are the only answers, and because a failed registration is normal enough
+# that trusting only one source is trusting nothing.
+GUID_SESSION_DISPLAY_STATUS = _guid("2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5")
+GUID_CONSOLE_DISPLAY_STATE = _guid("6FE69556-704A-47A0-8F24-C28D936FDA47")
+GUID_MONITOR_POWER_ON = _guid("02731015-4510-4526-99E6-E5A17EBD1AEA")
+
+DISPLAY_SOURCES = (("session-display", GUID_SESSION_DISPLAY_STATUS),
+                   ("console-display", GUID_CONSOLE_DISPLAY_STATE),
+                   ("monitor-power", GUID_MONITOR_POWER_ON))
+DISPLAY_RANK = {guid: i for i, (_, guid) in enumerate(DISPLAY_SOURCES)}
 
 
 def _guid_bytes(raw: bytes) -> ctypes.Array[ctypes.c_ubyte]:
@@ -212,7 +236,11 @@ class EventWindow:
         self.sink = sink
         self.hwnd: int | None = None
         self.error: str | None = None
-        self.reg_console = self.reg_monitor = self.reg_session = False
+        # Which display settings this window is actually subscribed to, by the name
+        # `_on_setting` reports them under: `HostState` needs it to know when a
+        # lower-ranked setting is allowed to answer at all.
+        self.reg: dict[str, bool] = {name: False for name, _ in DISPLAY_SOURCES}
+        self.reg_session = False
         self._keep: list = []
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -291,10 +319,14 @@ class EventWindow:
         reg = u.RegisterPowerSettingNotification
         reg.restype = ctypes.c_void_p
         reg.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
-        self.reg_console = bool(reg(hwnd, ctypes.byref(_guid_bytes(GUID_CONSOLE_DISPLAY_STATE)),
-                                    DEVICE_NOTIFY_WINDOW_HANDLE))
-        self.reg_monitor = bool(reg(hwnd, ctypes.byref(_guid_bytes(GUID_MONITOR_POWER_ON)),
-                                    DEVICE_NOTIFY_WINDOW_HANDLE))
+        for name, guid in DISPLAY_SOURCES:
+            # Pinned in `_keep` alongside the window procedure rather than left as a
+            # temporary: the API takes a *pointer* to the GUID, and a pointer handed
+            # to the OS should not depend on a temporary staying alive for the call.
+            blob = _guid_bytes(guid)
+            self._keep.append(blob)
+            self.reg[name] = bool(reg(hwnd, ctypes.byref(blob),
+                                      DEVICE_NOTIFY_WINDOW_HANDLE))
         try:
             w = ctypes.windll.wtsapi32
             w.WTSRegisterSessionNotification.argtypes = [ctypes.c_void_p, ctypes.c_uint]
@@ -307,7 +339,7 @@ class EventWindow:
         if not self.hwnd:
             return
         try:
-            if self.reg_console or self.reg_monitor:
+            if any(self.reg.values()):
                 ctypes.windll.user32.UnregisterPowerSettingNotification(self.hwnd)
             if self.reg_session:
                 ctypes.windll.wtsapi32.WTSUnRegisterSessionNotification(self.hwnd)
@@ -353,9 +385,7 @@ class HostState:
         self._ev = EventWindow(self._on_event)
         self.events_live = self._ev.start() if events else False
         self.event_error = self._ev.error or ("events off (selftest)" if not events else "")
-        self.events = {"console-display": self._ev.reg_console,
-                       "monitor-power": self._ev.reg_monitor,
-                       "session": self._ev.reg_session}
+        self.events = {**self._ev.reg, "session": self._ev.reg_session}
         self._tick_now = time.monotonic()
         self._primed = False
         self._asleep_since = 0.0
@@ -379,10 +409,17 @@ class HostState:
                 # The last instant at which we can still switch the panel off.
                 self._enter_asleep("query-suspend")
                 self.last_event = "suspend-query"
-            elif w == PBT_APMSUSPEND or w == PBT_APMUSERSUSPEND:
+            elif w == PBT_APMSUSPEND:
                 self._enter_asleep("suspend")
                 self.last_event = "suspend"
-            elif w in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMUSERRESUME):
+            elif w in (PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMUSERRESUME,
+                       PBT_APMRESUMECRITICAL):
+                # 0x6 belongs here, not with the suspends: WinUser.h gives that number
+                # to PBT_APMUSERSUSPEND as well, but what it documents is "the system
+                # has resumed operation" after a critical suspension, support for it
+                # ended with Windows XP, and treating it as a suspend is the one
+                # mistake that can leave the panel dark on a live desktop with nothing
+                # left to wake it.
                 self._exit_asleep(f"resume:{w:#x}")
                 self.last_event = f"resume:{w:#x}"
             elif w == PBT_POWERSETTINGCHANGE:
@@ -399,10 +436,10 @@ class HostState:
                 self.locked = False
                 self._event_lock = False
                 self.last_event = f"session:{w:#x}"
-                # Unlocking means somebody is sitting at the machine and typing:
-                # the display is on, whatever the last notification said. It is
-                # also worth a repaint — the panel has been showing a locked
-                # desktop's worth of nothing.
+                # Unlocking, logging on, or a remote session attaching all mean
+                # somebody is sitting at the machine and typing: the display is on,
+                # whatever the last notification said. It is also worth a repaint —
+                # the panel has been showing a locked desktop's worth of nothing.
                 self.monitor_on = True
                 self.monitor_seeded = False   # an answer, not the start-up guess
                 self.resume = self.resume or "session-unlock"
@@ -413,6 +450,14 @@ class HostState:
                 self.console_lost = False
                 self.last_event = "console-connect"
                 self.resume = self.resume or "console-connect"
+            else:
+                # 0x9 (remote-control status changed), 0xF (desktop ready) and the two
+                # reserved codes 0xA/0xB are not evidence of anything here. They used
+                # to be read as logon and logoff, so a session-create cleared the lock
+                # and claimed the display was on, and a session-terminate said the
+                # console had been handed over. Named, because an unrecognised code
+                # that leaves no trace is what a later guess gets wrong again.
+                self.last_event = f"session:{w:#x}"
             return
         if msg == WM_DISPLAYCHANGE:
             # A monitor arriving or leaving changes which COM port and which
@@ -433,22 +478,43 @@ class HostState:
             data = int.from_bytes(bytes(raw[20:24]), "little")
         except (ValueError, OSError):
             return
-        if guid == GUID_CONSOLE_DISPLAY_STATE:
-            which = "console"
-        elif guid == GUID_MONITOR_POWER_ON:
-            which = "monitor"
-        else:
+        rank = DISPLAY_RANK.get(guid)
+        if rank is None:
             self.last_event = f"setting:{guid[0:4].hex()}={data}"
             return
-        on = data != 0
+        name = DISPLAY_SOURCES[rank][0]
+        on = data != 0                    # 2 (dimmed) is still a lit display
+        better = self._display_outranked(rank)
+        if better:
+            # Redundant, and the better source either has just said the same thing or
+            # is about to. Ignored rather than applied: which of the three messages
+            # happened to arrive last is not a reason for the panel to change its mind
+            # about the screen.
+            self.last_event = f"{name}-{'on' if on else 'off'} behind {better}"
+            return
         self.monitor_on = on
         # This is the notification the whole monitor rule is built on: it outranks the
         # start-up derivation, so the derivation's label has to go — otherwise the
         # "input beats a guess" rule in `tick()` would keep overwriting a fact.
         self.monitor_seeded = False
-        self.last_event = f"{which}-display-{'on' if on else 'off'}"
+        self.last_event = f"{name}-{'on' if on else 'off'}"
         if on:
-            self.resume = self.resume or f"{which}-display-on"
+            self.resume = self.resume or f"{name}-on"
+
+    def _display_outranked(self, rank: int) -> str | None:
+        """A live display setting that outranks `rank`, if there is one.
+
+        Liveness here means *registered*, not "recently heard from": the setting we are
+        subscribed to is the one we answer for, and one we are not subscribed to (an
+        older Windows, or a registration that failed) is what gets to answer instead.
+        The cost is a setting that registers and then stays quiet, which leaves
+        `monitor_on` unknown rather than wrong, and the panel falls back to the
+        start-up seed and the idle timer, which is all it had before events existed.
+        """
+        for name, _ in DISPLAY_SOURCES[:rank]:
+            if self._ev.reg.get(name):
+                return name
+        return None
 
     def _enter_asleep(self, why: str) -> None:
         if not self.asleep:

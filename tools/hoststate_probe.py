@@ -9,15 +9,16 @@ not come back". Sleep and monitor-off cannot be simulated honestly, so run this,
 put the machine to sleep / lock it / let the displays time out, and read what it
 printed when you get back:
 
-    events console-display=1 monitor-power=1 session=1   ← which notifications arrived
+    events live=True {'session-display': True, ...}   ← which notifications arrived
     asleep=True(query-suspend)  monitor=False            ← the pre-suspend query got here
     resume:0x12 (PBT_APMRESUMEAUTOMATIC)                 ← the wake, before the desktop
     gap 412s                                             ← or: no events, caught by time
 
 `--trace` also dumps the raw WM_POWERBROADCAST/PBT codes and the GUID of any
-power-setting notification, which is how the two monitor GUIDs in app/hoststate.py
-were pinned: whichever line appears when the display times out is the one this
-build delivers.
+power-setting notification. The three display settings are registered in precedence
+order (session, console, legacy monitor power), so whichever of those lines appears
+when the display times out is the one this build delivers, and the one `last_event`
+is named for; a better-ranked one that is live wins over the ones below it.
 """
 import argparse
 import sys
@@ -39,8 +40,10 @@ PBTS = {0x0: "PBT_APMQUERYSUSPEND", 0x2: "PBT_APMQUERYSUSPENDFAILED", 0x4: "PBT_
         0xB: "PBT_APMQUERYUSERSUSPEND", 0x12: "PBT_APMRESUMEAUTOMATIC",
         PBT_POWERSETTINGCHANGE: "PBT_POWERSETTINGCHANGE"}
 WTSS = {0x1: "CONSOLE_CONNECT", 0x2: "CONSOLE_DISCONNECT", 0x3: "REMOTE_CONNECT",
-        0x4: "REMOTE_DISCONNECT", 0x7: "SESSION_LOCK", 0x8: "SESSION_UNLOCK",
-        0xA: "SESSION_LOGON", 0xB: "SESSION_LOGOFF"}
+        0x4: "REMOTE_DISCONNECT", 0x5: "SESSION_LOGON", 0x6: "SESSION_LOGOFF",
+        0x7: "SESSION_LOCK", 0x8: "SESSION_UNLOCK", 0x9: "SESSION_REMOTE_CONTROL",
+        0xA: "SESSION_CREATE(reserved)", 0xB: "SESSION_TERMINATE(reserved)",
+        0xF: "SESSION_DESKTOP_READY"}
 
 
 def main() -> int:
