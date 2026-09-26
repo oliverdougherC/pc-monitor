@@ -41,6 +41,8 @@ class FallbackBackend:
         now = time.monotonic()
         net = psutil.net_io_counters()
         dtn = max(now - self._last_net_ts, 1e-6)
+        # psutil counts bytes; the snapshot carries network in bits/s (see app/snapshot.py),
+        # and the panel labels it accordingly — Mbps, not MB/s.
         snap.net_down_bps = (net.bytes_recv - self._last_net.bytes_recv) * 8 / dtn
         snap.net_up_bps = (net.bytes_sent - self._last_net.bytes_sent) * 8 / dtn
         self._last_net, self._last_net_ts = net, now
