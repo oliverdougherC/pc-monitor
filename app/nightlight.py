@@ -39,9 +39,11 @@ near-black at near-black, which is what the burn-in/power design needs.
 """
 from __future__ import annotations
 
+import ctypes
 import math
 import os
 import time
+from typing import NamedTuple
 
 # Bond CompactBinary v1 type ids (only the ones the night-light schemas use).
 _STOP, _STOP_BASE, _BOOL, _UINT8, _UINT16, _UINT32, _UINT64 = 0, 1, 2, 3, 4, 5, 6
@@ -367,13 +369,17 @@ class NightLight:
         self.gains = None
         if mode == "auto" and bool(self.cfg.get("check_gamma_ramp", True)):
             ramp = gamma_gains()
-            if ramp is not None:
-                r, _g, b = ramp
+            if ramp.gains is not None:
+                r, _g, b = ramp.gains
                 warm = (r - b) >= float(self.cfg.get("ramp_warm_margin", 0.12))
-                self.gains = ramp if warm else None
-                det += f"; ramp r/b={r:.2f}/{b:.2f}{' warm' if warm else ''}"
+                self.gains = ramp.gains if warm else None
+                det += f"; ramp {ramp.device} r/b={r:.2f}/{b:.2f}{' warm' if warm else ''}"
                 if warm and not on:
                     on, src = True, "ramp"
+            else:
+                # "the display is neutral" and "the display could not be asked"
+                # are different claims; only the first one is evidence.
+                det += f"; ramp unreadable ({ramp.reason})"
         self.on, self.source = on, src
         self.detail = det
 
@@ -444,8 +450,91 @@ def _in_clock_range(spec: str, now) -> bool:
 
 
 # ------------------------------------------------------------------ the look
-def gamma_gains() -> tuple[float, float, float] | None:
-    """Mid-tone per-channel gains the OS is currently applying to the display.
+class RampReading(NamedTuple):
+    """What the display's gamma ramp said — or why it could not say anything.
+
+    `gains is None` used to be the whole answer, which made "this display is
+    neutral" and "I could not ask the display" indistinguishable to the caller
+    and to the log line. They are not the same claim, so they are not allowed to
+    travel as one value.
+    """
+    gains: tuple[float, float, float] | None
+    device: str | None          # which display was measured, e.g. "\\.\DISPLAY1"
+    reason: str | None          # why there is no measurement; None when there is one
+
+
+class _DisplayDeviceW(ctypes.Structure):
+    """DISPLAY_DEVICEW, exactly as the SDK lays it out."""
+    _fields_ = [("cb", ctypes.c_uint32),
+                ("DeviceName", ctypes.c_wchar * 32),
+                ("DeviceString", ctypes.c_wchar * 128),
+                ("StateFlags", ctypes.c_uint32),
+                ("DeviceID", ctypes.c_wchar * 128),
+                ("DevKey", ctypes.c_wchar * 128)]
+
+
+_DISPLAY_DEVICE_ACTIVE = 0x1
+_DISPLAY_DEVICE_PRIMARY = 0x4
+
+
+def _display_api(windll):
+    """Declare the display calls this module makes, with their SDK signatures.
+
+    The one that mattered: `EnumDisplayDevicesW`/`EnumDisplaySettingsW` are
+    exported by **User32**, while `CreateDCW`/`GetDeviceGammaRamp`/`DeleteDC` are
+    exported by **Gdi32**. This module used to ask Gdi32 for
+    `EnumDisplaySettingsW`; ctypes answers a missing export with an
+    AttributeError, the broad handler turned that into `None`, and the gamma-ramp
+    second opinion had therefore never measured anything (issue #16).
+
+    `CreateDCW`'s HDC is declared pointer-sized. Left undeclared, ctypes hands
+    back a C `int` and an HDC with the upper 32 bits set is truncated into a
+    handle that belongs to some other object.
+    """
+    u, g = windll.user32, windll.gdi32
+    u.EnumDisplayDevicesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint,
+                                      ctypes.c_void_p, ctypes.c_uint32]
+    u.EnumDisplayDevicesW.restype = ctypes.c_long            # BOOL
+    g.CreateDCW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
+                            ctypes.c_wchar_p, ctypes.c_void_p]
+    g.CreateDCW.restype = ctypes.c_void_p                    # HDC
+    g.GetDeviceGammaRamp.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    g.GetDeviceGammaRamp.restype = ctypes.c_long             # BOOL
+    g.DeleteDC.argtypes = [ctypes.c_void_p]
+    g.DeleteDC.restype = ctypes.c_int
+    return u, g
+
+
+def _display_names(u, wanted: str | None):
+    """The active display device names, and which one the OS calls primary.
+
+    Returns (name, primary_name, error). `wanted` is honoured only if it is an
+    active device, so a stale configured name says so instead of quietly
+    measuring a different monitor.
+    """
+    primary = None
+    names: list[str] = []
+    for i in range(16):                      # no display has this many adapters
+        dd = _DisplayDeviceW()
+        dd.cb = ctypes.sizeof(dd)
+        if not u.EnumDisplayDevicesW(None, i, ctypes.byref(dd), 0):
+            break
+        if not (dd.StateFlags & _DISPLAY_DEVICE_ACTIVE):
+            continue
+        names.append(dd.DeviceName)
+        if dd.StateFlags & _DISPLAY_DEVICE_PRIMARY:
+            primary = dd.DeviceName
+    if not names:
+        return None, None, "no active display device"
+    if wanted:
+        if wanted not in names:
+            return None, primary, f"{wanted} is not an active display ({', '.join(names)})"
+        return wanted, primary, None
+    return (primary or names[0]), primary, None
+
+
+def gamma_gains(device: str | None = None, _windll=None) -> RampReading:
+    """Mid-tone per-channel gains the OS is currently applying to one display.
 
     Measured on this desk: Windows Night light does *not* go through the gamma ramp
     (it stayed identity at 2525 K, applied further down the display pipeline), so
@@ -454,51 +543,39 @@ def gamma_gains() -> tuple[float, float, float] | None:
     "night mode", not "the CloudStore key". A neutral ramp is honest evidence too —
     `NightLight` logs which evidence it acted on, so a wrong guess is visible.
 
-    Returns None when there is no display to ask (service session, disconnected
-    RDP, no window station) — never a fake neutral.
+    Which display: the gamma ramp is per-device, so this reads the device Windows
+    marks primary (the one Night light warms) unless `device` names an active one.
+    The name measured travels back in the reading, because "the panel is warm" and
+    "the other monitor is warm" are different answers.
+
+    Never returns a fake neutral: with no display to ask (service session,
+    disconnected RDP, no window station, a driver that refuses the ramp) the
+    reading carries the reason instead.
     """
     if os.name != "nt":
-        return None
+        return RampReading(None, None, "not Windows")
     try:
-        import ctypes
+        u, g = _display_api(_windll if _windll is not None else ctypes.windll)
+    except AttributeError as e:      # a windll that does not export these
+        return RampReading(None, None, f"display API unavailable: {e}")
 
-        u = ctypes.windll.user32
-        g = ctypes.windll.gdi32
+    name, _primary, err = _display_names(u, device)
+    if err:
+        return RampReading(None, None, err)
 
-        class DeviceMode(ctypes.Structure):
-            _fields_ = [("dmDeviceName", ctypes.c_wchar * 32), ("dmSpecVersion", ctypes.c_uint16),
-                        ("dmDriverVersion", ctypes.c_uint16), ("dmSize", ctypes.c_uint16),
-                        ("dmDriverExtra", ctypes.c_uint16), ("dmFields", ctypes.c_uint32),
-                        ("dmOrientation", ctypes.c_int16), ("dmPrintQuality", ctypes.c_int16),
-                        ("dmColor", ctypes.c_int16), ("dmDuplex", ctypes.c_int16),
-                        ("dmFormSize", ctypes.c_int16), ("dmNumpels", ctypes.c_int16),
-                        ("dmDisplayFrequency", ctypes.c_uint32),
-                        ("dmDisplayFixedOutput", ctypes.c_uint32),
-                        ("dmDefaultSource", ctypes.c_uint32),
-                        ("dmPositions", ctypes.c_ubyte * 32), ("dmDriver", ctypes.c_ubyte * 12),
-                        ("dmSizeComplete", ctypes.c_uint32),
-                        ("dmColorDepth", ctypes.c_uint16), ("dmDisplayOrientation", ctypes.c_uint16)]
-
-        dm = DeviceMode()
-        dm.dmSize = ctypes.sizeof(dm)
-        dm.dmDriverExtra = 0
-        if not g.EnumDisplaySettingsW(None, -1, ctypes.byref(dm)):   # ENUM_CURRENT_SETTINGS
-            return None
-        name = ("\\\\.\\" + dm.dmDeviceName) if dm.dmDeviceName else None
-        hdc = g.CreateDCW("DISPLAY", name, None, None)
-        if not hdc or hdc == -1:
-            return None
-        try:
-            ramp = (ctypes.c_ushort * 768)()
-            if not g.GetDeviceGammaRamp(ctypes.c_void_p(hdc), ctypes.byref(ramp)):
-                return None
-            mid = [ramp[c * 256 + 128] / 65535.0 for c in range(3)]      # 50% tone
-        finally:
-            g.DeleteDC(ctypes.c_void_p(hdc))
-        peak = max(mid) or 1.0
-        return tuple(max(0.0, min(1.0, v / peak)) for v in mid)     # type: ignore[return-value]
-    except Exception:  # noqa: BLE001 - a display we cannot measure is not an error
-        return None
+    hdc = g.CreateDCW("DISPLAY", name, None, None)
+    if not hdc or hdc in (-1, ctypes.c_size_t(-1).value):
+        return RampReading(None, name, f"CreateDCW failed (error {ctypes.GetLastError()})")
+    try:
+        ramp = (ctypes.c_ushort * 768)()
+        if not g.GetDeviceGammaRamp(ctypes.c_void_p(hdc), ctypes.byref(ramp)):
+            return RampReading(None, name,
+                               f"GetDeviceGammaRamp failed (error {ctypes.GetLastError()})")
+        mid = [ramp[c * 256 + 128] / 65535.0 for c in range(3)]      # 50% tone
+    finally:
+        g.DeleteDC(ctypes.c_void_p(hdc))        # always: one DC, one release
+    peak = max(mid) or 1.0
+    return RampReading(tuple(max(0.0, min(1.0, v / peak)) for v in mid), name, None)
 
 
 def gains_lut(gains: tuple[float, float, float], strength: float = 1.0) -> list[int] | None:
