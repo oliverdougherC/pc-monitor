@@ -28,7 +28,10 @@ So the link owns the device object and nothing else touches it:
 
 `DiffPusher` takes this object in place of the raw driver; the call surface it
 uses (`DisplayPILImage`, `get_width`, `get_height`) is unchanged, so the render
-path did not have to learn about any of this.
+path did not have to learn about any of this, except that `DisplayPILImage`
+now answers with the link's verdict instead of nothing, and `generation` counts
+bring-ups, which together let the diff cache commit only frames this connection
+actually displayed.
 """
 from __future__ import annotations
 
@@ -98,6 +101,12 @@ class PanelLink:
         self._brightness: int | None = None
         self._screen_on: bool | None = None
         self.needs_full = True       # panel memory is not trustworthy yet
+        # One number per successful bring-up: a push that starts and finishes on
+        # the same generation went to one live connection the whole way, and only
+        # such a push may be remembered as displayed. `needs_full` on its own is
+        # not enough: the diff cache has to be able to tell a late completion
+        # from the old link apart from a fresh one on the new.
+        self.generation = 0
         self._on_relink = None
 
     # ---------------------------------------------------------------- setup
@@ -207,6 +216,7 @@ class PanelLink:
             self.ok = True
             self._brightness = self._screen_on = None
             self.needs_full = True
+            self.generation += 1     # a new connection identity starts here
             self.down_reason = ""
             self._restart_depth = 0       # it answered: start the escalation over
             self._restart_attempts = 0
@@ -337,8 +347,12 @@ class PanelLink:
 
     # Vendor-shaped passthroughs, so DiffPusher can hold this instead of the driver.
     def DisplayPILImage(self, image, x: int = 0, y: int = 0,   # noqa: N802
-                        image_width: int = 0, image_height: int = 0) -> None:
-        self.push(image, x, y)
+                        image_width: int = 0, image_height: int = 0) -> bool:
+        # The bool is the point: the raw driver answers with None whether or not
+        # the bytes arrived, and DiffPusher treats anything but an explicit True
+        # as "not displayed". Returning the link's verdict here is what lets the
+        # diff cache commit transactionally instead of optimistically.
+        return self.push(image, x, y)
 
     def get_width(self) -> int:      # noqa: N802
         return int(self.d["portrait_height"]) if str(self.d.get("orientation", "landscape")) \

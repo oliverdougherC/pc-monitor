@@ -38,6 +38,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\lights_selftest.py         # what the panel does about each of those
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
 .venv\Scripts\python tools\panel_link_selftest.py     # link survives raise/hang, rebuilds, walks its device ladder
+.venv\Scripts\python tools\diff_cache_selftest.py     # diff cache commits only acknowledged pushes
 .venv\Scripts\python tools\fault_selftest.py          # nothing outside the per-tick guard (AST-checked)
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
 ```
@@ -76,6 +77,7 @@ state, how many bands a partial panel update would need (same math as
 | `tools/hoststate_selftest.py` | no admin: replays power/session broadcasts through the real state machine (sleep, monitor timeout, lock, frozen-loop fallback, slow start) |
 | `tools/nightlight_probe.py` | prints what Windows actually stores; `--selftest` replays the captured blobs, `--watch 30` follows a manual toggle |
 | `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the disable/enable journaling (including "a refused disable is never followed by an enable") |
+| `tools/diff_cache_selftest.py` | the diff cache is transactional: a failed, half-sent, or relink-overtaken push leaves a full refresh pending, and only an acknowledged push on one connection generation commits the shadow frame |
 | `tools/lights_selftest.py` | the light decision end to end: sleep, displays-off, idle, dim, precedence, the night cap and LUT, and a rendered frame measured before/after the warmth |
 | `tools/fault_selftest.py` | the per-tick guard: fallback + one log line per fault, `SystemExit` contained, Ctrl-C not — plus an AST pass that fails if any subsystem call in the loop has escaped the guard |
 | `tools/hoststate_probe.py` | live watcher at 2 Hz: what each power/session event did to the state (`--trace` for raw window messages) |
