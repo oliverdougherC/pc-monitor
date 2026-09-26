@@ -5,8 +5,8 @@
     .venv\Scripts\python tools\run_offline_tests.py --only panel_link
 
 The selftests are the contract — "everything behavioural has an offline proof
-that needs neither admin nor hardware" — but eight separate commands are eight
-chances to forget one, and a change cannot be judged by whoever remembers to
+that needs neither admin nor hardware" — but a command per selftest is a chance
+to forget one, and a change cannot be judged by whoever remembers to
 run them. This runner is what CI calls and what a contributor runs before
 pushing: each selftest stays a separate process (its own `sys.path`, its own
 fault guard), and this only aggregates their exit codes.
@@ -48,6 +48,8 @@ CASES = [
      "present-stream parsing: fps, GPU-busy, held values, stream guards", None, None),
     ("gamewatch", ["tools/gamewatch_selftest.py"],
      "game entry/exit, alt-tab keeps the locked target, video is not a game", None, None),
+    ("steamid", ["tools/steamid_selftest.py"],
+     "Steam identity read from psutil-shaped environments, incl. a live child", None, None),
     ("hoststate", ["tools/hoststate_selftest.py"],
      "sleep / displays-off / lock / frozen-loop fallback in the state machine", None,
      "reads the live GetLastInputInfo clock, so it fails whenever a human is at the "
