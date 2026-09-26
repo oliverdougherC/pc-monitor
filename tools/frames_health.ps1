@@ -54,16 +54,32 @@ $starved = FindLast 'no rows from presentmon'
 $denied  = FindLast 'access denied|failed to start trace session'
 $shown   = FindLast 'frames=(\d|no)'
 
+# A verdict about *this* run only. Every signal must post-date the last [start]
+# banner: a LIVE line from yesterday's process used to outrank today's silence,
+# which is the one thing this script must not do — say "flowing" about a capture
+# that has said nothing since it started. A child that has not delivered a header
+# yet is silent, not proven dead, so silence gets its own honest verdict.
+function SinceStart($hit) {
+    if (-not $hit) { $null }
+    elseif (-not $started -or $hit.LineNumber -gt $started.LineNumber) { $hit }
+    else { $null }
+}
+$liveS = SinceStart $live
+$starvedS = SinceStart $starved
+$deniedS = SinceStart $denied
+
 $verdict = 'QUIET'
 $note    = 'the capture has not reported anything since the last start'
 if (-not $started) {
     $verdict = 'QUIET'; $note = 'no [start] banner in the window read - the app is not running, or the log rolled'
-} elseif ($denied -and (-not $live -or $denied.LineNumber -gt $live.LineNumber)) {
+} elseif ($deniedS) {
     $verdict = 'DENIED'; $note = 'presentmon could not start a trace session - run the app elevated'
-} elseif ($starved -and (-not $live -or $starved.LineNumber -gt $live.LineNumber)) {
+} elseif ($starvedS) {
     $verdict = 'STARVED'; $note = 'session up, zero rows - the machine is not delivering graphics events (see README)'
-} elseif ($live) {
+} elseif ($liveS) {
     $verdict = 'LIVE'; $note = 'presents are flowing'
+} elseif ($live) {
+    $note = 'silent so far this run - the last LIVE line belongs to an earlier start; a child that has not written its header yet is silent, not dead (the app restarts it with backoff, so read this again after a minute, or render something)'
 }
 
 "frames verdict : $verdict  ($note)"

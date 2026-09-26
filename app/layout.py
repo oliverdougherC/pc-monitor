@@ -42,6 +42,10 @@ BLUE = (96, 165, 250)
 GREEN = (72, 222, 128)
 WHITE = (240, 243, 246)
 TAN = (224, 208, 178)      # fps/frametime panel, distinct from disk white
+# Same hue, unmistakably "not live": used when frame values are being held while the
+# game has stopped presenting. Still readable at the dim brightness level, which is
+# where a held value usually lives.
+TAN_HELD = (140, 130, 112)
 PINK = (255, 106, 182)
 
 W, H = 800, 480
@@ -84,6 +88,8 @@ class Layout:
         dt = (1.0 / rate_hz) if rate_hz else float(cfg["sensors"].get("interval_s", 1.0))
         self.history = History(int(round(win / max(dt, 0.05))))
         self.samples = self.history.samples
+        # Night mode's per-channel LUT; None until something sets it (app/lights.py).
+        self.warm_lut: list[int] | None = None
 
     # ---------- text helpers ---------------------------------------------------
     def _font(self, path: str, size: int) -> ImageFont.FreeTypeFont:
@@ -264,7 +270,11 @@ class Layout:
         ms = f.latency_ms
         if ms is None and f.fps:
             ms = 1000.0 / f.fps
-        h.push("frames.ms", ms)
+        # A held value is deliberately not a trend point: pushing it would draw a
+        # flat line through the seconds when nothing was measured, which is exactly
+        # the fabrication the rest of this file goes out of its way to avoid. The
+        # panel still *shows* the held number, dimmed, from FrameStats itself.
+        h.push("frames.ms", None if (f.stale or ms is None) else ms)
 
     # ---------- CPU / GPU panels: identical in both states -----------------------
     def _chip_panel(self, d, box, name: str, color, temp, load, sub: str,
@@ -360,22 +370,29 @@ class Layout:
         f = snap.frames
         x0, y0, x1, y1 = box
         cx0, cx1 = x0 + INNER, x1 - INNER
+        # Held, not live: the game is alive but has stopped presenting (alt-tab, a
+        # loading screen). Say so on the panel instead of letting a frozen number
+        # pass for a live one — same value, honest colour, honest label.
+        held = bool(getattr(f, "stale", False))
+        col = TAN_HELD if held else TAN
         self._panel(d, box)
-        self._txt(d, (cx0, y0 + 22), "FRAMES", (self.flabel, 15), TAN, "ls")
-        self._big(d, cx0, y0 + 76, self.num(f.fps, "{:.0f}"), 56, TAN, "ls",
+        self._txt(d, (cx0, y0 + 22), "FRAMES", (self.flabel, 15), col, "ls")
+        self._big(d, cx0, y0 + 76, self.num(f.fps, "{:.0f}"), 56, col, "ls",
                   f.fps is not None)
-        self._txt(d, (cx1, y0 + 76), "FPS", (self.flabel, 14), DIM, "rs")
+        unit = "FPS" if not held else f"FPS  HELD {f.age_s:.0f}s"
+        self._txt(d, (cx1, y0 + 76), unit, (self.flabel, 14), DIM if not held else DIMMER,
+                  "rs")
 
-        ms = self.history.last("frames.ms")
+        ms = f.latency_ms or (1000.0 / f.fps if f.fps else None)
         self._row(d, cx0, cx1, y0 + 104, left=("FRAME TIME", DIMMER, 13),
-                  right=self._value(ms, "{:.1f} ms", TAN, 20))
+                  right=self._value(ms, "{:.1f} ms", col, 20))
         target = float(self.cfg["game"].get("frametime_target_ms", 16.7))
         self._graph(d, cx0, y0 + 112, cx1, y0 + 142, self._series("frames.ms"),
                     TAN, span_min=2.0, target=target, plain=not self.trends)
 
-        self._pair(d, cx0, y0 + 168, "1% LOW", self.num(f.low1_pct), DIMMER, TAN, 13, 22,
+        self._pair(d, cx0, y0 + 168, "1% LOW", self.num(f.low1_pct), DIMMER, col, 13, 22,
                    present=f.low1_pct is not None)
-        self._pair(d, 0, y0 + 168, "0.1% LOW", self.num(f.low01_pct), DIMMER, TAN, 13, 22,
+        self._pair(d, 0, y0 + 168, "0.1% LOW", self.num(f.low01_pct), DIMMER, col, 13, 22,
                    right_edge=cx1, present=f.low01_pct is not None)
 
     # ---------- shared bottom row dispatch ---------------------------------------
@@ -423,6 +440,20 @@ class Layout:
         self._txt(d, (cx1, y0 + 26), time.strftime("%H:%M"), (self.fsmall, 17), DIM, "rs")
 
     # ---------- state layouts ----------------------------------------------------
+    def set_warm(self, lut: list[int] | None) -> None:
+        """Night mode: a 768-entry per-channel LUT applied to every frame we draw.
+
+        Applied at the very end of `render`, to the finished image, rather than by
+        mixing warm colours into the palette: one place to be wrong, every element
+        including the graphs and the power strip shifts together, and a LUT is what
+        a colour temperature physically is. Near-black stays near-black because a
+        LUT maps 0 to 0 — which is what keeps the panel's idle background idle.
+        """
+        self.warm_lut = lut
+
+    def _warm(self, img: Image.Image) -> Image.Image:
+        return img.point(self.warm_lut) if self.warm_lut else img
+
     def render(self, snap: Snapshot, state: str, shift=(0, 0)) -> Image.Image:
         sx, sy = shift
         img = Image.new("RGB", (self.w, self.h), BG)
@@ -430,13 +461,13 @@ class Layout:
         self._chips(d, snap, sx, sy)                      # permanent top half
         self._bottom_row(img, d, snap, sx, sy, state)     # the mode-dependent strip
         self._power_strip(img, d, snap, sx, sy)           # permanent bottom strip
-        return img
+        return self._warm(img)
 
     def blank(self) -> Image.Image:
         """Dark frame for the state-change wipe (`output.wipe`): hides the outgoing
         layout so its slow pixels are not mid-transition when the new frame lands.
         Near-black PNG-compresses to ~1 KB, so it is nearly free on TUR_USB."""
-        return Image.new("RGB", (self.w, self.h), BG)
+        return self._warm(Image.new("RGB", (self.w, self.h), BG))
 
     # ---------- burn-in exercise sweep --------------------------------------------
     def sweep(self, progress: float) -> Image.Image:
@@ -450,4 +481,6 @@ class Layout:
         rgb = np.array([colorsys.hsv_to_rgb(x, 0.9, 0.9) for x in xs]) * 255
         row = rgb.astype(np.uint8)                       # (W,3)
         frame = np.tile(row[None, :, :], (self.h, 1, 1))
-        return Image.fromarray(frame)
+        # Warmed like everything else: an exercise pattern that is suddenly cooler and
+        # brighter than the night-mode panel around it is its own kind of disturbance.
+        return self._warm(Image.fromarray(frame))

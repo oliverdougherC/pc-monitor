@@ -21,10 +21,31 @@ display:
   # broken app and is only fixable by pulling the cable. Set true to restore the
   # vendor's always-reboot order.
   reset_on_start: false
+  # Last resort that does not need a hand on the cable. After 2 minutes of silence the
+  # app steps through three rungs, one per attempt: restart the CDC interface, restart
+  # the composite device above it, then disable+re-enable that device (as close to
+  # pulling the plug as Windows allows; the intent is journaled in .panel_reset_pending
+  # so a crash between the two words is finished by the next start). Measured on this
+  # desk - when the endpoint has stopped draining, the COM port still opens but the
+  # first write blocks, so no command (including the vendor's RESTART) can ever be
+  # delivered. Needs Administrator; without it the refusal is logged and retried.
+  usb_restart_on_fail: true
+  # One [beat] line per this many seconds proving the loop is alive and saying what it
+  # decided (state, light reason, panel link, fps). 0 disables it; 0 < x also fine.
+  heartbeat_s: 900
   brightness_idle: 45     # %
   brightness_game: 70     # %
   brightness_dim: 12      # % when nobody has touched the PC for a while
   screen_off_after_min: 45
+  # The step before screen-off: after this many seconds of no input the panel drops
+  # to brightness_dim instead of sitting at full brightness on an empty desk.
+  dim_after_s: 300
+  # Both timers above measure keyboard and mouse only (GetLastInputInfo), so a player
+  # on a controller looks like an empty desk and would get a dimmed panel at 5 minutes
+  # and a dark one at 45. While the locked game is presenting live frames, hold them;
+  # an alt-tabbed or loading game reports `stale` numbers, and then the timers run.
+  # asleep / locked / monitor-off are never held.
+  stay_lit_in_game: true
 
 sensors:
   # auto: LHM if pythonnet+dll available, else psutil+NVML. Or force: lhm | fallback | demo
@@ -53,6 +74,42 @@ power:
   gradient_min_w: 50   # color: green at/below this
   gradient_max_w: 1000 # color: red at/above this
   gradient_gamma: 0.75
+  # --- what the panel does when the machine itself changes state -------------
+  # Read from Windows power/broadcast notifications (app/hoststate.py), not guessed:
+  # a hidden top-level window receives WM_POWERBROADCAST (suspend/resume), the
+  # console-display power setting (the monitors going off on their own timeout), and
+  # the session lock. If no event window can exist, the loop's own tick gap still
+  # catches a suspend, so the wake half keeps working regardless.
+  follow_sleep: true      # dark while the PC is asleep; back on when it is not
+  follow_lock: true       # dark while the session is locked - nobody is at the desk
+  follow_display: true    # dark while Windows has turned the displays off
+  # Windows reports display-power *changes*, so a start-up while the screens are
+  # already off is told nothing. Derive it once from the idle clock against the power
+  # scheme's own timeout (measured here: 300 s on AC) instead of sitting lit until the
+  # idle timer; `[monitor]` in log.log prints the reasoning and `[beat]` marks the
+  # value `(seed)` until a real notification replaces it.
+  seed_monitor: true
+  # A tick gap bigger than this means the process was frozen: the panel link is
+  # rebuilt, the ETW capture is restarted, and the game lock is dropped.
+  wake_gap_s: 5.0
+
+# Night mode: the panel follows YOUR night mode instead of owning a schedule.
+# "auto" reads Windows Night light from CloudStore (the toggle in Quick Settings and
+# its scheduled transitions) and also looks at the gamma ramp the OS is applying, so
+# a third-party warmer (f.lux, LightBulb) is followed too. Nothing is invented: if
+# the state cannot be read it says so in log.log and falls back to `schedule`.
+night:
+  mode: auto            # auto | on | off
+  refresh_s: 3.0        # how often to re-read it (a toggle lands in ~3 s)
+  strength: 1.0         # 1.0 = the colour temperature you set; lower blends to neutral
+  color_temp_k: 0       # 0 = whatever Windows has set; a number overrides it
+  schedule: ""          # e.g. "21:00-07:00" — only used when the state can't be read
+  # Night mode also dims, or a 45%-brightness panel in a dark room is the light you
+  # just turned off at the lamp: level = max(floor, level x scale).
+  brightness_scale: 0.55
+  brightness_floor: 8
+  check_gamma_ramp: true
+  ramp_warm_margin: 0.12   # R-B at 50% tone before the ramp counts as warm
 
 game:
   # explicit process names (lowercase .exe) that always trigger game mode
@@ -80,6 +137,26 @@ game:
   # heuristic above remains the fallback for light games under the present
   # threshold and whenever ETW is unavailable.
   present_detection: true
+  # --- how the detector decides, per confidence tier (app/gamewatch.py) ---------
+  detection:
+    # A foreground process presenting over its whole monitor is not a maybe: it gets
+    # in on this clock instead of the flat enter_after_s, which is what made a game
+    # start feel slow. Everything weaker waits enter_after_s.
+    enter_strong_s: 1.2
+    # Once locked, the frame target is not stolen by another presenter. It is
+    # released when the process disappears (dead_exit_s, after the 2 s liveness
+    # window) or when it stops presenting altogether (exit_after_s above).
+    dead_exit_s: 3.0
+    # Target quiet for this long while something else renders confidently -> the new
+    # process gets the lock (starting game B from game A's desktop).
+    switch_silence_s: 3.0
+    # % of the frame the GPU spent busy for a process before "busy" counts as
+    # evidence it is a title and not a video: measured here at ~100% for a game and
+    # ~19% for a scrolling browser, on PresentMon's own MsGPUBusy column.
+    min_gpu_score: 55.0
+    # Presenters that are never the game, however busy they are (browsers, chat, the
+    # shell, capture tools). Uncomment to replace the built-in list.
+    # non_game: [chrome.exe, msedge.exe, firefox.exe, spotify.exe, discord.exe]
 
 # Real frame telemetry (fps / frametime / 1%/0.1% low) per process, from the
 # GameTechDev PresentMon ETW stream — zero injection, works for DX/Vulkan/GL/UWP.
@@ -101,6 +178,10 @@ frames:
   # Diagnostic: write the raw capture here instead of streaming it. Frame stats
   # are off by design in this mode — the file is the artifact (tools/ab_capture.ps1).
   output_file:
+  # A game that stops presenting (alt-tab, a loading screen) keeps its last
+  # measurement on the panel for this long — dimmed, labelled HELD — before the
+  # numbers go to `--`. Never a fabricated live rate.
+  hold_s: 12
 
 burnin:
   shift_every_min: 5       # global pixel-shift of the layout

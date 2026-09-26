@@ -7,6 +7,9 @@ tmp
 log.log
 probe.txt
 lhm_dump.txt
+# Journal of an in-progress USB disable/enable (app/panel.py). Transient, machine
+# specific, and its presence means "a device needs re-enabling" - never a source file.
+.panel_reset_pending
 
 # theme/render scratch
 preview/

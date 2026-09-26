@@ -65,6 +65,26 @@ def ensure_vendor_path() -> None:
         sys.path.append(p)  # append: our tree must always win name collisions
 
 
+def _harden_log(logger) -> None:
+    """Stop a status line from ever raising inside the logger.
+
+    log.log is opened by the vendored logger with the runtime default encoding —
+    cp1252 on this machine — while our own lines carry arrows and box characters
+    (`sunset→sunrise`, `old→new`). A handler that cannot encode those logs a
+    "Logging error" traceback into the file we read to diagnose the app. Unmappable
+    characters become `?` instead; the text is still readable, and the run never
+    stops over punctuation.
+    """
+    for h in list(getattr(logger, "handlers", []) or []):
+        stream = getattr(h, "stream", None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="replace")
+            except Exception:  # noqa: BLE001 - already tolerant, this is best-effort
+                pass
+
+
 def app_log(msg: str) -> None:
     """Write one line to log.log via the vendored logger; never raises.
 
@@ -75,6 +95,7 @@ def app_log(msg: str) -> None:
     try:
         ensure_vendor_path()
         from library.log import logger
+        _harden_log(logger)
         logger.info(msg)
     except Exception:  # noqa: BLE001 - logging must never break the loop
         pass

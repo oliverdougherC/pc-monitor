@@ -44,6 +44,18 @@ _MAX_SAMPLES = 12000            # 60 s at 200 Hz
 _PID_EXPIRE_S = 30.0
 _STREAM_SILENT_S = 20.0         # header up but no rows for this long → say so in the log
 _SESSION_SETTLE_S = 2.5         # grace after stopping a previous run's session, see _reclaim_session
+_RESTART_MAX_S = 60.0           # backoff ceiling for a capture that keeps dying
+_HEALTHY_S = 120.0              # alive this long with rows → the streak of failures resets
+# Present modes worth distinguishing, from the column of the same name. `Hardware:`
+# without "Composed" is a true exclusive-flip path; everything else goes through the
+# compositor like any other window. dwm.exe's own rows are the compositor presenting
+# and are ignored outright (it is in `game.ignore`), which is what keeps a
+# `Hardware: Legacy Flip` row from being read as "the desktop is a fullscreen game".
+_MODE_EXCLUSIVE = ("hardware: legacy flip", "hardware committed", "hardware: flip")
+# A present this old is not "live" any more, and a game that stopped presenting is
+# held (dimmed, `stale`) for `hold_s` before the panel goes to `--`.
+_FRESH_S = 1.2
+_DEFAULT_HOLD_S = 12.0
 # Per-present clock. Exactly one name, verified against a live 2.5.1 capture on
 # this desk (2026-09-24): `--qpc_time_ms`, which we always pass, produces
 # CPUStartQPCTimeInMs in milliseconds, and its deltas match MsBetweenPresents.
@@ -199,6 +211,17 @@ class Presenter:
     name: str
     fps: float
     last_s: float     # seconds since this pid's last present (0 = just now)
+    # How hard the GPU is working for this process, % of the frame span. A real game
+    # renders every frame it can: on this desk re9.exe measured ~100 % while a
+    # scrolling browser sat near 19 %, on the same column. That makes it the single
+    # best "this is a game, not a video" discriminator available without asking the
+    # user, and it is free — PresentMon already measured it.
+    gpu: float | None = None
+    # True when the process presents on a hardware flip path (`Hardware: Legacy
+    # Flip`, `Hardware Committed`), i.e. exclusive fullscreen. `Hardware Composed:
+    # Independent Flip` and `Composed: Flip` are the desktop-compositor paths, which
+    # every window uses, so they say nothing about exclusivity.
+    exclusive: bool = False
 
 
 class FrameMonitor:
@@ -234,6 +257,9 @@ class FrameMonitor:
         # session over from a previous (or orphaned) run — see --stop_existing_session.
         self.session_name = f"PCMonitor-{role}"
         self._job = _KillJob()
+        # How long a game that has stopped presenting keeps its last measurement
+        # (dimmed, `stale`) instead of dropping to `--`. Alt-tab and loading screens.
+        self.hold_s = float(fcfg.get("hold_s", _DEFAULT_HOLD_S))
 
         self.ok = False
         self.error: str | None = None
@@ -243,14 +269,18 @@ class FrameMonitor:
         self.parsed = 0                     # … of those, the ones we could ingest
         self.silent_busy_s = 0.0            # seconds of "GPU busy, stream empty"
         self.last_args: list[str] = []      # spawn line, for the log/warning text
+        self.starts = 0                     # successful spawns, including restarts
+        self.restarts = 0                   # deliberate ones (after a resume)
         self._lock = threading.Lock()
         self._pids: dict[int, str] = {}                       # pid → app name
-        self._rings: dict[tuple[int, str], deque] = {}        # (pid, swapchain) → (t_ms, between_ms, display_ms)
+        self._rings: dict[tuple[int, str], deque] = {}        # (pid, swapchain) → samples
         self._pid_t: dict[int, float] = {}                    # pid → last event qpc-ms
+        self._held: dict[int, tuple] = {}                     # pid → (last live stats, mono)
         self._last_t = 0.0                                    # newest qpc-ms seen
         self._last_row = 0.0      # monotonic time of the last data row (liveness)
         self._spawned = 0.0       # monotonic time of the successful spawn
-        self._retries = 1
+        self._streak = 0          # consecutive early exits, drives the backoff
+        self._restart_req = False
         self._stop = threading.Event()
         self._proc: subprocess.Popen | None = None
         self._out: list[str] = []                             # stray output lines (for error text)
@@ -313,27 +343,76 @@ class FrameMonitor:
         return proc
 
     def _supervise(self) -> None:
+        """Keep a capture running, forever, with a backoff that never gives up.
+
+        The old behaviour was one retry and then a permanent `error`, which is the
+        wrong shape for the real failure modes: the ETW session can be held by
+        something that is about to exit, and the child can be killed by a sleep/resume
+        cycle. In both cases the capture comes back on its own if asked again in a few
+        seconds, and a panel that shows `--` for the rest of the afternoon because one
+        spawn failed is a worse outcome than a child that retries quietly.
+        """
         while not self._stop.is_set():
+            t_start = time.monotonic()
             try:
                 proc = self._spawn()
             except OSError as e:
                 self._fail(f"could not start presentmon: {e}")
-                return
+                if self._stop.wait(_RESTART_MAX_S):
+                    return
+                continue
+            self.starts += 1
             self._proc = proc
             try:
                 self._read_stream(proc)
-            except Exception:  # noqa: BLE001 — never let a parse bug kill the stream silently
+            except Exception:  # noqa: BLE001 - never let a parse bug kill the stream silently
                 pass
             rc = proc.wait()
             if self._stop.is_set():
                 return
-            if self._retries > 0:
-                self._retries -= 1
-                time.sleep(1.0)
+            alive = time.monotonic() - t_start
+            if self._restart_req:
+                self._restart_req = False
+                self.restarts += 1
+                self._streak = 0
+                self.error = None
                 continue
+            if alive > _HEALTHY_S:
+                self._streak = 0          # it worked; whatever broke now starts fresh
+            self._streak += 1
+            delay = min(_RESTART_MAX_S, 2.0 ** min(self._streak, 6))
+            self.ok = False
             tail = " | ".join(self._out[-3:]) or f"exit code {rc}"
-            self._fail(f"presentmon stopped: {tail}")
-            return
+            self.error = (f"presentmon exited after {alive:.0f}s: {tail} — retrying in "
+                          f"{delay:.0f}s (attempt {self._streak})")
+            if self._stop.wait(delay):
+                return
+
+    def restart(self, reason: str = "") -> None:
+        """Throw the capture away and open a clean one. Called after a resume.
+
+        An ETW session that survived suspend is the sort of thing that keeps its
+        registration and delivers nothing, and the rings are full of timestamps from
+        before the machine stopped — so both go. The panel keeps showing the held
+        `stale` numbers until the new stream produces real ones.
+        """
+        self._restart_req = True
+        with self._lock:
+            self._rings.clear()
+            self._pids.clear()
+            self._pid_t.clear()
+        self.rows = self.parsed = 0
+        self._held.clear()
+        self._last_t = 0.0
+        self.ok = False
+        proc = self._proc
+        if proc and proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        if reason:
+            self.error = f"restarting capture after {reason}"
 
     def _read_stream(self, proc: subprocess.Popen) -> None:
         stream = io.TextIOWrapper(proc.stdout, encoding="utf-8-sig",
@@ -377,6 +456,14 @@ class FrameMonitor:
         between = self._f(row, idx, "MsBetweenPresents")
         display = self._f(row, idx, "MsBetweenDisplayChange")
         swap = row[idx["SwapChainAddress"]] if "SwapChainAddress" in idx else "-"
+        # GPU busyness for this frame, as a percentage of the frame's own span.
+        busy = self._f(row, idx, "MsGPUBusy")
+        span = between or self._f(row, idx, "MsGPUTime")
+        gpu = max(0.0, min(100.0, 100.0 * busy / span)) if busy and span else None
+        mode = 0
+        if "PresentMode" in idx:
+            m = (row[idx["PresentMode"]] or "").strip().lower()
+            mode = 1 if m in _MODE_EXCLUSIVE else 0
         now = time.monotonic()
         with self._lock:
             self.parsed += 1
@@ -389,7 +476,7 @@ class FrameMonitor:
             ring = self._rings.get(key)
             if ring is None:
                 ring = self._rings[key] = deque(maxlen=_MAX_SAMPLES)
-            ring.append((t, between, display, now))
+            ring.append((t, between, display, now, gpu, mode))
 
     @staticmethod
     def _f(row: list[str], idx: dict[str, int], col: str) -> float | None:
@@ -460,18 +547,50 @@ class FrameMonitor:
             proc.terminate()
 
     # ------------------------------------------------------------------ queries
-    def _rows(self, pid: int, max_age_s: float) -> list[tuple[float, float, float]]:
-        """(qpc_ms, between_ms, display_ms) for one pid, newest-first, fresh."""
-        now_mono = time.monotonic()
-        out = []
+    def _best(self, pid: int, span_s: float) -> list:
+        """The busiest of a process's swapchains over `span_s` of stream time.
+
+        Two things in this method are deliberate. Summing swapchains is the tempting
+        thing to do and it is wrong: a process with two of them (a benchmark overlay,
+        a second window) would report double the frame rate it has, so the *busiest*
+        one is the frame rate. And the window is stream time — the QPC column inside
+        the rows — not arrival time, because arrival time is what a replayed CSV has
+        no notion of: windowing by it reported a replay of a steady 60 fps as 180.
+        """
+        best: list = []
         for (p, _swap), ring in self._rings.items():
-            if p != pid:
+            if p != pid or not ring:
                 continue
-            for t, between, display, mono in reversed(ring):
-                if now_mono - mono > max_age_s:
-                    break
-                out.append((t, between, display))
-        return out
+            newest = ring[-1][0]
+            fresh = [r for r in reversed(ring) if r[0] >= newest - span_s * 1000.0]
+            if len(fresh) > len(best):
+                best = fresh
+        return best
+
+    @staticmethod
+    def _summarise(rows: list) -> tuple:
+        """(fps, median frametime, gpu %, exclusive?) for one swapchain's rows."""
+        if not rows:
+            return 0.0, None, None, False
+        newest = rows[0][0]
+        last1 = [r for r in rows if r[0] >= newest - 1000.0]
+        allb = [r[1] for r in rows if r[1] is not None]
+        b1 = [r[1] for r in last1 if r[1] is not None]
+        # Frames per second from the *interval* between the newest and oldest frame in
+        # the window, not from how many rows fell inside it: N timestamps span N-1
+        # frames, and counting rows inflates every reading by one (a true 60 fps read
+        # as 61, 48 as 49 — small, but it is a number the user compares against an
+        # on-screen counter). Falls back to the median frametime when the window holds
+        # a single frame.
+        span = (last1[0][0] - last1[-1][0]) if len(last1) >= 2 else 0.0
+        fps = ((len(last1) - 1) * 1000.0 / span if span > 0 else
+               (1000.0 / float(np.median(allb)) if allb else 0.0)) if last1 else (
+               1000.0 / float(np.median(allb)) if allb else 0.0)
+        ms = float(np.median(b1)) if b1 else (float(np.median(allb)) if allb else None)
+        g = [r[4] for r in last1 if r[4] is not None]
+        gpu = float(np.median(g)) if g else None
+        excl = bool(rows[0][5]) or sum(r[5] for r in rows[:40]) > 20
+        return fps, ms, gpu, excl
 
     def _sweep(self) -> None:
         """Drop state for processes that stopped presenting a while ago.
@@ -484,11 +603,23 @@ class FrameMonitor:
             for key in [k for k in self._rings if k[0] == p]:
                 self._rings.pop(key, None)
 
-    def presenters(self) -> dict[int, Presenter]:
-        """Processes whose displayed present rate beats `min_fps` right now.
-        This is the 'it is rendering a game' signal: age < 2 s AND fps >= min_fps."""
+    def presenters(self, min_fps: float | None = None) -> dict[int, Presenter]:
+        """Processes actively rendering right now, and how hard.
+
+        This is the detection signal: age < 2 s AND fps >= min_fps. The extras exist
+        because "something is presenting" is not the same question as "a game is
+        running" — a browser presenting 60 fps of scrolling, a video at 24, and a
+        game at 120 all look identical to a frame counter, and differ completely in
+        how busy the GPU is and how the frames reach the screen.
+        """
         if not self.ok:
             return {}
+        # Nobody is presenting anything at all if the stream itself has been quiet:
+        # on a desktop that has gone still, DWM stops too, and without this the last
+        # known frame rates would keep looking live forever.
+        if time.monotonic() - self._last_row > 3.0:
+            return {}
+        floor = self.min_fps if min_fps is None else float(min_fps)
         with self._lock:
             self._sweep()
             out: dict[int, Presenter] = {}
@@ -497,17 +628,9 @@ class FrameMonitor:
                 age = max(0.0, (self._last_t - t0) / 1000.0)
                 if age > 2.0:
                     continue
-                n = 0
-                for (p, _swap), ring in self._rings.items():
-                    if p != pid:
-                        continue
-                    for t, *_ in reversed(ring):
-                        if t < self._last_t - 1000.0:
-                            break
-                        n += 1
-                fps = n / 1.0
-                if fps >= self.min_fps:
-                    out[pid] = Presenter(pid, name, fps, age)
+                fps, _ms, gpu, excl = self._summarise(self._best(pid, 1.0))
+                if fps >= floor:
+                    out[pid] = Presenter(pid, name, fps, age, gpu, excl)
             return out
 
     def names(self) -> dict[int, str]:
@@ -515,22 +638,53 @@ class FrameMonitor:
             return dict(self._pids)
 
     def stats(self, pid: int) -> FrameStats | None:
-        """Panel numbers for one process; None when it has no fresh data."""
-        if not self.ok:
+        """Panel numbers for one process.
+
+        Live numbers while it presents. Once it stops — minimised, alt-tabbed, a
+        loading screen that renders nothing — the last measurement is held, dimmed
+        and flagged `stale`, for `hold_s`; after that it is gone, and the panel shows
+        `--`. Holding is the honest middle: a game you tabbed out of has not stopped
+        having a frame rate, and inventing one, or dropping to `--` the instant the
+        window loses focus, are the two wrong answers here.
+        """
+        if not self.ok or pid is None:
             return None
+        hold = float(self.hold_s)
         with self._lock:
-            rows = self._rows(pid, self.window_s)
+            rows = self._best(pid, self.window_s)
         if not rows:
+            held = self._held.get(pid)
+            if held and (time.monotonic() - held[1]) <= hold:
+                out = held[0]
+                return FrameStats(fps=out.fps, low1_pct=out.low1_pct,
+                                  low01_pct=out.low01_pct, latency_ms=out.latency_ms,
+                                  stale=True, age_s=time.monotonic() - held[1],
+                                  gpu_pct=out.gpu_pct)
+            self._held.pop(pid, None)
             return None
-        newest = rows[0][0]
-        between = [b for t, b, d in rows if b is not None and t >= newest - self.window_s * 1000]
-        last1 = [b for t, b, d in rows if b is not None and t >= newest - 1000]
-        disp1 = [d for t, b, d in rows if d is not None and t >= newest - 1000]
-        if not last1 and not between:
+        newest_t = rows[0][0]
+        newest_mono = rows[0][3]
+        # Two gaps, both needed, and neither alone is enough: how far this process's
+        # newest frame is behind the newest frame *in the stream* (a game that went
+        # quiet while everything else keeps presenting), and how long it has been
+        # since anything at all arrived (the whole stream stopped). Both are in the
+        # stream's own clock or the child's arrival time, so a replayed CSV ages the
+        # same way a live one does.
+        age = max(0.0, (self._last_t - newest_t) / 1000.0) \
+            + max(0.0, time.monotonic() - self._last_row)
+        if age > hold:
+            # The ring still remembers this process for `window_s`, but a number that
+            # old is not a held measurement, it is a memory — and the panel has no way
+            # to say "this was true 20 seconds ago" in the space it has. `--` is the
+            # honest answer, and `hold_s` is the knob that decides where that line is.
+            self._held.pop(pid, None)
             return None
-        n1 = sum(1 for t, *_ in rows if t >= newest - 1000)
-        fps = float(n1) if n1 else (1000.0 / float(np.median(between)) if between else 0.0)
+        fps, ms, gpu, _excl = self._summarise(rows)
+        between = [r[1] for r in rows if r[1] is not None]
         low1 = 1000.0 / float(np.percentile(between, 99)) if len(between) >= 30 else None
         low01 = 1000.0 / float(np.percentile(between, 99.9)) if len(between) >= 100 else None
-        ms = float(np.median(disp1)) if disp1 else (float(np.median(last1)) if last1 else None)
-        return FrameStats(fps=fps, low1_pct=low1, low01_pct=low01, latency_ms=ms)
+        out = FrameStats(fps=fps if fps > 0 else None, low1_pct=low1, low01_pct=low01,
+                         latency_ms=ms, stale=age > _FRESH_S, age_s=age, gpu_pct=gpu)
+        if age <= _FRESH_S:
+            self._held[pid] = (out, newest_mono)   # the last thing that was live
+        return out

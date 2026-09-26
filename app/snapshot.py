@@ -27,6 +27,13 @@ class FrameStats:
     low1_pct: float | None = None        # 1% low
     low01_pct: float | None = None       # 0.1% low
     latency_ms: float | None = None      # avg frame latency
+    # True when these are the *last measured* numbers rather than live ones: the
+    # game is alive but has stopped presenting (minimised, alt-tabbed, a loading
+    # screen that renders nothing). The panel renders them dimmed instead of
+    # inventing a live rate, and `age_s` says how stale they are.
+    stale: bool = False
+    age_s: float = 0.0
+    gpu_pct: float | None = None         # this process's own GPU busyness, %
 
 
 @dataclass

@@ -58,8 +58,15 @@ V1_HEADER = ("Application,ProcessID,SwapChainAddress,Runtime,SyncInterval,Presen
 
 
 def synth(header: str, time_col: str, n: int = 180, fps: float = 60.0,
-          hitch_at: int = 90, hitch_ms: float = 30.0, base_ms: float = 1_000_000.0) -> bytes:
-    """n presents at `fps`, one frame taking `hitch_ms`, as presentmon would print."""
+          hitch_at: int = 90, hitch_ms: float = 30.0, base_ms: float = 1_000_000.0,
+          pid: int = 4242, name: str = "game.exe", gpu_busy_pct: float | None = None,
+          mode: str = "Composed: Flip") -> bytes:
+    """n presents at `fps`, one frame taking `hitch_ms`, as presentmon would print.
+
+    `gpu_busy_pct` fills MsGPUBusy against MsGPUTime — the column pair the detector
+    scores a process on — and `mode` chooses the PresentMode string, which is how the
+    exclusive-flip flag gets exercised.
+    """
     cols = header.split(",")
     step = 1000.0 / fps
     rows = []
@@ -68,9 +75,9 @@ def synth(header: str, time_col: str, n: int = 180, fps: float = 60.0,
         vals = []
         for c in cols:
             if c == "Application":
-                vals.append("game.exe")
+                vals.append(name)
             elif c == "ProcessID":
-                vals.append("4242")
+                vals.append(str(pid))
             elif c in ("SwapChainAddress", "SwapChainAddress "):
                 vals.append("0x1ABC0000")
             elif c in ("PresentRuntime", "Runtime"):
@@ -78,13 +85,18 @@ def synth(header: str, time_col: str, n: int = 180, fps: float = 60.0,
             elif c in ("SyncInterval", "PresentFlags", "AllowsTearing", "Dropped"):
                 vals.append("0")
             elif c == "PresentMode":
-                vals.append("Composed: Flip")
+                vals.append(mode)
             elif c == time_col:
                 vals.append(f"{base_ms + i * step:.4f}")
             elif c in ("MsBetweenPresents", "msBetweenPresents"):
                 vals.append(f"{ms:.4f}")
             elif c in ("MsBetweenDisplayChange", "msBetweenDisplayChange"):
                 vals.append(f"{ms:.4f}")
+            elif c == "MsGPUTime":
+                vals.append(f"{step:.4f}")
+            elif c == "MsGPUBusy":
+                vals.append("NA" if gpu_busy_pct is None
+                            else f"{gpu_busy_pct / 100.0 * step:.4f}")
             elif c in ("TimeInSeconds", "QPCTime"):
                 vals.append(f"{(base_ms + i * step) / 1000.0:.6f}")
             else:
@@ -179,9 +191,58 @@ def main() -> int:
     if not caught2:
         fails.append("silent guard")
 
+    print("\ncase 4: GPU busyness and present mode — the detector's evidence")
+    g = replay(synth(V2_HEADER, V2_TIME, n=120, fps=48.0, hitch_at=-1,
+                     gpu_busy_pct=100.0, mode="Hardware Composed: Independent Flip"))
+    gp = g.presenters().get(4242)
+    if gp is None:
+        fails.append("gpu presenter")
+        print("  FAIL no presenter")
+    else:
+        check("fps", round(float(gp.fps)), 48)
+        check("gpu busy from MsGPUBusy/MsGPUTime", round(float(gp.gpu)), 100)
+        # Measured on this desk: a real game at 48 fps presents as Independent Flip
+        # with the GPU ~100% busy. That path is not exclusive flip, so classifying
+        # exclusivity must never be what gates the game evidence.
+        check("independent flip is not exclusive", bool(gp.exclusive), False)
+        check("stats carries gpu", round(float(g.stats(4242).gpu_pct)), 100)
+    ex = replay(synth(V2_HEADER, V2_TIME, n=120, fps=48.0, hitch_at=-1,
+                      gpu_busy_pct=100.0, mode="Hardware: Legacy Flip"))
+    check("legacy flip counts as exclusive",
+          bool(ex.presenters().get(4242).exclusive), True)
+    na = replay(synth(V2_HEADER, V2_TIME, n=120, fps=48.0, hitch_at=-1))
+    check("gpu None when the columns are NA", na.presenters().get(4242).gpu, None)
+
+    print("\ncase 5: the game stops presenting while the stream moves on")
+    m5 = replay(synth(V2_HEADER, V2_TIME, n=120, fps=60.0, hitch_at=-1))
+    live = m5.stats(4242)
+    check("live before", live.stale, False)
+    # 2 s of someone else's frames starting 3 s after the game's last: the game's
+    # numbers must stay on the panel, marked no-longer-live, aged by the *stream*
+    # clock (its newest frame is ~5 s behind the stream's newest).
+    m5._read_stream(_Stub(synth(V2_HEADER, V2_TIME, n=120, fps=60.0, hitch_at=-1,
+                                pid=7, name="chrome.exe", base_ms=1_000_000.0 + 3_000.0)))
+    held5 = m5.stats(4242)
+    if held5 is None:
+        fails.append("held within hold_s")
+        print("  FAIL stats() dropped the game inside the hold window")
+    else:
+        check("value is still the game's", round(float(held5.fps)), 60)
+        check("marked stale", held5.stale, True)
+        ok = 2.5 <= held5.age_s <= 3.5
+        print(f"  {'ok  ' if ok else 'FAIL'} age follows the stream clock: "
+              f"{held5.age_s:.1f}s (game's newest frame is 3 s behind the stream's)")
+        if not ok:
+            fails.append("held age")
+    # Past hold_s the number is a memory, not a measurement: the panel goes to `--`.
+    m5._read_stream(_Stub(synth(V2_HEADER, V2_TIME, n=1200, fps=60.0, hitch_at=-1,
+                                pid=7, name="chrome.exe", base_ms=1_000_000.0 + 20_000.0)))
+    check("held value expires after hold_s", m5.stats(4242), None)
+    check("the new presenter is untouched", round(float(m5.stats(7).fps)), 60)
+
     if len(sys.argv) > 1:
         p = Path(sys.argv[1])
-        print(f"\ncase 4: recorded stream {p}")
+        print(f"\ncase 6: recorded stream {p}")
         blob = p.read_bytes()
         r = replay(blob)
         print(f"  header : {','.join(r.header[:14])}…")
