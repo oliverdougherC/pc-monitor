@@ -42,6 +42,12 @@ from app.snapshot import FrameStats
 _HEADER_TIMEOUT_S = 10.0        # no CSV header by then → presentmon failed to start
 _MAX_SAMPLES = 12000            # 60 s at 200 Hz
 _PID_EXPIRE_S = 30.0
+# A swapchain with no presents this far behind the stream's newest is retired,
+# whatever its process is doing: a display-mode change recreates the chain and
+# leaves the old one behind *under a live pid*, which a per-pid sweep can never
+# reach. Without this line a long session accumulates one ring per recreation.
+_CHAIN_EXPIRE_S = 30.0
+_OUT_CAP = 64                   # stray child output lines kept, across restarts
 _STREAM_SILENT_S = 20.0         # header up but no rows for this long → say so in the log
 _SESSION_SETTLE_S = 2.5         # grace after stopping a previous run's session, see _reclaim_session
 _RESTART_MAX_S = 60.0           # backoff ceiling for a capture that keeps dying
@@ -281,9 +287,15 @@ class FrameMonitor:
         self._spawned = 0.0       # monotonic time of the successful spawn
         self._streak = 0          # consecutive early exits, drives the backoff
         self._restart_req = False
+        # Capture generation: bumped by restart(). Rows are ingested only while
+        # their reader's generation is current, so the last buffered rows of a
+        # child we just killed cannot repopulate rings the restart cleared.
+        self._gen = 0
         self._stop = threading.Event()
         self._proc: subprocess.Popen | None = None
-        self._out: list[str] = []                             # stray output lines (for error text)
+        # Stray output lines (for error text). Bounded: a child that crash-loops
+        # printing a line per attempt must not grow this with session length.
+        self._out: deque[str] = deque(maxlen=_OUT_CAP)
 
         if not os.path.exists(self._exe):
             self.error = (f"presentmon not found: {self._exe} — "
@@ -364,7 +376,7 @@ class FrameMonitor:
             self.starts += 1
             self._proc = proc
             try:
-                self._read_stream(proc)
+                self._read_stream(proc, self._gen)
             except Exception:  # noqa: BLE001 - never let a parse bug kill the stream silently
                 pass
             rc = proc.wait()
@@ -397,6 +409,10 @@ class FrameMonitor:
         `stale` numbers until the new stream produces real ones.
         """
         self._restart_req = True
+        # The generation is what makes "both go" stick: the reader thread may
+        # still be handing over the dead child's last buffered rows, and those
+        # belong to the capture this call just threw away.
+        self._gen += 1
         with self._lock:
             self._rings.clear()
             self._pids.clear()
@@ -414,12 +430,20 @@ class FrameMonitor:
         if reason:
             self.error = f"restarting capture after {reason}"
 
-    def _read_stream(self, proc: subprocess.Popen) -> None:
+    def _read_stream(self, proc: subprocess.Popen, gen: int | None = None) -> None:
+        """Ingest one child's CSV until EOF. `gen` is the capture generation the
+        child belongs to: rows from a superseded generation are dropped whole,
+        because restart() has already decided that child is history. Without
+        the gate, the last buffered presents of a killed child land in the
+        rings the restart just cleared, and that child's header flips `ok`
+        back on for a stream that no longer exists."""
         stream = io.TextIOWrapper(proc.stdout, encoding="utf-8-sig",
                                   errors="replace", newline="")
         reader = csv.reader(stream)
         idx: dict[str, int] | None = None
         for row in reader:
+            if gen is not None and gen != self._gen:
+                return
             if not row:
                 continue
             if idx is None:
@@ -468,15 +492,33 @@ class FrameMonitor:
         with self._lock:
             self.parsed += 1
             self._last_t = max(self._last_t, t)
+            name = row[idx["Application"]] if "Application" in idx else "?"
+            known = self._pids.get(pid)
+            if known is not None and known != name and name != "?" and known != "?":
+                # Same pid, different executable: Windows recycled the pid and
+                # this row is a different process. The CSV carries no process
+                # creation time, so the name in the stream is the only identity
+                # signal here — and when it changes, the old process's chains
+                # and held number must never answer for the new one.
+                self._forget_pid(pid)
+                known = None
+            if known is None:
+                self._pids[pid] = name
             self._pid_t[pid] = t
-            if pid not in self._pids:
-                self._pids[pid] = (row[idx["Application"]] if "Application" in idx
-                                   else "?")
             key = (pid, swap)
             ring = self._rings.get(key)
             if ring is None:
                 ring = self._rings[key] = deque(maxlen=_MAX_SAMPLES)
             ring.append((t, between, display, now, gpu, mode))
+
+    def _forget_pid(self, pid: int) -> None:
+        """Drop everything known about one pid. Called under the lock when the
+        stream proves the process behind the pid is gone (pid reuse)."""
+        self._pids.pop(pid, None)
+        self._pid_t.pop(pid, None)
+        self._held.pop(pid, None)
+        for key in [k for k in self._rings if k[0] == pid]:
+            self._rings.pop(key, None)
 
     @staticmethod
     def _f(row: list[str], idx: dict[str, int], col: str) -> float | None:
@@ -548,24 +590,49 @@ class FrameMonitor:
 
     # ------------------------------------------------------------------ queries
     def _best(self, pid: int, span_s: float) -> list:
-        """The busiest of a process's swapchains over `span_s` of stream time.
+        """The samples of one process's *primary* swapchain over `span_s` of stream time.
 
-        Two things in this method are deliberate. Summing swapchains is the tempting
+        Three things in this method are deliberate. Summing swapchains is the tempting
         thing to do and it is wrong: a process with two of them (a benchmark overlay,
         a second window) would report double the frame rate it has, so the *busiest*
-        one is the frame rate. And the window is stream time — the QPC column inside
+        live one is the frame rate. The window is stream time — the QPC column inside
         the rows — not arrival time, because arrival time is what a replayed CSV has
         no notion of: windowing by it reported a replay of a steady 60 fps as 180.
+        And the chains are judged against a *common* clock — the newest frame in the
+        stream — because windowing each chain against its own newest timestamp (the
+        old contract) let a chain retired by a swapchain recreation win forever: 240
+        rows in the old chain's last second always outvote 60 rows in the new chain's,
+        no matter which chain the process is actually presenting on.
+
+        The policy, explicitly: the primary chain is the busiest one still presenting
+        within `_FRESH_S` of the stream clock — same "a present this old is not live"
+        line the held logic uses. When nothing for this pid is live, the chain with
+        the newest frame owns the numbers — recency decides, never sample count — and
+        the caller's age/hold logic turns that into `stale` or `--`.
         """
-        best: list = []
-        for (p, _swap), ring in self._rings.items():
-            if p != pid or not ring:
+        ref = self._last_t
+        live_cut = ref - _FRESH_S * 1000.0
+        one_s = ref - 1000.0
+        pick: tuple | None = None      # (samples in the common last second, key, newest)
+        for key, ring in self._rings.items():
+            if key[0] != pid or not ring:
                 continue
             newest = ring[-1][0]
-            fresh = [r for r in reversed(ring) if r[0] >= newest - span_s * 1000.0]
-            if len(fresh) > len(best):
-                best = fresh
-        return best
+            if newest < live_cut:
+                continue
+            n = sum(1 for r in reversed(ring) if r[0] >= one_s)
+            if pick is None or n > pick[0] or (n == pick[0] and newest > pick[2]):
+                pick = (n, key, newest)
+        if pick is None:
+            for key, ring in self._rings.items():
+                if key[0] != pid or not ring:
+                    continue
+                if pick is None or ring[-1][0] > pick[2]:
+                    pick = (0, key, ring[-1][0])
+        if pick is None:
+            return []
+        ring = self._rings[pick[1]]
+        return [r for r in reversed(ring) if r[0] >= pick[2] - span_s * 1000.0]
 
     @staticmethod
     def _summarise(rows: list) -> tuple:
@@ -598,10 +665,21 @@ class FrameMonitor:
         _PID_EXPIRE_S is gone — a process sweep, not a wall-clock race."""
         dead = [p for p, t in self._pid_t.items() if t < self._last_t - _PID_EXPIRE_S * 1000]
         for p in dead:
-            self._pid_t.pop(p, None)
-            self._pids.pop(p, None)
-            for key in [k for k in self._rings if k[0] == p]:
-                self._rings.pop(key, None)
+            self._forget_pid(p)
+        # Chains expire on their own, because a pid sweep structurally cannot
+        # reach them: a display-mode change recreates the swapchain while the
+        # process goes on presenting, so its _pid_t stays fresh forever and
+        # the retired ring — with its misleading dense history — would live
+        # for the rest of the session. One line per chain, same stream clock.
+        for key in [k for k, ring in self._rings.items()
+                    if not ring or ring[-1][0] < self._last_t - _CHAIN_EXPIRE_S * 1000]:
+            self._rings.pop(key, None)
+        # Held values expire on the wall clock — the same one stats() reads
+        # them by — or a pid that is simply never queried again keeps its
+        # entry (a FrameStats per game of the afternoon) for the whole run.
+        now = time.monotonic()
+        for p in [p for p, (_s, mono) in self._held.items() if now - mono > self.hold_s]:
+            self._held.pop(p, None)
 
     def presenters(self, min_fps: float | None = None) -> dict[int, Presenter]:
         """Processes actively rendering right now, and how hard.
@@ -652,15 +730,19 @@ class FrameMonitor:
         hold = float(self.hold_s)
         with self._lock:
             rows = self._best(pid, self.window_s)
-        if not rows:
+            # Read under the lock too: the sweep added in _sweep() now prunes
+            # _held from the query path, and a lookup that races a prune reads
+            # a half-decision.
             held = self._held.get(pid)
+        if not rows:
             if held and (time.monotonic() - held[1]) <= hold:
                 out = held[0]
                 return FrameStats(fps=out.fps, low1_pct=out.low1_pct,
                                   low01_pct=out.low01_pct, latency_ms=out.latency_ms,
                                   stale=True, age_s=time.monotonic() - held[1],
                                   gpu_pct=out.gpu_pct)
-            self._held.pop(pid, None)
+            with self._lock:
+                self._held.pop(pid, None)
             return None
         newest_t = rows[0][0]
         newest_mono = rows[0][3]
