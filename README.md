@@ -42,6 +42,11 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
 ```
 
+Which open repair fixes which tracked failure, in what order they should land,
+and — just as plainly — what no offline run can yet claim, is written up in
+[`docs/reliability-plan.md`](docs/reliability-plan.md) (the deliverable of the
+#33 tracker).
+
 `tools/liveview.py` renders **both** states from the same telemetry and
 hot-reloads `app/layout.py` / `app/power.py` / `config.yaml` on save — edit the
 layout and the browser updates within a tick (no restart). It also reports, per
