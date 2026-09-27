@@ -16,7 +16,9 @@ non-interactive task cannot see the foreground window, so game detection would
 silently stop working. LogonType Interactive keeps the window-station access.
 
 The app owns one COM port, so any already-running instance is stopped first --
-otherwise the new one dies on "Cannot open COM port".
+otherwise the new one dies on "Cannot open COM port". Nothing is stopped, and
+nothing is registered, until tools\env_check.py --strict has said the installed
+dependencies can actually do what this task is for; -SkipChecks registers anyway.
 
 .EXAMPLE
   # one elevated window, does everything including the first start
@@ -24,11 +26,15 @@ otherwise the new one dies on "Cannot open COM port".
 
 .EXAMPLE
   .\tools\install_autostart.ps1 -Remove    # unregister and stop (elevated too)
+
+.EXAMPLE
+  .\tools\install_autostart.ps1 -SkipChecks  # register on an incomplete environment
 #>
 [CmdletBinding()]
 param(
     [switch]$Remove,
-    [switch]$NoStart
+    [switch]$NoStart,
+    [switch]$SkipChecks
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,6 +42,9 @@ $ErrorActionPreference = 'Stop'
 $Root = Split-Path -Parent $PSScriptRoot
 $TaskName = 'PCMonitor'
 $Pyw = Join-Path $Root '.venv\Scripts\pythonw.exe'
+# The console interpreter of the same venv: env_check.py has to ask the questions of the
+# interpreter the scheduled task will run, not of whichever python is on PATH.
+$Py = Join-Path $Root '.venv\Scripts\python.exe'
 $Main = Join-Path $Root 'main.py'
 
 function Test-Admin {
@@ -90,8 +99,29 @@ if ($Remove) {
     return
 }
 
-if (-not (Test-Path $Pyw)) { throw "no interpreter at $Pyw - create the venv first" }
+if (-not (Test-Path $Pyw)) { throw "no interpreter at $Pyw - create the venv first (tools\bootstrap.ps1)" }
 if (-not (Test-Path $Main)) { throw "no main.py at $Main" }
+
+if (-not $SkipChecks) {
+    <#
+      Registering the task is the last thing a user does, and until now it was also the
+      first moment anything checked that the environment could do the job: a clone with
+      no vendored library, no pythonnet, or a PresentMon binary that is not the pinned
+      one registered happily, started at every logon, and quietly drew `--` in the
+      columns the elevation was supposed to fill. Validate first, in the interpreter the
+      task will actually run, and say what is missing rather than registering a task
+      that will under-deliver.
+    #>
+    ' checking the dependencies the elevated task needs'
+    $checkArgs = @((Join-Path $PSScriptRoot 'env_check.py'), '--root', $Root,
+                   '--strict', '--manifest')
+    & $Py @checkArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw ("the environment is incomplete (env_check.py exited $LASTEXITCODE, see " +
+               'the FAIL lines above). Fix those, or run this with -SkipChecks to ' +
+               'register the task anyway.')
+    }
+}
 
 " stopping existing instances (the panel has one COM port)"
 Stop-AppInstances

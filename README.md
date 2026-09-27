@@ -6,6 +6,30 @@ Telemetry → 5" USB-C "Turing-family" LCD via
 identifies itself as `chs_5inch.dev1_rom1.88`, i.e. the classic 5" **revision C**
 (CDC-ACM COM port), not a `TUR_USB` TURZX board — see "The panel on this desk".
 
+## From a clone to running
+
+```
+powershell -File tools\bootstrap.ps1        # venv + pinned deps + vendored library + PresentMon, then prove it
+```
+
+That is the whole first-time path: it creates `.venv`, installs
+`requirements.txt` (`-r requirements-lhm.txt` with `-WithLhm`, which adds
+pythonnet for the LibreHardwareMonitor backend), fetches the vendored panel
+library **at the revision `vendor/LOCK.txt` names**, fetches the sha256-pinned
+PresentMon binary, and then runs three proofs — `tools\env_check.py`, the
+offline selftests, and a headless render. Every step verifies before it
+installs, so running it twice is free, and a step that fails stops the script
+with the failing command's own output above it. It does not register a
+scheduled task, start the app, or touch a device; that is
+`tools\install_autostart.ps1`, elevated, on purpose.
+
+Two pins, both checked rather than assumed:
+
+```
+.venv\Scripts\python tools\env_check.py             # is what is installed what was reviewed?
+powershell -File tools\vendor_lock.ps1 -Verify      # the vendored tree alone
+```
+
 ## Run now (no hardware needed)
 
 ```
@@ -39,6 +63,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
 .venv\Scripts\python tools\panel_link_selftest.py     # link survives raise/hang, rebuilds, walks its device ladder
 .venv\Scripts\python tools\fault_selftest.py          # nothing outside the per-tick guard (AST-checked)
+.venv\Scripts\python tools\env_check_selftest.py      # the dependency pin verifies; it does not bless what it finds
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
 ```
 
@@ -480,14 +505,24 @@ handler. Add a bare `layout.render(...)` to the loop and the test says so.
 
 `vendor/` holds an **unmodified** copy of turing-smart-screen-python and is
 git-ignored: the upstream tree is 1.1 GB, 1.05 GB of which is theme artwork this
-app never loads. Only `vendor/README.md` (provenance: byte-for-byte upstream
-`main`, CRLF endings) and `vendor/LOCK.txt` (sha256 of the 20 files we import)
-are tracked. On a fresh clone:
+app never loads. What is tracked is the dependency itself — `vendor/LOCK.txt`,
+one upstream commit plus a sha256 for each of the 55 files we import (the
+library, the three theme fonts, and `external/LibreHardwareMonitor`, whose DLL
+`app/sensors/lhm.py` loads), and `vendor/README.md`, which says how that was
+established. On a fresh clone:
 
 ```
-powershell -File tools\vendor_lock.ps1 -Fetch     # sparse clone + write LOCK.txt
+powershell -File tools\vendor_lock.ps1 -Fetch     # install the revision LOCK.txt names
 powershell -File tools\vendor_lock.ps1 -Verify    # prove the copy did not drift
 ```
+
+`-Fetch` stages a sparse checkout of the pinned commit, verifies it against the
+lock, and only then moves it into place; a failure anywhere leaves the previous
+tree and lock exactly as they were. It cannot write the lock — that is
+`-Update -Sha <40 hex>`, a maintainer moving a dependency, which prints every
+file that moved and refuses a branch name. A lock that says `main` describes
+whatever upstream heads to the next time someone installs, and the `-Verify`
+after it stops meaning anything.
 
 ## Bandwidth budget (it decides what the layout may animate)
 
