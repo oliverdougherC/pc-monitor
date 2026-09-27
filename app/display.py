@@ -132,36 +132,89 @@ def _run_bounded(fn, wait_s: float, what: str) -> bool:
 
 
 def _abandon(lcd) -> None:
-    """Close the port so an abandoned vendored retry loop stops writing.
+    """Take a driver we are walking away from out of the running, then close it.
 
-    InitializeComm() keeps sending HELLO once a second while the ID looks wrong. If
-    we stopped waiting for it, that thread is still writing frames down a port we
-    are about to use for real traffic; closing makes its next write raise and the
-    thread die. A thread blocked *inside* a write is not reachable this way — that
-    is the wedged-firmware case, and the caller has to say so out loud.
+    Closing alone is not enough, and this is the part that used to bite: the vendored
+    `WriteLine`/`ReadData` reopen the port *themselves* when a write fails
+    (`lcd_comm.py` calls `self.openSerial()` in its fault path), and `InitializeComm`
+    keeps sending HELLO once a second while the panel id looks wrong. So a thread we
+    stopped waiting for does not quietly die on a closed port — a second later it
+    takes the port back and is writing frames down it while our *next* driver is
+    trying to open the same one. Two owners, and neither is stoppable from Python.
+
+    Hence: `openSerial` is refused first, so the retry loop's next attempt raises
+    where it used to reclaim the port; then the port is closed, which makes an
+    in-flight write raise and the thread die for real. A thread already blocked
+    *inside* a native write is not reachable this way — that is the wedged-firmware
+    case, and the caller has to say so out loud.
     """
+    if lcd is None:           # an attempt that never got a port: nothing to retire
+        return
+    try:
+        if not getattr(lcd, "_pcmonitor_abandoned", False):
+            def _refuse(*_a, **_k):    # noqa: ANN001, ANN202 - vendor-shaped stub
+                raise RuntimeError("this driver was retired by PC Monitor; the port "
+                                   "belongs to a newer connection")
+
+            lcd.openSerial = _refuse
+            lcd._pcmonitor_abandoned = True
+    except Exception:  # noqa: BLE001 - best effort; the close below is the real step
+        pass
     try:
         lcd.closeSerial()
     except Exception:  # noqa: BLE001
         pass
 
 
-def _bring_up(lcd, force_reset: bool) -> str:
-    """Handshake first, reboot the panel only if it did not answer: ok | deaf | wedged.
+def _reopen(remake, what: str):
+    """A *fresh* driver object, or None. Never a second lease on a retired one.
+
+    `remake` is the caller's constructor: opening a new object is what keeps the
+    abandoned thread and the live connection from sharing state (and, on revision C,
+    re-runs the awake-port dance, which is exactly what a panel that has just reset
+    needs — its awake COM port can move).
+    """
+    if remake is None:
+        return None
+    try:
+        return remake()
+    except SystemExit:                    # vendor gives up on the port after 10 tries
+        app_log(f"[display] {what}: the driver gave up looking for the port")
+    except Exception as e:  # noqa: BLE001
+        app_log(f"[display] {what}: reopen failed ({type(e).__name__}: {e})")
+    return None
+
+
+def _bring_up(lcd, force_reset: bool, remake=None) -> tuple[str, object | None]:
+    """Handshake first, reboot the panel only if it did not answer:
+    (ok | deaf | wedged | noport, the driver to keep owning).
 
     Reset() used to run on every start because that is the order the vendored
     examples use. It is not needed for a screen that answers: the loop's first push
     is a full frame (DiffPusher starts with no previous frame), so whatever was on
     the panel is painted over within a second. Skipping it removes the one blocking
     write from every normal start — and about 15 s from the boot.
+
+    `remake` is the caller's factory for a fresh driver object. It matters because a
+    deadline here only stops *us* waiting: the call we gave up on is still running on
+    `lcd`. Retrying on that same object would put our reset traffic and that thread's
+    HELLO loop on one handle, so after every `_abandon` the next attempt is a new
+    object and the old one is gone for good. Without a factory we do not reopen at
+    all — a retry we cannot make safe is a retry we should not make.
+
+    The second value is the object this attempt ended on, which is not necessarily the
+    one passed in: it is the caller's to dispose of, and returning anything else would
+    leave a port open behind an attempt that failed.
     """
     answered = _run_bounded(lcd.InitializeComm, _HELLO_WAIT_S, "HELLO handshake")
     if answered and not force_reset:
-        return "ok"
+        return "ok", lcd
     if not answered:
         _abandon(lcd)
         time.sleep(1.0)
-        lcd.openSerial()              # bounded and logged; AUTO re-detects the port
+        lcd = _reopen(remake, "after HELLO timeout")
+        if lcd is None:
+            return ("noport" if remake is not None else "deaf"), None
     try:
         # Where pyserial honours this, a wedged endpoint now raises after 2 s instead
         # of hanging; where it does not, the deadline above still catches it.
@@ -174,16 +227,17 @@ def _bring_up(lcd, force_reset: bool) -> str:
         # worked — so try to talk to it again before declaring anything.
         _abandon(lcd)
         time.sleep(2.0)
-        try:
-            lcd.openSerial()
-        except SystemExit:            # vendor gives up on the port after 10 tries
-            return "wedged"
+        lcd = _reopen(remake, "after reset timeout")
+        if lcd is None:
+            return "wedged", None
         if not _run_bounded(lcd.InitializeComm, _HELLO_WAIT_S, "HELLO after failed reset"):
-            return "wedged"
-        return "ok"
+            return "wedged", lcd
+        return "ok", lcd
     if answered and force_reset:
-        return "ok"   # reset was the point; the panel already identified itself
-    return "ok" if _run_bounded(lcd.InitializeComm, _HELLO_WAIT_S, "HELLO after reset") else "deaf"
+        return "ok", lcd   # reset was the point; the panel already identified itself
+    if _run_bounded(lcd.InitializeComm, _HELLO_WAIT_S, "HELLO after reset"):
+        return "ok", lcd
+    return "deaf", lcd
 
 
 def make_lcd(cfg: dict):
@@ -211,28 +265,40 @@ def make_lcd(cfg: dict):
     else:
         if rev not in _CLS:
             raise SystemExit(f"unknown display revision: {rev}")
-        mod = importlib.import_module(_CLS[rev][0])
-        lcd = getattr(mod, _CLS[rev][1])(com_port=port, display_width=w, display_height=h)
+
+        def make():
+            """A brand-new driver for this revision, port included.
+
+            Every attempt — here and inside `_bring_up` — gets its own object, because
+            an attempt we stopped waiting for still owns the one it was running on.
+            """
+            m = importlib.import_module(_CLS[rev][0])
+            return getattr(m, _CLS[rev][1])(com_port=port, display_width=w,
+                                            display_height=h)
+
+        lcd = make()
         for attempt in range(1, _INIT_TRIES + 1):
-            outcome = _bring_up(lcd, force_reset)
+            outcome, lcd = _bring_up(lcd, force_reset, remake=make)
             if outcome == "ok":
                 break
             if outcome == "wedged":
                 app_log("[display] screen stopped answering in the middle of its reset - its "
                         "firmware is wedged, not the app. Unplug its USB for 5 seconds and, "
                         "once it enumerates again: Start-ScheduledTask -TaskName PCMonitor")
+                _abandon(lcd)
                 raise SystemExit(2)
-            app_log(f"[display] screen did not answer ({attempt}/{_INIT_TRIES}); "
-                    f"waiting {_INIT_RETRY_WAIT_S:.0f} s for it to come back")
+            app_log(f"[display] screen did not answer ({attempt}/{_INIT_TRIES}; "
+                    f"{outcome}); waiting {_INIT_RETRY_WAIT_S:.0f} s for it to come back")
             _abandon(lcd)
             time.sleep(_INIT_RETRY_WAIT_S)
             try:
-                lcd.openSerial()
+                lcd = make()
             except SystemExit:
                 raise SystemExit(2)
         else:
             app_log("[display] no answer from the screen after several tries - check its cable, "
                     "then start it again: Start-ScheduledTask -TaskName PCMonitor")
+            _abandon(lcd)
             raise SystemExit(2)
 
     if str(cfg["display"]["orientation"]).lower() == "landscape":

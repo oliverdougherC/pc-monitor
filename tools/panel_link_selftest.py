@@ -175,89 +175,142 @@ def case_relink_is_synchronous() -> None:
     link.close()
 
 
+def _usb_fixtures():
+    """The fake device store from the USB-reset suite, shared rather than duplicated.
+
+    Both suites need the same thing - a device store that answers the module's own
+    marked queries - and #50's gate means the ladder can no longer be exercised
+    without one. Importing the sibling keeps the two honest about the same rows.
+    """
+    import importlib.util
+    p = Path(__file__).resolve().parent / "panel_usb_reset_selftest.py"
+    spec = importlib.util.spec_from_file_location("panel_usb_fixtures", p)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 def case_ladder() -> None:
     print("case: the device-recovery ladder steps up, one rung per attempt")
-    link = PanelLink(simu_cfg(), log=lambda m: print(f"    | {m}"))
-    calls: list[str] = []
-    link.port = "COM9"
-    # The two things `_usb_restart` does to the outside world, replaced: which device
-    # owns the port, and what the device verbs return. Everything else is the real
-    # ladder logic — and the order of the rungs is the whole point of it.
-    link._device_id = lambda port, parent=False: (
-        "USB\\VID_1D6B&PID_0106&MI_00\\8&1" if not parent
-        else "USB\\VID_1D6B&PID_0106\\20080411")
-    link._pnputil = lambda verb, dev: (calls.append(f"{verb} {dev}"), (True, "stubbed"))[1]
-    waits = []
-    for _ in range(3):
-        waits.append(link._restart_wait())
-        link._usb_restart()
-    check("rung 1: restart the CDC interface", calls[0],
-          "/restart-device USB\\VID_1D6B&PID_0106&MI_00\\8&1")
-    check("rung 2: restart the composite device", calls[1],
-          "/restart-device USB\\VID_1D6B&PID_0106\\20080411")
-    check("rung 3: disable it", calls[2].split()[0], "/disable-device")
-    check("rung 3: then enable it again", calls[3].split()[0], "/enable-device")
-    check("rung 3 aimed at the composite device",
-          calls[3].split()[1], "USB\\VID_1D6B&PID_0106\\20080411")
-    check("restarts counted", link.usb_restarts, 3)
-    # The cadence is the reason escalation is worth having: the whole ladder walks a
-    # minute apart, and only then does it slow down.
-    check("the ladder walks quickly while it has rungs left", waits, [60.0, 60.0, 60.0])
-    check("and settles down once it has walked", link._restart_wait(), 300.0)
-    check("the panel answering resets the ladder", link.relink("recovered"), True)
-    check("quick again for the next outage", link._restart_wait(), 60.0)
-    check("depth reset too", link._restart_depth, 0)
-    link.close()
-
-
-def case_power_cycle_safety() -> None:
-    print("case: a power cycle never leaves the device disabled")
-    real_mark = panel_mod._MARK_FILE
-    tmp = Path(tempfile.mkdtemp()) / "marker"
-    panel_mod._MARK_FILE = tmp
+    # Reconciled during integration (#40 x #50): the rungs and the cadence are
+    # unchanged, but every verb is now aimed through the identity gate - the
+    # instance id has to be established as the panel before anything is touched -
+    # and rung 3 is the journal-durable disable/enable rather than the old
+    # unrecorded power cycle. So the case gives the link a fake device store and
+    # an identity a HELLO would have confirmed. The claim under test is still the
+    # order of the rungs; what it now also proves is that the ladder walks *while
+    # properly aimed*, which is the only way it may walk at all.
+    fix = _usb_fixtures()
+    bus = fix.panel_bus()
+    put = fix.Pnputil(bus)
+    real_subprocess, real_state = panel_mod.subprocess, panel_mod.STATE_DIR
+    real_settle = panel_mod._BUS_SETTLE_S
+    panel_mod.subprocess = put
+    panel_mod.STATE_DIR = Path(tempfile.mkdtemp())
+    panel_mod._BUS_SETTLE_S = 0.0        # the settle is real-world timing, not a claim
     try:
         link = PanelLink(simu_cfg(), log=lambda m: print(f"    | {m}"))
+        link.port = "COM7"
+        link._bus = bus
+        link._identity = panel_mod.PanelIdentity(fix.PANEL_IF, "COM7",
+                                                 tuple(fix.PANEL_HW), True, True)
+        waits = []
+        for _ in range(3):
+            waits.append(link._restart_wait())
+            link._usb_restart()
+        touched = fix.touched(put)
+        check("rung 1: restart the CDC interface", touched[0],
+              f"/restart-device {fix.PANEL_IF}")
+        check("rung 2: restart the composite device", touched[1],
+              f"/restart-device {fix.PANEL_PARENT}")
+        check("rung 3: disable it", touched[2].split()[0], "/disable-device")
+        check("rung 3: then enable it again", touched[3].split()[0], "/enable-device")
+        check("rung 3 aimed at the composite device",
+              touched[3].split()[1], fix.PANEL_PARENT)
+        check("restarts counted", link.usb_restarts, 3)
+        check("nothing is owed after a paid cycle", link._pending_recovery(), "")
+        # The cadence is the reason escalation is worth having: the whole ladder walks a
+        # minute apart, and only then does it slow down.
+        check("the ladder walks quickly while it has rungs left", waits, [60.0, 60.0, 60.0])
+        check("and settles down once it has walked", link._restart_wait(), 300.0)
+        check("the panel answering resets the ladder", link.relink("recovered"), True)
+        check("quick again for the next outage", link._restart_wait(), 60.0)
+        check("depth reset too", link._restart_depth, 0)
+        link.close()
+    finally:
+        panel_mod.subprocess = real_subprocess
+        panel_mod.STATE_DIR = real_state
+        panel_mod._BUS_SETTLE_S = real_settle
 
-        # 1. a disable that is refused must not be followed by an enable: that would
-        #    "re-enable" a device we never stopped, and write a marker about it.
+
+def case_disable_enable_safety() -> None:
+    print("case: a device cycle never leaves the device disabled")
+    # Reconciled during integration (#40): the marker file became a journaled
+    # record in the per-user state directory (`STATE_DIR` is the seam),
+    # `_power_cycle` became `_disable_and_enable`, and the start-up heal became
+    # `_reconcile_recovery`. The same four claims, on the real machinery: a
+    # refusal writes nothing, success writes then clears, a stuck enable leaves
+    # the record, and the next bring-up pays the debt.
+    real_state, real_settle = panel_mod.STATE_DIR, panel_mod._BUS_SETTLE_S
+    panel_mod.STATE_DIR = Path(tempfile.mkdtemp())
+    panel_mod._BUS_SETTLE_S = 0.0
+    try:
+        link = PanelLink(simu_cfg(), log=lambda m: print(f"    | {m}"))
+        dev = "USB\\VID_1D6B&PID_0106&MI_00\\7&1a2b3c4d&0&0000"
+
+        # 1. a disable that did not take must not be followed by an enable: that
+        #    would "re-enable" a device we never stopped, and write a record about it.
         calls: list[str] = []
-        link._pnputil = lambda verb, dev: (calls.append(verb), (False, "Access is denied."))[1]
-        ok, line = link._power_cycle("USB\\X")
+        link._pnputil = lambda verb, d: (calls.append(verb), (False, "Access is denied."))[1]
+        link._device_state = lambda d: "on"       # the node says: never stopped
+        ok, line = link._disable_and_enable(dev)
         check("refused disable fails honestly", ok, False)
         check("no enable attempted", calls, ["/disable-device"])
-        check("the refusal is the message", "denied" in line.lower(), True)
-        check("no marker written", tmp.exists(), False)
+        check("the refusal is the message", "did not take effect" in line, True)
+        check("no record written", link._pending_recovery(), "")
 
         # 2. the happy path writes the intent and removes it.
-        link._pnputil = lambda verb, dev: (calls.append(verb), (True, "ok"))[1]
-        ok, _ = link._power_cycle("USB\\X")
+        calls.clear()
+        link._pnputil = lambda verb, d: (calls.append(verb), (True, "ok"))[1]
+        states = iter(["off", "on"])              # off after disable, on after enable
+        link._device_state = lambda d: next(states)
+        ok, _ = link._disable_and_enable(dev)
         check("disable then enable", ok, True)
-        check("both verbs ran", calls[1:], ["/disable-device", "/enable-device"])
-        check("marker cleaned up", tmp.exists(), False)
+        check("both verbs ran", calls, ["/disable-device", "/enable-device"])
+        check("record cleaned up", link._pending_recovery(), "")
 
-        # 3. the dangerous path: stopped it, cannot start it again. The marker must
+        # 3. the dangerous path: stopped it, cannot start it again. The record must
         #    survive so the next start finishes the job, and the log must be blunt.
         seen: list[str] = []
         link.log = lambda m: seen.append(m)
-        link._pnputil = lambda verb, dev: (
+        calls.clear()
+        link._pnputil = lambda verb, d: (
             calls.append(verb), (verb != "/enable-device", "stub"))[1]
-        ok, line = link._power_cycle("USB\\X")
+        link._device_state = lambda d: "off"      # still disabled, whatever it says
+        ok, line = link._disable_and_enable(dev)
         check("reported as failed", ok, False)
         check("enable retried", calls.count("/enable-device") >= 3, True)
-        check("marker left behind", tmp.exists(), True)
-        check("the log says how to undo it", any("COULD NOT RE-ENABLE" in m for m in seen),
+        check("record left behind", link._pending_recovery(), dev)
+        check("the log says how to undo it", any("COULD NOT CONFIRM" in m for m in seen),
               True)
 
-        # 4. the next start-up finds the marker and finishes the job.
+        # 4. the next bring-up finds the record and finishes the job. The node still
+        #    says disabled when reconcile first looks - that is the whole reason it
+        #    asks - and says enabled once the enable has been issued.
+        calls.clear()
         link.log = lambda m: seen.append(m)
-        link._pnputil = lambda verb, dev: (calls.append(verb), (True, "ok"))[1]
-        link._heal_disabled()
+        link._pnputil = lambda verb, d: (calls.append(verb), (True, "ok"))[1]
+        states = iter(["off", "on"])
+        link._device_state = lambda d: next(states)
+        check("reconcile says the debt is paid", link._reconcile_recovery(), True)
         check("enabled on the next start", calls[-1], "/enable-device")
-        check("marker gone", tmp.exists(), False)
-        check("and it said so", any("re-enabled" in m for m in seen), True)
+        check("record gone", link._pending_recovery(), "")
+        check("and it said so", any("enabled again" in m.lower() or "re-enabled" in m.lower()
+                                    for m in seen), True)
         link.close()
     finally:
-        panel_mod._MARK_FILE = real_mark
+        panel_mod.STATE_DIR = real_state
+        panel_mod._BUS_SETTLE_S = real_settle
 
 
 def case_exhausted_notice() -> None:
@@ -267,9 +320,15 @@ def case_exhausted_notice() -> None:
     link.ok = False
     now = time.monotonic()
     link._restart_attempts = 0
+    link._restart_touched = 0
     link._exhausted_notice(now)
     check("silent while rungs remain", any("exhausted" in m for m in seen), False)
+    # Reconciled during integration (#50): the notice counts verbs *actually
+    # issued*, because a ladder refused at every rung has proved nothing about the
+    # firmware and must not claim to have been walked. So the case issues rungs,
+    # it does not merely ask for them.
     link._restart_attempts = 3
+    link._restart_touched = 3
     link._exhausted_notice(now)
     check("says it once the ladder is out", sum("exhausted" in m for m in seen), 1)
     check("and names the action", "unplug" in seen[-1], True)
@@ -280,6 +339,13 @@ def case_exhausted_notice() -> None:
     link.ok = True
     link._exhausted_notice(now + 5000.0)
     check("never while the link is up", sum("exhausted" in m for m in seen), 2)
+    # A ladder that was refused at every rung stays quiet about the firmware.
+    link.ok = False
+    link._restart_touched = 0
+    link._last_giveup_log = 0.0
+    link._exhausted_notice(now + 6000.0)
+    check("a refused ladder never claims it was walked",
+          sum("exhausted" in m for m in seen), 2)
     print(f"    {seen[-1][:110]}…")
     link.close()
 
@@ -317,7 +383,7 @@ def case_backoff_when_all_is_lost() -> None:
 
 def main() -> int:
     for fn in (case_happy, case_deaf_recovers, case_wedged_is_bounded,
-               case_relink_is_synchronous, case_ladder, case_power_cycle_safety,
+               case_relink_is_synchronous, case_ladder, case_disable_enable_safety,
                case_exhausted_notice, case_backoff_when_all_is_lost):
         fn()
         print()
