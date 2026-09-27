@@ -55,6 +55,9 @@ CASES = [
      "Pinning that clock is issue #4, which should drop this advisory flag."),
     ("nightlight", ["tools/nightlight_probe.py", "--selftest"],
      "CloudStore night-mode decode, pinned to captured blobs", None, None),
+    ("sensors", ["tools/sensors_selftest.py"],
+     "supervisor: bounded ticks, held grace, blanking, reopen with backoff, "
+     "NVML re-acquire", None, None),
     ("panel_link", ["tools/panel_link_selftest.py"],
      "link survives raise/hang, rebuilds, walks its device ladder", "vendor", None),
     ("lights", ["tools/lights_selftest.py"],

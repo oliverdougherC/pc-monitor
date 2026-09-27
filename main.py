@@ -50,6 +50,7 @@ from app.output import DiffPusher, wipe, wipe_supported   # noqa: E402
 from app.panel import PanelLink                        # noqa: E402
 from app.power import estimate                         # noqa: E402
 from app.sensors import make_hub                       # noqa: E402
+from app.snapshot import Snapshot                      # noqa: E402
 from app.steamid import SteamIdentity                  # noqa: E402
 
 
@@ -249,7 +250,7 @@ def main() -> None:
     demo = hub.backend if isinstance(hub.backend, DemoBackend) else None
 
     # prime interval-based counters
-    prev_snap = hub.tick()
+    hub.tick()
     time.sleep(0.2)
 
     # Containment for everything the loop cannot control, and a first light decision
@@ -286,17 +287,25 @@ def main() -> None:
     started = time.monotonic()
     while True:
         t0 = time.monotonic()
+        # The hub is the supervisor (app/sensors/__init__.py): the backend call
+        # is bounded, a failed tick holds the last good sample for a documented
+        # grace and then blanks to honest "--". Reaching this except would be a
+        # supervisor bug - contain it, but fall back to a *blank* snapshot:
+        # re-presenting the previous one as live used to be the answer here,
+        # and it is the very fault this replaced (flat lines drawn into the
+        # trend bands for as long as the driver stayed dead).
         try:
             snap = hub.tick()
         except Exception as e:  # noqa: BLE001 - a sensor that throws once must not stop the panel
             errors += 1
             if f"{type(e).__name__}" != last_err or t0 - last_err_at > 300.0:
                 last_err, last_err_at = f"{type(e).__name__}", t0
-                status(f"[sensors] tick failed ({type(e).__name__}: {e}) — using the last "
-                       f"snapshot; {errors} total")
-            snap = prev_snap
-        else:
-            prev_snap = snap
+                status(f"[sensors] supervisor fault ({type(e).__name__}: {e}) — "
+                       f"blank sample; {errors} total")
+            snap = Snapshot(ts=time.time())
+        line = g.run("sensors-report", hub.changed_to_log, "")
+        if line:
+            status(line)
 
         dt = min(max(t0 - tick_dt, 0.0), 60.0)   # a frozen loop must not fake a long dt
         tick_dt = t0
@@ -316,6 +325,10 @@ def main() -> None:
                 g.run("capture-restart", lambda: frames_mon.restart(reason))
                 frames_reported = False      # say again whether the session came back
             g.run("watch-reset", lambda: watch.reset(reason))
+            # Drivers do not survive sleep either: NVML handles and the LHM
+            # Computer belong to the world that existed before the suspend, so
+            # the hub re-acquires them instead of trusting the ones it has.
+            g.run("sensors-recover", lambda: hub.recover(reason))
 
         # Background link maintenance: when the screen is down this retries the port
         # on its own clock (and, past a couple of minutes, asks Windows to restart the
@@ -450,7 +463,13 @@ def main() -> None:
 
         # shift changed → next push is automatically full via diff (large change)
         shift = burn.shift()
-        g.run("history", lambda: layout.observe(snap, state))   # feeds the 60s bands
+        # History takes measured samples only: a held one (the hub's last-good
+        # re-publication while the backend is blind) would draw the blind
+        # window as a flat measured line, and the bands' contract is that
+        # missing data is a gap. The panel still renders held numbers until
+        # the grace expires; after it the Nones draw gaps and "--".
+        if not snap.held:
+            g.run("history", lambda: layout.observe(snap, state))   # feeds the 60s bands
         # Still observed while dark, so the trend bands are continuous across a
         # wake — but not rendered: the pixels cannot be seen and the draw is not
         # free (~40 ms of a 1 Hz tick).

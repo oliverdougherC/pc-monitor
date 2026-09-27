@@ -45,7 +45,27 @@ DEFAULTS = {
         # set false to let the timers win even during play.
         "stay_lit_in_game": True,
     },
-    "sensors": {"backend": "auto", "interval_s": 1.0},
+    "sensors": {
+        "backend": "auto", "interval_s": 1.0,
+        # The supervisor's numbers (app/sensors/__init__.py). Drivers hang and
+        # reset; these are how long the panel waits and how long it lies to
+        # itself before it stops.
+        # tick_timeout_s: how long one backend call may take before the hub
+        #   abandons it (the sample thread is leaked; nothing else dies).
+        # stale_grace_s: how long a blind tick may re-present the last good
+        #   sample (marked held, never pushed into history) before every
+        #   metric shows "--" and the trend bands draw gaps.
+        # reopen_after / reopen_backoff_s / reopen_backoff_max_s: after this
+        #   many consecutive failed samples the hub closes and re-makes the
+        #   backend (NVML handles, the LHM Computer); a reopen that itself
+        #   fails waits reopen_backoff_s, doubling to the cap, so a dead
+        #   driver is asked politely, not hammered.
+        # nvml_retry_s: how soon the fallback backend asks NVML again after a
+        #   failed open - a driver that was still loading at boot.
+        "tick_timeout_s": 2.0, "stale_grace_s": 30.0,
+        "reopen_after": 3, "reopen_backoff_s": 5.0, "reopen_backoff_max_s": 60.0,
+        "nvml_retry_s": 60.0,
+    },
     "power": {
         "base_w": 34, "rail_overhead_pct": 9, "cpu_tdp": 170, "gpu_tdp": 575,
         "gradient_min_w": 50, "gradient_max_w": 1000, "gradient_gamma": 0.75,

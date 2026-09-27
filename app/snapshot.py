@@ -49,3 +49,14 @@ class Snapshot:
     net_up_bps: float | None = None
     frames: FrameStats = field(default_factory=FrameStats)
     power_total_w: float | None = None
+    # Telemetry provenance, filled by SensorHub (app/sensors/__init__.py):
+    # `source` names the backend that answered; `held` marks a re-published
+    # last-good sample (a blind tick), with `age_s` how old it is; `failed`
+    # names the metric groups that did not answer this tick. A held sample is
+    # rendered but never pushed into history, and a failed group is None - a
+    # gap - because the honest alternative is drawing old data as a flat,
+    # measured line.
+    source: str = ""
+    held: bool = False
+    age_s: float = 0.0
+    failed: tuple[str, ...] = ()
