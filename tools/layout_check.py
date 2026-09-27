@@ -50,7 +50,7 @@ BLANK = {k: None for k in EXTREMES["idle"]}
 BLANK.update(fps=None, low1=None, low01=None)
 
 
-def build(case: dict, state: str) -> Snapshot:
+def build(case: dict, state: str, simulated: bool = False) -> Snapshot:
     s = Snapshot()
     s.cpu.load_pct, s.cpu.temp_c = case["load"], case["temp"]
     s.cpu.clock_max_mhz, s.cpu.clock_avg_mhz = case["clock_max"], case["clock_avg"]
@@ -63,6 +63,10 @@ def build(case: dict, state: str) -> Snapshot:
     s.net_down_bps, s.net_up_bps = case["down"], case["up"]
     s.frames.fps, s.frames.low1_pct = case.get("fps"), case.get("low1")
     s.frames.low01_pct, s.frames.latency_ms = case.get("low01"), None
+    # The simulated pane earns its own pass: the badge is a new run in a panel that
+    # is already full, and it only appears over invented numbers — which is exactly
+    # when nobody thinks to look for a collision.
+    s.frames.simulated = simulated
     s.power_total_w = case["total_w"]
     return s
 
@@ -73,7 +77,7 @@ def panels_for(state: str):
             "power": layout_mod.POWER_BOX}
 
 
-def check_state(layout, state: str, case: dict, label: str):
+def check_state(layout, state: str, case: dict, label: str, simulated: bool = False):
     """Render and audit: every text run must sit inside its own panel and must
     not touch any other text run."""
     drawn: list[tuple[str, tuple, str]] = []
@@ -89,7 +93,7 @@ def check_state(layout, state: str, case: dict, label: str):
 
     layout_mod.Layout._txt = spy
     try:
-        layout.render(build(case, state), state, (3, 3))   # worst case: shifted
+        layout.render(build(case, state, simulated), state, (3, 3))   # worst case: shifted
     finally:
         layout_mod.Layout._txt = orig_txt
 
@@ -143,6 +147,12 @@ def main() -> int:
             problems += check_state(layout, state, EXTREMES[state],
                                     f"{mode_name}/extreme")
             problems += check_state(layout, state, BLANK, f"{mode_name}/blank")
+            if state == "game":
+                # Same worst-case digits, with the values marked as invented: the
+                # SIMULATED badge lands on the frames panel's own title row, and a
+                # preview is precisely where a bad fit would never be noticed.
+                problems += check_state(layout, state, EXTREMES[state],
+                                        f"{mode_name}/simulated", simulated=True)
 
     if problems:
         print(f"FAIL — {len(problems)} layout problem(s):")
@@ -150,7 +160,8 @@ def main() -> int:
             print("  -", p)
         print("SELFTEST FAILED: layout")
         return 1
-    print("ok — no collisions, no panel overflow, both states, all value extremes")
+    print("ok — no collisions, no panel overflow, both states, all value extremes, "
+          "invented frame values included")
     # The gate reads this line rather than trusting the exit code: a check that
     # stops early can still exit 0, and that looks exactly like a check that ran.
     print("SELFTEST PASSED")

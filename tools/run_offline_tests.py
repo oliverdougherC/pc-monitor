@@ -48,6 +48,11 @@ CASES = [
      "present-stream parsing: fps, GPU-busy, held values, stream guards", None, None),
     ("gamewatch", ["tools/gamewatch_selftest.py"],
      "game entry/exit, alt-tab keeps the locked target, video is not a game", None, None),
+    # No vendor, no fonts, no admin: this one has to actually gate on the runner,
+    # because "the preview does not invent measurements" is a claim about the default.
+    ("liveview", ["tools/liveview_selftest.py"],
+     "preview shows missing fps as missing; invented fps is marked on the image",
+     None, None),
     ("hoststate", ["tools/hoststate_selftest.py"],
      "sleep / displays-off / lock / frozen-loop fallback in the state machine", None,
      "reads the live GetLastInputInfo clock, so it fails whenever a human is at the "

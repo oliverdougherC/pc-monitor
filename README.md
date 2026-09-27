@@ -18,7 +18,9 @@ identifies itself as `chs_5inch.dev1_rom1.88`, i.e. the classic 5" **revision C*
 
 Real fps/frametime (game pane, `--backend auto|lhm|fallback`) additionally needs
 the pinned PresentMon binary and Administrator — everything else degrades to
-honest `--`, never fake numbers:
+honest `--`, never fake numbers. That includes the developer preview:
+`tools/liveview.py` invents frame stats only when `--synth-fps on` asks it to, and
+then paints `SIMULATED` over the pane that shows them:
 
 ```
 powershell -File tools\fetch_presentmon.ps1          # download + sha256-lock vendor/presentmon/
@@ -34,6 +36,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\run_offline_tests.py       # all of the below, one exit code
 .venv\Scripts\python tools\frames_selftest.py         # fps/GPU/mode parsing, held values, stream guards
 .venv\Scripts\python tools\gamewatch_selftest.py      # entry speed, alt-tab keeps the game's numbers
+.venv\Scripts\python tools\liveview_selftest.py       # the preview invents nothing it does not say so on
 .venv\Scripts\python tools\hoststate_selftest.py      # sleep / displays-off / lock / frozen loop
 .venv\Scripts\python tools\lights_selftest.py         # what the panel does about each of those
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
@@ -47,6 +50,15 @@ hot-reloads `app/layout.py` / `app/power.py` / `config.yaml` on save — edit th
 layout and the browser updates within a tick (no restart). It also reports, per
 state, how many bands a partial panel update would need (same math as
 `app/output.py`), and has zoom / brightness / grid / burn-in-shift overlays.
+
+Its game pane follows the real present stream, so a preview run with
+`--backend auto` shows the same numbers the panel would. When that stream is off,
+denied, quiet or has no usable target, the pane shows `--` — it does not fill
+itself in. `--synth-fps on` is there for designing the layout without a game
+running, and it is explicit and marked: the pane is painted `SIMULATED`, in the
+frame itself, so an exported PNG cannot be mistaken for a measurement. The status
+line reports the provenance of the numbers on screen (`displayed:
+real|simulated|none`), not of the capture underneath them.
 
 ## Architecture
 
@@ -67,12 +79,13 @@ state, how many bands a partial panel update would need (same math as
 | `app/history.py` | bounded ring buffers feeding the trend bands |
 | `app/output.py` | numpy diff → only changed bands are sent to the panel |
 | `app/burnin.py` | 3-px layout shift and the periodic color sweep (brightness/screen-off moved out to `app/lights.py`) |
-| `tools/liveview.py` | dev server: live idle+game two-up, hot-reload, push-cost stats, real present-stream fps |
+| `tools/liveview.py` | dev server: live idle+game two-up, hot-reload, push-cost stats, real present-stream fps; invented fps is opt-in and painted `SIMULATED` |
 | `tools/layout_check.py` | geometry guard: value extremes → collisions / panel overflow |
 | `tools/frames_probe.py` | what the PresentMon stream sees right now: presenters, AppIDs, fps/frametime |
 | `tools/frames_health.ps1` | no admin: which of LIVE / STARVED / DENIED / QUIET the capture is in, straight from `log.log` |
 | `tools/frames_selftest.py` | no admin: replays synthetic present streams through the real parser; fps math, GPU-busy/mode parsing, the held-value window, and the silence/column guards |
 | `tools/gamewatch_selftest.py` | no admin: fake present streams + fake focus through the real detector — fast entry, alt-tab holds the game's numbers, quick exit on quit, video is not a game, target handover |
+| `tools/liveview_selftest.py` | no admin, no fonts, no vendored library: the preview's game pane through the five shapes a capture comes in — off, denied, quiet, no stats, measured. Nothing is invented unless `--synth-fps on` was asked for, and then the marking is in the pixels and in the status line at once |
 | `tools/hoststate_selftest.py` | no admin: replays power/session broadcasts through the real state machine (sleep, monitor timeout, lock, frozen-loop fallback, slow start) |
 | `tools/nightlight_probe.py` | prints what Windows actually stores; `--selftest` replays the captured blobs, `--watch 30` follows a manual toggle |
 | `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the disable/enable journaling (including "a refused disable is never followed by an enable") |
