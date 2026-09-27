@@ -15,7 +15,10 @@ its values as Microsoft Bond CompactBinary v1 payloads):
 Both are an outer CloudStore wrapper (metadata struct + a Unix timestamp + the
 payload as a list<int8>) whose payload is *itself* a marshaled CB struct:
 
-  state    field 0  int32   PRESENT ⇒ night light is force-enabled right now
+  state    field 0  int32   PRESENT ⇒ night light is being applied right now;
+           Windows rewrites it at every scheduled transition and on every
+           manual toggle, so a hand-turned-off reads OFF even inside an open
+           schedule window
            field 10 int32   initialized (always 1)
            field 20 uint64  FILETIME of the last on/off transition
   settings field 0  bool    a schedule is enabled
@@ -28,8 +31,11 @@ Verified on this desk 2026-10-09 against the live values: the state payload is
 `4342010010 00 D00A02 C614<filetime>` — field 0 present, i.e. ON — with settings
 temperature 2525 K and a disabled schedule, which is exactly what Quick Settings
 showed. Nothing here guesses: `parse_state`/`parse_settings` either decode the
-fields or return `None`, and an undecodable blob degrades to "unknown", which the
-caller treats as "fall back to the configured schedule" and says so in the log.
+fields or return `None`, and an undecodable blob degrades to "unknown". Unknown
+is a third answer, never a quiet "off": CloudStore is rewritten by another
+process, so a failed read holds the last *confirmed* appearance (see
+`NightLight`) instead of flashing the panel back to day brightness, and the log
+says where every answer came from.
 
 The panel has no colour-temperature hardware, so the warmth is applied to the
 pixels: `warm_lut()` builds a 768-entry per-channel LUT from the Kelvin value
@@ -39,9 +45,12 @@ near-black at near-black, which is what the burn-in/power design needs.
 """
 from __future__ import annotations
 
+import ctypes
 import math
 import os
 import time
+from dataclasses import dataclass
+from typing import NamedTuple
 
 # Bond CompactBinary v1 type ids (only the ones the night-light schemas use).
 _STOP, _STOP_BASE, _BOOL, _UINT8, _UINT16, _UINT32, _UINT64 = 0, 1, 2, 3, 4, 5, 6
@@ -259,6 +268,28 @@ def parse_settings(blob: bytes) -> dict | None:
     }
 
 
+# ------------------------------------------------------------------ appearances
+@dataclass(frozen=True)
+class NightAppearance:
+    """One coherent night look, published from a single read.
+
+    Bundled so the panel can never act on a mixture - a fresh ON beside the
+    old warmth, or an old ON beside a fresh warmth. `source` and `detail` say
+    where the answer came from; `state_mtime` is the CloudStore wrapper's own
+    write time (0.0 when the answer was inferred rather than read), and
+    `since` is the monotonic clock when it was confirmed - what the hold
+    grace period is measured against.
+    """
+
+    on: bool
+    temp_k: int | None
+    gains: tuple[float, float, float] | None
+    source: str
+    detail: str
+    state_mtime: float = 0.0
+    since: float = 0.0
+
+
 # ------------------------------------------------------------------- the reader
 class NightLight:
     """Answers "is the user's night mode on, and how warm did they set it?".
@@ -267,17 +298,30 @@ class NightLight:
     doing one every second) and *self-describing*: the first read logs the whole
     decode, because a wrong read here is invisible on the panel — it just never
     goes amber, or never stops being amber.
+
+    The answer is published as a whole `NightAppearance`, and the last confirmed
+    one survives a blind poll: CloudStore is rewritten by another process, so a
+    torn read or a missing key is a transient failure, not the user turning the
+    light off. While holding, `stale` is True and the detail says so; past
+    `hold_grace_s` the policy is explicitly to keep holding, because the
+    alternative — guessing "day" from a store we cannot read — is the one
+    outcome that brightens a dark room on a read error. A *confirmed* read
+    replaces the appearance at once, OFF included.
     """
 
     def __init__(self, cfg: dict, refresh_s: float = 3.0):
         self.cfg = cfg.get("night", {})
         self.refresh_s = refresh_s
         self._next = 0.0
-        self.on: bool | None = None       # None = unknown (no signal at all)
+        self.on: bool | None = None   # None = unknown (nothing ever confirmed)
         self.temp_k: int | None = None
         self.gains: tuple[float, float, float] | None = None   # measured warm ramp
         self.source = "unknown"           # windows | windows-schedule | ramp | config | unknown
         self.detail = "not read yet"
+        self.stale = False                # True while holding the last appearance
+        self.appearance: NightAppearance | None = None
+        self.hold_grace_s = float(self.cfg.get("hold_grace_s", 900))
+        self._held_since = 0.0
         self._said: tuple = ()
         self._reads = 0
 
@@ -293,12 +337,35 @@ class NightLight:
         except OSError:
             return None       # absent value = the feature has never been touched
 
-    def _read_windows(self) -> tuple[bool | None, int | None, str]:
+    def _read_windows(self, now=None) -> tuple[bool | None, int | None, str, str, float]:
+        """(on, temp_k, source, detail, state_mtime) — state, override, schedule kept apart.
+
+        ONE tuple contract for both branches of this merge. `state_mtime` is the
+        wrapper timestamp of the blob the on/off answer came from — Windows' own
+        write time for it, kept so a published appearance can say how fresh it is
+        instead of re-guessing. The two blobs are read apart because they are
+        written apart; the caller turns their answer into one appearance, so a
+        half-failure never swaps in a new state beside an old warmth.
+
+        The state blob is the *effective* state: what Windows is applying to the
+        display right now, rewritten at every scheduled transition and at every
+        manual toggle. The settings blob is *configuration* — the schedule the
+        user set and the warmth they chose — and configuration is not state:
+        a manual "off for the rest of this window" is written into the state
+        blob and nowhere else, so the schedule must never be OR-ed onto a
+        decoded OFF. The schedule is consulted only when there is no state blob
+        at all, and only when its own endpoints are readable. The returned
+        source says which of these the answer came from. `now` is a
+        `time.struct_time` for deterministic tests; the live reader takes the
+        wall clock.
+        """
         state = settings = None
+        state_mtime = 0.0
         try:
             raw = self._blob(_STATE_KEY)
             if raw:
-                state = parse_state(unwrap(raw)[1])
+                state_mtime, inner = unwrap(raw)
+                state = parse_state(inner)
         except CBError:
             state = None
         try:
@@ -308,49 +375,70 @@ class NightLight:
         except CBError:
             settings = None
         temp = settings.get("temp_k") if settings else None
-        if state is not None:
-            # `enabled` is what Windows has applied *right now*: it flips on a
-            # manual toggle and on each scheduled transition. The window computed
-            # from `settings` is OR-ed in rather than trusted or ignored: it is
-            # what the user's own schedule says, so it can only ever agree with
-            # an intent they set, and it covers a build where the state blob
-            # tracks only the manual toggle.
+        if now is None:
             now = time.localtime()
-            mins = now.tm_hour * 60 + now.tm_min
-            sched = bool(settings and settings["schedule"] and _in_window(mins, settings))
-            on = bool(state["enabled"]) or sched
-            det = f"state enabled={state['enabled']} schedule-now={sched}"
+        mins = now.tm_hour * 60 + now.tm_min
+        if state is not None:
+            # The decoded state is authoritative, override included: turning
+            # Night light off by hand inside a scheduled window writes field 0
+            # absent, and that OFF holds until the next scheduled transition.
+            # The old code OR-ed the open window onto it, so the panel stayed
+            # amber straight through the user's own "off" — and the comment
+            # here claimed the schedule could only ever agree with intent,
+            # which is exactly what an override does not do.
+            on = bool(state["enabled"])
+            det = f"effective state: enabled={on}"
+            if not on and settings and settings["schedule"] \
+                    and _in_window(mins, settings) is True:
+                det += ("; schedule window is open but Windows says OFF - "
+                        "honouring the manual override")
             if state.get("last_change"):
                 det += ", changed " + time.strftime("%H:%M:%S", state["last_change"])
+            if state_mtime:
+                det += ", written " + time.strftime("%H:%M:%S",
+                                                    time.localtime(state_mtime))
             if settings:
-                det += (f"; schedule={settings['schedule']} "
+                det += (f"; config: schedule={settings['schedule']} "
                         f"{'set-hours' if settings['set_hours'] else 'sunset-sunrise'}"
                         f" {_hhmm(settings['start'])}-{_hhmm(settings['end'])} temp={temp}K")
-            return on, temp, "windows", det
+            return on, temp, "windows", det, state_mtime
         if settings and settings["schedule"]:
-            # No state blob but a schedule we can evaluate ourselves: honest,
-            # and it keeps night mode working on a build that stores state
-            # somewhere we cannot read.
-            now = time.localtime()
-            mins = now.tm_hour * 60 + now.tm_min
+            # No state blob but a schedule we can evaluate ourselves: honest
+            # inference on a build that stores state somewhere we cannot read —
+            # and it says `windows-schedule` so nobody mistakes it for state.
+            # Without readable endpoints there is nothing to infer from:
+            # inventing 21:00→07:00 (or a sunset for the user's longitude)
+            # would go amber on a guess, so we degrade to unknown instead.
             win = _in_window(mins, settings)
-            det = (f"no state blob; schedule {_hhmm(settings['start'])}-"
-                   f"{_hhmm(settings['end'])} now={now.tm_hour:02d}:{now.tm_min:02d} "
+            if win is None:
+                # Five values, always: `_read_windows` publishes the CloudStore
+                # write time alongside the state (#15), and a path that returns
+                # four is a caller that unpacks into five and dies. There is no
+                # state blob on this path, so the timestamp is "none known".
+                return (None, temp, "unknown",
+                        ("schedule is enabled but its endpoints are unreadable; "
+                         "not guessing a window"), 0.0)
+            start, end = ((settings["start"], settings["end"]) if settings["set_hours"]
+                          else (settings["sunset"], settings["sunrise"]))
+            det = (f"no state blob; inferred from schedule {_hhmm(start)}-"
+                   f"{_hhmm(end)} now={now.tm_hour:02d}:{now.tm_min:02d} "
                    f"{'in' if win else 'outside'} window")
-            return win, temp, "windows-schedule", det
-        return None, temp, "unknown", "no readable night-light state in CloudStore"
+            return win, temp, "windows-schedule", det, 0.0
+        return (None, temp, "unknown", "no readable night-light state in CloudStore", 0.0)
 
-    def _read(self) -> None:
+    def _read(self, now: float) -> None:
         mode = str(self.cfg.get("mode", "auto")).lower()
         if mode == "on":
-            self.on, self.source, self.detail = True, "config", "night.mode: on"
-            self.temp_k = int(self.cfg.get("color_temp_k") or 0) or self.temp_k
+            temp = int(self.cfg.get("color_temp_k") or 0) or self.temp_k
+            self._publish(NightAppearance(True, temp, None, "config",
+                                          "night.mode: on", 0.0, now), now)
             return
         if mode == "off":
-            self.on, self.source, self.detail = False, "config", "night.mode: off"
+            self._publish(NightAppearance(False, self.temp_k, None, "config",
+                                          "night.mode: off", 0.0, now), now)
             return
-        on, temp, src, det = self._read_windows()
-        self.temp_k = int(self.cfg.get("color_temp_k") or 0) or temp
+        on, temp, src, det, state_mtime = self._read_windows()
+        temp = int(self.cfg.get("color_temp_k") or 0) or temp
         if on is None:
             sched = str(self.cfg.get("schedule") or "").strip()
             if sched:
@@ -364,43 +452,122 @@ class NightLight:
         # to follow the user's night mode however they run it. Only ever *adds* an
         # on — a neutral ramp never overrides a registry that says warm, because that
         # is the normal Windows case and the registry is the better source there.
-        self.gains = None
+        gains = None
         if mode == "auto" and bool(self.cfg.get("check_gamma_ramp", True)):
             ramp = gamma_gains()
-            if ramp is not None:
-                r, _g, b = ramp
+            if ramp.gains is not None:
+                r, _g, b = ramp.gains
                 warm = (r - b) >= float(self.cfg.get("ramp_warm_margin", 0.12))
-                self.gains = ramp if warm else None
-                det += f"; ramp r/b={r:.2f}/{b:.2f}{' warm' if warm else ''}"
+                gains = ramp.gains if warm else None
+                det += f"; ramp {ramp.device} r/b={r:.2f}/{b:.2f}{' warm' if warm else ''}"
                 if warm and not on:
                     on, src = True, "ramp"
-        self.on, self.source = on, src
-        self.detail = det
+            else:
+                # "the display is neutral" and "the display could not be asked"
+                # are different claims; only the first one is evidence. `ramp`
+                # is the ONE gamma-ramp return contract here (`RampReading`, see
+                # `gamma_gains`): nothing in this module may unpack a bare tuple.
+                det += f"; ramp unreadable ({ramp.reason})"
+        if on is None:
+            # Nothing this poll can say for certain: keep the last confirmed
+            # appearance instead of dropping the panel to "unknown", which the
+            # planner would read as night off - a white flash through a warm
+            # evening, from a store that was merely mid-rewrite.
+            self._hold(now, det)
+            return
+        if temp is None and self.appearance is not None and self.appearance.temp_k:
+            # A settings-only failure: the state is fresh, the warmth is not.
+            # Carry the warmth from the last appearance that had one, and say
+            # where it came from - the alternative is the panel dimming with
+            # no warm LUT at all, which is neither look the user asked for.
+            temp = self.appearance.temp_k
+            det += "; warmth held from the last settings read"
+        self._publish(NightAppearance(bool(on), temp, gains, src, det,
+                                      state_mtime, now), now)
 
-    def lut(self, strength: float = 1.0) -> list[int] | None:
-        """The panel's warmth: from the measured ramp if that is the evidence, else
-        from the colour temperature the user set."""
+    def _publish(self, app: NightAppearance, now: float) -> None:
+        """Put a whole confirmed appearance on the object in one swap."""
+        self.appearance = app
+        self.on, self.temp_k, self.gains = app.on, app.temp_k, app.gains
+        self.source, self.detail = app.source, app.detail
+        self.stale = False
+        self._held_since = 0.0
+
+    def _hold(self, now: float, why: str) -> None:
+        """A blind poll: keep showing the last confirmed appearance.
+
+        Unknown and stale are answers in their own right, never a quiet off:
+        the panel must not brighten just because a read failed, so the whole
+        appearance is re-published unchanged and only `stale`/`detail` move.
+        Within `hold_grace_s` this is a transient failure; past it the policy
+        is explicit and non-disruptive - keep holding, because inventing a
+        day state from an unreadable store is the one guess that can hurt.
+        """
+        if self.appearance is None:
+            # Startup with nothing ever confirmed: there is no look to keep,
+            # and the honest answer is unknown (the planner keeps the panel
+            # in its day look until the first real answer arrives).
+            self.on, self.source = None, "unknown"
+            self.detail = f"{why}; nothing confirmed to hold yet"
+            self.stale = False
+            return
+        if not self.stale:
+            self._held_since = now
+        app = self.appearance
+        self.on, self.temp_k, self.gains = app.on, app.temp_k, app.gains
+        self.source = app.source
+        self.stale = True
+        if now - self._held_since > self.hold_grace_s:
+            self.detail = (f"holding last confirmed appearance past "
+                           f"hold_grace_s={self.hold_grace_s:.0f}s; keeping it - "
+                           f"a read failure is not the user turning night off ({why})")
+        else:
+            self.detail = f"holding last confirmed appearance ({why})"
+
+    def lut(self, strength: float = 1.0, temp_k: int | None = None) -> list[int] | None:
+        """The panel's warmth for the ONE effective temperature — issue #53.
+
+        `temp_k` is the *effective* temperature, resolved by `LightPlanner` and
+        passed in here. This method must never make a temperature decision of
+        its own: `self.temp_k` is `None` in exactly the case that matters (night
+        known-ON, no readable warmth), and a second decision here is how the
+        panel came to *report* 2700 K from the planner while `warm_lut(None)`
+        returned no LUT at all — plan right, pixels cold.
+
+        So: the caller's `temp_k` is authoritative, and a `None` argument means
+        the caller resolved no temperature (never "ask Windows again"), which is
+        the only case that yields no LUT. `self.gains` still wins when the
+        evidence is the *measured* gamma ramp (f.lux-shaped): that is a
+        measurement, not a colour temperature, and there is no Kelvin to compare
+        it against.
+        """
         if self.gains is not None:
             return gains_lut(self.gains, strength)
-        return warm_lut(self.temp_k, strength)
+        return warm_lut(temp_k, strength)
 
-    def refresh(self) -> bool:
-        """Re-read at most every `refresh_s`; True when the answer changed."""
-        now = time.monotonic()
+    def refresh(self, now: float | None = None) -> bool:
+        """Re-read at most every `refresh_s`; True when the answer changed.
+
+        `now` is a pinned monotonic clock for the deterministic tests; the
+        live loop lets the module take it. A raising read is the same story
+        as an undecodable one: hold the last confirmed appearance, because
+        the failure mode of replacing it is a white flash at 3 a.m.
+        """
+        now = time.monotonic() if now is None else now
         if now < self._next:
             return False
         self._next = now + self.refresh_s
         was = (self.on, self.temp_k, self.source)
         try:
-            self._read()
+            self._read(now)
         except Exception as e:  # noqa: BLE001 - a settings store we cannot read is not fatal
-            self.on, self.source = None, "unknown"
-            self.detail = f"read failed: {type(e).__name__}: {e}"
+            self._hold(now, f"read failed: {type(e).__name__}: {e}")
         self._reads += 1
         return (self.on, self.temp_k, self.source) != was
 
     def describe(self) -> str:
-        return (f"night={'on' if self.on else ('off' if self.on is False else 'unknown')} "
+        return (f"night={'on' if self.on else ('off' if self.on is False else 'unknown')}"
+                f"{'(stale)' if self.stale else ''} "
                 f"src={self.source} temp={self.temp_k}K ({self.detail})")
 
     def changed_to_log(self) -> str | None:
@@ -412,23 +579,27 @@ class NightLight:
         return "[night] " + self.describe()
 
 
-def _mins(hm: tuple | None, default: int) -> int:
-    return default if hm is None else hm[0] * 60 + hm[1]
-
-
 def _hhmm(hm: tuple | None) -> str:
     """`(21, 30)` → `"21:30"`, `None` → `--:--`: log lines are read at arm's length,
     and a Python tuple full of commas does not scan as a time."""
     return "--:--" if hm is None else f"{hm[0]:02d}:{hm[1]:02d}"
 
 
-def _in_window(mins: int, s: dict) -> bool:
-    """True inside the schedule, including a window that wraps past midnight."""
-    start = _mins(s.get("start"), 21 * 60) if s.get("set_hours", True) \
-        else _mins(s.get("sunset"), 20 * 60)
-    end = _mins(s.get("end"), 7 * 60) if s.get("set_hours", True) \
-        else _mins(s.get("sunrise"), 7 * 60)
-    return (mins >= start or mins < end) if start > end else (start <= mins < end)
+def _in_window(mins: int, s: dict) -> bool | None:
+    """True inside the schedule, False outside, None when it cannot be told.
+
+    A window that wraps past midnight is normal (21:00→07:00). None means the
+    endpoints the schedule needs are not readable — and there is no honest
+    default for them: 21:00→07:00 is a guess about when the user wants warmth,
+    and a fixed 20:00 sunset is a guess about where they live. Callers must
+    treat None as "do not infer", never as a convenient False or True.
+    """
+    start, end = (s.get("start"), s.get("end")) if s.get("set_hours", True) \
+        else (s.get("sunset"), s.get("sunrise"))
+    if start is None or end is None:
+        return None
+    a, b = start[0] * 60 + start[1], end[0] * 60 + end[1]
+    return (mins >= a or mins < b) if a > b else (a <= mins < b)
 
 
 def _in_clock_range(spec: str, now) -> bool:
@@ -444,8 +615,91 @@ def _in_clock_range(spec: str, now) -> bool:
 
 
 # ------------------------------------------------------------------ the look
-def gamma_gains() -> tuple[float, float, float] | None:
-    """Mid-tone per-channel gains the OS is currently applying to the display.
+class RampReading(NamedTuple):
+    """What the display's gamma ramp said — or why it could not say anything.
+
+    `gains is None` used to be the whole answer, which made "this display is
+    neutral" and "I could not ask the display" indistinguishable to the caller
+    and to the log line. They are not the same claim, so they are not allowed to
+    travel as one value.
+    """
+    gains: tuple[float, float, float] | None
+    device: str | None          # which display was measured, e.g. "\\.\DISPLAY1"
+    reason: str | None          # why there is no measurement; None when there is one
+
+
+class _DisplayDeviceW(ctypes.Structure):
+    """DISPLAY_DEVICEW, exactly as the SDK lays it out."""
+    _fields_ = [("cb", ctypes.c_uint32),
+                ("DeviceName", ctypes.c_wchar * 32),
+                ("DeviceString", ctypes.c_wchar * 128),
+                ("StateFlags", ctypes.c_uint32),
+                ("DeviceID", ctypes.c_wchar * 128),
+                ("DevKey", ctypes.c_wchar * 128)]
+
+
+_DISPLAY_DEVICE_ACTIVE = 0x1
+_DISPLAY_DEVICE_PRIMARY = 0x4
+
+
+def _display_api(windll):
+    """Declare the display calls this module makes, with their SDK signatures.
+
+    The one that mattered: `EnumDisplayDevicesW`/`EnumDisplaySettingsW` are
+    exported by **User32**, while `CreateDCW`/`GetDeviceGammaRamp`/`DeleteDC` are
+    exported by **Gdi32**. This module used to ask Gdi32 for
+    `EnumDisplaySettingsW`; ctypes answers a missing export with an
+    AttributeError, the broad handler turned that into `None`, and the gamma-ramp
+    second opinion had therefore never measured anything (issue #16).
+
+    `CreateDCW`'s HDC is declared pointer-sized. Left undeclared, ctypes hands
+    back a C `int` and an HDC with the upper 32 bits set is truncated into a
+    handle that belongs to some other object.
+    """
+    u, g = windll.user32, windll.gdi32
+    u.EnumDisplayDevicesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint,
+                                      ctypes.c_void_p, ctypes.c_uint32]
+    u.EnumDisplayDevicesW.restype = ctypes.c_long            # BOOL
+    g.CreateDCW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p,
+                            ctypes.c_wchar_p, ctypes.c_void_p]
+    g.CreateDCW.restype = ctypes.c_void_p                    # HDC
+    g.GetDeviceGammaRamp.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    g.GetDeviceGammaRamp.restype = ctypes.c_long             # BOOL
+    g.DeleteDC.argtypes = [ctypes.c_void_p]
+    g.DeleteDC.restype = ctypes.c_int
+    return u, g
+
+
+def _display_names(u, wanted: str | None):
+    """The active display device names, and which one the OS calls primary.
+
+    Returns (name, primary_name, error). `wanted` is honoured only if it is an
+    active device, so a stale configured name says so instead of quietly
+    measuring a different monitor.
+    """
+    primary = None
+    names: list[str] = []
+    for i in range(16):                      # no display has this many adapters
+        dd = _DisplayDeviceW()
+        dd.cb = ctypes.sizeof(dd)
+        if not u.EnumDisplayDevicesW(None, i, ctypes.byref(dd), 0):
+            break
+        if not (dd.StateFlags & _DISPLAY_DEVICE_ACTIVE):
+            continue
+        names.append(dd.DeviceName)
+        if dd.StateFlags & _DISPLAY_DEVICE_PRIMARY:
+            primary = dd.DeviceName
+    if not names:
+        return None, None, "no active display device"
+    if wanted:
+        if wanted not in names:
+            return None, primary, f"{wanted} is not an active display ({', '.join(names)})"
+        return wanted, primary, None
+    return (primary or names[0]), primary, None
+
+
+def gamma_gains(device: str | None = None, _windll=None) -> RampReading:
+    """Mid-tone per-channel gains the OS is currently applying to one display.
 
     Measured on this desk: Windows Night light does *not* go through the gamma ramp
     (it stayed identity at 2525 K, applied further down the display pipeline), so
@@ -454,51 +708,39 @@ def gamma_gains() -> tuple[float, float, float] | None:
     "night mode", not "the CloudStore key". A neutral ramp is honest evidence too —
     `NightLight` logs which evidence it acted on, so a wrong guess is visible.
 
-    Returns None when there is no display to ask (service session, disconnected
-    RDP, no window station) — never a fake neutral.
+    Which display: the gamma ramp is per-device, so this reads the device Windows
+    marks primary (the one Night light warms) unless `device` names an active one.
+    The name measured travels back in the reading, because "the panel is warm" and
+    "the other monitor is warm" are different answers.
+
+    Never returns a fake neutral: with no display to ask (service session,
+    disconnected RDP, no window station, a driver that refuses the ramp) the
+    reading carries the reason instead.
     """
     if os.name != "nt":
-        return None
+        return RampReading(None, None, "not Windows")
     try:
-        import ctypes
+        u, g = _display_api(_windll if _windll is not None else ctypes.windll)
+    except AttributeError as e:      # a windll that does not export these
+        return RampReading(None, None, f"display API unavailable: {e}")
 
-        u = ctypes.windll.user32
-        g = ctypes.windll.gdi32
+    name, _primary, err = _display_names(u, device)
+    if err:
+        return RampReading(None, None, err)
 
-        class DeviceMode(ctypes.Structure):
-            _fields_ = [("dmDeviceName", ctypes.c_wchar * 32), ("dmSpecVersion", ctypes.c_uint16),
-                        ("dmDriverVersion", ctypes.c_uint16), ("dmSize", ctypes.c_uint16),
-                        ("dmDriverExtra", ctypes.c_uint16), ("dmFields", ctypes.c_uint32),
-                        ("dmOrientation", ctypes.c_int16), ("dmPrintQuality", ctypes.c_int16),
-                        ("dmColor", ctypes.c_int16), ("dmDuplex", ctypes.c_int16),
-                        ("dmFormSize", ctypes.c_int16), ("dmNumpels", ctypes.c_int16),
-                        ("dmDisplayFrequency", ctypes.c_uint32),
-                        ("dmDisplayFixedOutput", ctypes.c_uint32),
-                        ("dmDefaultSource", ctypes.c_uint32),
-                        ("dmPositions", ctypes.c_ubyte * 32), ("dmDriver", ctypes.c_ubyte * 12),
-                        ("dmSizeComplete", ctypes.c_uint32),
-                        ("dmColorDepth", ctypes.c_uint16), ("dmDisplayOrientation", ctypes.c_uint16)]
-
-        dm = DeviceMode()
-        dm.dmSize = ctypes.sizeof(dm)
-        dm.dmDriverExtra = 0
-        if not g.EnumDisplaySettingsW(None, -1, ctypes.byref(dm)):   # ENUM_CURRENT_SETTINGS
-            return None
-        name = ("\\\\.\\" + dm.dmDeviceName) if dm.dmDeviceName else None
-        hdc = g.CreateDCW("DISPLAY", name, None, None)
-        if not hdc or hdc == -1:
-            return None
-        try:
-            ramp = (ctypes.c_ushort * 768)()
-            if not g.GetDeviceGammaRamp(ctypes.c_void_p(hdc), ctypes.byref(ramp)):
-                return None
-            mid = [ramp[c * 256 + 128] / 65535.0 for c in range(3)]      # 50% tone
-        finally:
-            g.DeleteDC(ctypes.c_void_p(hdc))
-        peak = max(mid) or 1.0
-        return tuple(max(0.0, min(1.0, v / peak)) for v in mid)     # type: ignore[return-value]
-    except Exception:  # noqa: BLE001 - a display we cannot measure is not an error
-        return None
+    hdc = g.CreateDCW("DISPLAY", name, None, None)
+    if not hdc or hdc in (-1, ctypes.c_size_t(-1).value):
+        return RampReading(None, name, f"CreateDCW failed (error {ctypes.GetLastError()})")
+    try:
+        ramp = (ctypes.c_ushort * 768)()
+        if not g.GetDeviceGammaRamp(ctypes.c_void_p(hdc), ctypes.byref(ramp)):
+            return RampReading(None, name,
+                               f"GetDeviceGammaRamp failed (error {ctypes.GetLastError()})")
+        mid = [ramp[c * 256 + 128] / 65535.0 for c in range(3)]      # 50% tone
+    finally:
+        g.DeleteDC(ctypes.c_void_p(hdc))        # always: one DC, one release
+    peak = max(mid) or 1.0
+    return RampReading(tuple(max(0.0, min(1.0, v / peak)) for v in mid), name, None)
 
 
 def gains_lut(gains: tuple[float, float, float], strength: float = 1.0) -> list[int] | None:

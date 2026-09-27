@@ -79,7 +79,11 @@ class LightPlanner:
         self.scale = float(self.n.get("brightness_scale", 0.55))
         self.floor = int(self.n.get("brightness_floor", 8))
         self.strength = float(self.n.get("strength", 1.0))
-        self.temp_default = int(self.n.get("color_temp_k", 2700))
+        # `color_temp_k: 0` is the shipped default and means "whatever Windows
+        # says"; when Windows' warmth cannot be read either, the plan still
+        # needs a number - the fallback is a documented safe warmth, because
+        # ON with no temperature must not dim the panel with no LUT at all.
+        self.temp_default = int(self.n.get("color_temp_k") or 2700)
         self.follow_display = bool(self.cfg.get("power", {}).get("follow_display", True))
         self.follow_sleep = bool(self.cfg.get("power", {}).get("follow_sleep", True))
         self.follow_lock = bool(self.cfg.get("power", {}).get("follow_lock", True))
@@ -153,16 +157,25 @@ class LightPlanner:
                     plan.reason += "+night"
             plan.brightness = max(0, min(100, level))
             if night_on:
+                # THE temperature decision, made once, right here (issue #53):
+                # Windows' reading wins; `color_temp_k` in config overrides it;
+                # and when night is known-ON but no warmth could be read, the
+                # documented safe fallback is used — `self.temp_default` is
+                # itself resolved as `color_temp_k or 2700`, because the shipped
+                # default is 0 ("whatever Windows says"), and 0 K is not a look.
                 plan.temp_k = int(getattr(self.night, "temp_k", 0) or self.temp_default)
-                # The night object owns the warmth decision: a colour temperature
-                # when the evidence is Windows' setting, the measured gamma ramp when
-                # the evidence is the ramp itself (f.lux-shaped). Keyed so the LUT is
-                # rebuilt only when the look actually changes.
+                # The night object owns *which evidence wins* — a colour
+                # temperature when the evidence is Windows' setting, the measured
+                # gamma ramp when the evidence is the ramp itself (f.lux-shaped) —
+                # but it does not choose the temperature: that resolved value is
+                # passed into `lut()` as the single source of truth, so the
+                # reported temperature and the rendered LUT cannot disagree.
+                # Keyed so the LUT is rebuilt only when the look actually changes.
                 gains = getattr(self.night, "gains", None)
                 key = (plan.temp_k, self.strength, None if gains is None else
                        tuple(round(x, 3) for x in gains))
                 if key != self._lut_key:
-                    self._lut = self.night.lut(self.strength)
+                    self._lut = self.night.lut(self.strength, plan.temp_k)
                     self._lut_key = key
                     plan.repaint = True     # the colours changed: full frame
                 plan.lut = self._lut

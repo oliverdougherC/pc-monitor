@@ -52,16 +52,25 @@ class Host:
 
 
 class Night:
-    """A `NightLight`-shaped stub: the same attributes, with the file reads taken out."""
+    """A `NightLight`-shaped stub: the same attributes, with the file reads taken out.
+
+    `lut(strength, temp_k)` is the real contract (#53): the planner's *effective*
+    temperature is handed to the renderer, so the pixels and the reported state
+    cannot disagree. The stub records what it was asked for, which is what lets a
+    case assert that a fallback temperature actually reached the LUT instead of
+    being chosen in the planner and thrown away on the way to the panel.
+    """
 
     def __init__(self, on=False, temp_k=2500, gains=None):
         self.on = on
         self.temp_k = temp_k
         self.gains = gains
         self.built = 0            # how many times a LUT was actually computed
+        self.built_at: list = []  # the temp_k of each build (None = "backend's own")
 
-    def lut(self, strength):
+    def lut(self, strength, temp_k=None):
         self.built += 1
+        self.built_at.append(temp_k)
         return [min(255, int(i * 0.6)) for i in range(256)]      # warm stand-in
 
 
@@ -256,6 +265,26 @@ def case_night() -> None:
     check("dark needs no LUT", (f.lut, f.dark), (None, True))
 
 
+def case_night_unknown() -> None:
+    print("case: unknown night is not night off, and unknown warmth still falls back")
+    # Startup with no prior state: the daytime look - the panel must not act
+    # on a state it has never read. (Transient loss of an *established* state
+    # is NightLight's held appearance, pinned in tools/nightlight_probe.py;
+    # the planner never even sees that as a change.)
+    u = planner(Night(on=None), Host()).tick("idle", 5.0, 1.0)
+    check("unknown at startup looks day", (u.reason, u.brightness, u.lut),
+          ("lit", 45, None))
+    # `color_temp_k: 0` is the shipped default, meaning "whatever Windows
+    # says". When Windows' warmth cannot be read either, the planner needs a
+    # number anyway - and the failure shape from the issue is dimming the
+    # panel with no LUT at all, so the fallback is a documented warmth.
+    n = Night(on=True, temp_k=None)
+    p = planner(n, Host(), config=cfg(night={"color_temp_k": 0}))
+    a = p.tick("idle", 5.0, 1.0)
+    check("falls back to a safe temperature", a.temp_k, 2700)
+    check("still capped for night", a.reason, "lit+night")
+
+
 def case_pixels_warm() -> None:
     print("case: the warmth actually reaches the pixels")
     from PIL import ImageStat
@@ -302,7 +331,8 @@ def case_pixels_warm() -> None:
 
 def main() -> int:
     for fn in (case_lit, case_dim_and_off, case_sleep, case_locked, case_playing,
-               case_monitor, case_precedence, case_night, case_pixels_warm):
+               case_monitor, case_precedence, case_night, case_night_unknown,
+               case_pixels_warm):
         fn()
         print()
     print("SELFTEST PASSED" if not fails else f"SELFTEST FAILED: {fails}")

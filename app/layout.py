@@ -18,7 +18,10 @@ Design rules:
   bottom edge. Gaps (None) are drawn as gaps, never interpolated.
 - type sizes are chosen for the WORST-CASE string per slot, so a value can
   never collide with its neighbour, and never changes size while it updates.
-- total system power always in the bottom strip, green→red over 50W→1000W.
+- total system power always in the bottom strip, green->red over 50W->1000W,
+  with one provenance word beside it ("measured input", "modelled input",
+  "partial", "stale", "unavailable"): a bare watt figure is only ever drawn
+  when the estimate is whole; otherwise the strip says so.
 - geometry lives in the *_BOX tables; content is inset by INNER and every line
   is placed by baseline, so rows stay aligned when fonts change.
 """
@@ -29,7 +32,7 @@ import time
 from PIL import Image, ImageDraw, ImageFont
 
 from app.history import History
-from app.power import power_color, power_watts_for_display
+from app.power import estimate, power_color
 from app.snapshot import Snapshot
 
 BG = (9, 11, 15)
@@ -46,6 +49,12 @@ TAN = (224, 208, 178)      # fps/frametime panel, distinct from disk white
 # game has stopped presenting. Still readable at the dim brightness level, which is
 # where a held value usually lives.
 TAN_HELD = (140, 130, 112)
+# Values that were invented for a preview rather than measured. Deliberately not a
+# muted version of TAN: the point is that the pane cannot be mistaken for a
+# measurement in a screenshot, a crop, or a saved PNG, by someone who never saw the
+# status line that produced it.
+SIM = (255, 138, 76)
+SIM_INK = (14, 11, 8)        # text on the filled SIMULATED badge
 PINK = (255, 106, 182)
 
 W, H = 800, 480
@@ -133,8 +142,23 @@ class Layout:
             self._txt(d, (x, y), label, (self.fsmall, lab_size), lab_col, "ls")
             self._txt(d, (x + lw + gap, y), value, (vfont, val_size), val_col, "ls")
 
-    def _panel(self, d, box):
-        d.rectangle(box, fill=PANEL, outline=BORDER, width=1)
+    def _panel(self, d, box, outline=BORDER):
+        d.rectangle(box, fill=PANEL, outline=outline, width=1)
+
+    def _badge(self, d, right: int, baseline: int, text: str, size: int,
+               fill, ink) -> None:
+        """Filled tag sitting on a text baseline, right-aligned at `right`.
+
+        Filled rather than outlined because it has to survive the whole journey a
+        preview frame takes: downscaled in a browser, cropped, and PNG-saved. A
+        hairline outline is the first thing to vanish on that trip; a solid block of
+        warning colour with dark text on it is the last.
+        """
+        fnt = self._font(self.flabel, size)
+        ink_box = d.textbbox((right, baseline), text, font=fnt, anchor="rs")
+        d.rectangle((ink_box[0] - 6, ink_box[1] - 4, ink_box[2] + 6, ink_box[3] + 4),
+                    fill=fill)
+        self._txt(d, (right, baseline), text, (self.flabel, size), ink, "rs")
 
     # ---------- the shared trend element ----------------------------------------
     @property
@@ -220,12 +244,31 @@ class Layout:
     # ---------- formatters ------------------------------------------------------
     @staticmethod
     def rate(bps: float | None) -> str:
+        """A **byte** rate — disk I/O. Network has its own formatter: the snapshot
+        carries `net_*_bps` in bits per second, and putting those numbers through
+        this one printed `1.0 GB/s` for what was really 125 MB/s (issue #27)."""
         if bps is None:
             return "--"
         for unit, div in (("GB/s", 1e9), ("MB/s", 1e6), ("KB/s", 1e3)):
             if bps >= div:
                 return f"{bps / div:.1f} {unit}"
         return f"{bps:.0f} B/s"
+
+    @staticmethod
+    def bitrate(bps: float | None) -> str:
+        """A **bit** rate — the unit `Snapshot.net_down_bps`/`net_up_bps` carry and
+        the unit networking is quoted in, so the label and the number agree.
+
+        Decimal steps (1e3/1e6/1e9), as link speeds are. `Mbps` is the same width
+        as `MB/s`, which matters: these sit side by side in a 210 px column and
+        `tools/layout_check.py` refuses a layout that overflows it.
+        """
+        if bps is None:
+            return "--"
+        for unit, div in (("Gbps", 1e9), ("Mbps", 1e6), ("Kbps", 1e3)):
+            if bps >= div:
+                return f"{bps / div:.1f} {unit}"
+        return f"{bps:.0f} bps"
 
     @staticmethod
     def ghz(mhz: float | None) -> str:
@@ -251,10 +294,10 @@ class Layout:
             return ("--", DIMMER, max(13, int(size * 0.62)), self.fsmall)
         return (self.num(v, fmt), color, size)
 
-    def _rate_value(self, v: float | None, color, size: int):
+    def _rate_value(self, v: float | None, color, size: int, fmt=None):
         if v is None:
             return ("--", DIMMER, max(13, int(size * 0.62)), self.fsmall)
-        return (self.rate(v), color, size)
+        return ((fmt or self.rate)(v), color, size)
 
     # ---------- telemetry → history (call once per tick, before render) ---------
     def observe(self, snap: Snapshot, state: str = "idle") -> None:
@@ -339,26 +382,27 @@ class Layout:
 
     # ---------- bottom row: paired-rate panel (DISK / NETWORK) -------------------
     def _rate_panel(self, d, box, title, color, lab_a, val_a, ser_a,
-                    lab_b, val_b, ser_b) -> None:
+                    lab_b, val_b, ser_b, fmt=None) -> None:
         x0, y0, x1, y1 = box
         cx0, cx1 = x0 + INNER, x1 - INNER
         self._panel(d, box)
         self._txt(d, (cx0, y0 + 24), title, (self.flabel, 15), color, "ls")
         if not self.trends:
             # serial budget mode: no history bands at all — stacked rows spaced to
-            # fill the panel. Two side-by-side 10-char rate columns ("999.9 MB/s")
-            # would overlap in a 210 px column, so the rows stay stacked either way.
+            # fill the panel. Two side-by-side 10-char rate columns ("999.9 MB/s",
+            # and "999.9 Mbps" is the same width) would overlap in a 210 px column,
+            # so the rows stay stacked either way.
             mid = (y0 + 34 + y1 - 12) // 2
             for off, lab, val in ((mid - 34, lab_a, val_a), (mid + 46, lab_b, val_b)):
                 self._row(d, cx0, cx1, off, left=(lab, DIMMER, 14),
-                          right=self._rate_value(val, color, 26))
+                          right=self._rate_value(val, color, 26, fmt))
             d.line((cx0, mid + 4, cx1, mid + 4), fill=BORDER, width=1)
             return
         # stacked rows: caption + value on one baseline, graph under each
         for row, (lab, val, ser) in enumerate(((lab_a, val_a, ser_a), (lab_b, val_b, ser_b))):
             base = y0 + 58 + row * 80
             self._row(d, cx0, cx1, base, left=(lab, DIMMER, 14),
-                      right=self._rate_value(val, color, 26))
+                      right=self._rate_value(val, color, 26, fmt))
             self._graph(d, cx0, base + 8, cx1, base + 44, ser, color, span_min=1.0,
                         plain=not self.trends)
         d.line((cx0, y0 + 100, cx1, y0 + 100), fill=BORDER, width=1)
@@ -374,9 +418,15 @@ class Layout:
         # loading screen). Say so on the panel instead of letting a frozen number
         # pass for a live one — same value, honest colour, honest label.
         held = bool(getattr(f, "stale", False))
-        col = TAN_HELD if held else TAN
-        self._panel(d, box)
+        # Invented, not measured: a preview running with --synth-fps on. The whole
+        # pane goes to the warning hue and carries the word, because the alternative
+        # is a screenshot of plausible fps that no viewer can date or discount.
+        sim = bool(getattr(f, "simulated", False))
+        col = SIM if sim else (TAN_HELD if held else TAN)
+        self._panel(d, box, outline=SIM if sim else BORDER)
         self._txt(d, (cx0, y0 + 22), "FRAMES", (self.flabel, 15), col, "ls")
+        if sim:
+            self._badge(d, cx1, y0 + 22, "SIMULATED", 14, SIM, SIM_INK)
         self._big(d, cx0, y0 + 76, self.num(f.fps, "{:.0f}"), 56, col, "ls",
                   f.fps is not None)
         unit = "FPS" if not held else f"FPS  HELD {f.age_s:.0f}s"
@@ -388,7 +438,8 @@ class Layout:
                   right=self._value(ms, "{:.1f} ms", col, 20))
         target = float(self.cfg["game"].get("frametime_target_ms", 16.7))
         self._graph(d, cx0, y0 + 112, cx1, y0 + 142, self._series("frames.ms"),
-                    TAN, span_min=2.0, target=target, plain=not self.trends)
+                    SIM if sim else TAN, span_min=2.0, target=target,
+                    plain=not self.trends)
 
         self._pair(d, cx0, y0 + 168, "1% LOW", self.num(f.low1_pct), DIMMER, col, 13, 22,
                    present=f.low1_pct is not None)
@@ -410,7 +461,8 @@ class Layout:
             elif key == "net":
                 self._rate_panel(d, b, "NETWORK", PINK,
                                  "DOWN", snap.net_down_bps, self._series("net.down"),
-                                 "UP", snap.net_up_bps, self._series("net.up"))
+                                 "UP", snap.net_up_bps, self._series("net.up"),
+                                 fmt=self.bitrate)
 
     # ---------- power strip ------------------------------------------------------
     def _power_strip(self, img, d, snap: Snapshot, sx: int, sy: int) -> None:
@@ -419,7 +471,11 @@ class Layout:
         self._panel(d, box)
         self._txt(d, (cx0, y0 + 24), "TOTAL POWER", (self.flabel, 14), DIM, "ls")
 
-        w = power_watts_for_display(snap, self.cfg)
+        # Recomputed from the snapshot's fields, never read back out of
+        # `snap.power_total_w`: what the panel may show is a question about the
+        # sensors, and the stored figure is one answer the loop already gave.
+        est = estimate(snap, self.cfg)
+        w = est.total_w
         gx0, gx1 = x0 + 160, x0 + 544
         if w is None:
             self._txt(d, (gx0, y0 + 24), "-- W", (self.fsmall, 14), DIMMER, "ls")
@@ -437,6 +493,12 @@ class Layout:
             self._txt(d, (gx1, y0 + 31), f"{hi:.0f}", (self.fsmall, 11), DIMMER, "rs")
             self._txt(d, (x0 + 676, y0 + 30), f"{w:.0f}", (self.fval, 34), col, "rs")
             self._txt(d, (x0 + 684, y0 + 30), "W", (self.fsmall, 18), col, "ls")
+        # The provenance word rides the caption row whether or not a number was
+        # drawn: "34 W" with nothing beside it is exactly the sentence that
+        # fooled the user when every sensor was dead, and "-- W" alone does not
+        # say whether that is "no panel data" or "some data, not enough".
+        self._txt(d, ((gx0 + gx1) // 2, y0 + 31), est.status,
+                  (self.fsmall, 11), DIMMER, "ms")
         self._txt(d, (cx1, y0 + 26), time.strftime("%H:%M"), (self.fsmall, 17), DIM, "rs")
 
     # ---------- state layouts ----------------------------------------------------
