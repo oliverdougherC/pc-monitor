@@ -5,6 +5,13 @@ second of every day. Two counters, both config-driven: every `shift_every_min` t
 layout is offset by 3 px around a 4-step cycle; for `exercise_s` every
 `exercise_every_h` a full-screen colour gradient sweeps the panel.
 
+This owns the *timing arithmetic* only. It has no idea what is on the screen, and it
+must not start deciding: the sweep is advanced one frame per control-loop iteration
+by `main.sweep_step`, which is where the current light plan, the game detector and
+the state of the link get a say in whether the next frame is worth pushing. An
+exercise that runs to completion inside one tick is twelve seconds during which the
+app cannot notice that the room went dark.
+
 Brightness, screen-off and night-mode warmth deliberately do not live here any
 more. The old `tick_brightness()` owned part of that decision and `main.py` owned
 the rest, which is how "the PC is going to sleep" and "Windows turned the displays
@@ -26,6 +33,14 @@ SHIFTS = [(0, 0), (3, 0), (3, 3), (0, 3)]  # px, cycles slowly
 class BurnIn:
     def __init__(self, cfg: dict):
         self.cfg = cfg["burnin"]
+        # The sweep is the one part of burn-in mitigation somebody can *notice*: a
+        # full-screen rainbow across the whole desk. The 3-px shift is free and
+        # invisible, so it stays on; the visible sweep is opt-in (`config.DEFAULTS`
+        # ships it false). The fallback here is true because this class has always
+        # had a sweep — it is the shipped default in `DEFAULTS` that makes the
+        # feature quiet, and a caller that passes a hand-made dict gets the
+        # historical behaviour.
+        self.enabled = bool(self.cfg.get("exercise_enabled", True))
         self._last_exercise_end = time.monotonic()
         self._exercise_start: float | None = None
         self.postponed = 0
@@ -38,9 +53,14 @@ class BurnIn:
 
     # ---- periodic exercise animation -----------------------------------------
     def exercise_due(self, now: float) -> bool:
+        """Arm the exercise when its interval has come round.
+
+        Never arms when the sweep is switched off: `exercise_progress` then has
+        nothing to report, so a disabled sweep costs the loop nothing at all.
+        """
         every = float(self.cfg["exercise_every_h"]) * 3600
         if self._exercise_start is None:
-            if now - self._last_exercise_end >= every:
+            if self.enabled and now - self._last_exercise_end >= every:
                 self._exercise_start = now
             return False
         return True

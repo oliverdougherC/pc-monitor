@@ -39,6 +39,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
 .venv\Scripts\python tools\panel_link_selftest.py     # link survives raise/hang, rebuilds, walks its device ladder
 .venv\Scripts\python tools\fault_selftest.py          # nothing outside the per-tick guard (AST-checked)
+.venv\Scripts\python tools\sweep_selftest.py          # burn-in sweep: one frame per tick, and outranked
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
 ```
 
@@ -66,7 +67,7 @@ state, how many bands a partial panel update would need (same math as
 | `app/layout.py` | 800×480 rendering: permanent top half + mode strip, trend bands, worst-case-fit type, night-mode LUT applied to the finished frame |
 | `app/history.py` | bounded ring buffers feeding the trend bands |
 | `app/output.py` | numpy diff → only changed bands are sent to the panel |
-| `app/burnin.py` | 3-px layout shift and the periodic color sweep (brightness/screen-off moved out to `app/lights.py`) |
+| `app/burnin.py` | 3-px layout shift and the periodic color sweep — opt-in, and stepped one frame per tick by `main.sweep_step` so the current light/game/link state can veto it (brightness/screen-off moved out to `app/lights.py`) |
 | `tools/liveview.py` | dev server: live idle+game two-up, hot-reload, push-cost stats, real present-stream fps |
 | `tools/layout_check.py` | geometry guard: value extremes → collisions / panel overflow |
 | `tools/frames_probe.py` | what the PresentMon stream sees right now: presenters, AppIDs, fps/frametime |
@@ -512,7 +513,10 @@ Consequence: **the whole screen may redraw every second on this panel**, so the
 1 Hz tick, so the diff transport in `app/output.py` is still what keeps the loop
 comfortable: a typical tick pushes a few bands (~25 ms each), and only the
 burn-in shift, the exercise sweep and the first frame pay the full 0.82 s.
-`layout.trend_bands: false` remains the knob for a genuinely slow link.
+`layout.trend_bands: false` remains the knob for a genuinely slow link. The sweep is
+also opt-in (`burnin.exercise_enabled`, off by default) and now advances one frame per
+control-loop tick, so it cannot spend twelve seconds of that budget ignoring a
+monitor-off, a lock, a suspend or a game start.
 
 ## The panel on this desk (connected 2026-09-23)
 
