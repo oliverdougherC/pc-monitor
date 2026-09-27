@@ -63,6 +63,9 @@ CASES = [
      "geometry at the value extremes: collisions and panel overflow", "fonts", None),
     ("fault", ["tools/fault_selftest.py"],
      "per-tick guard contains faults; AST pass over the loop", None, None),
+    ("recovery", ["tools/recovery_selftest.py"],
+     "start-up containment, bootstrap log, heartbeat, restart budget, task settings",
+     None, None),
 ]
 
 
