@@ -33,6 +33,13 @@ dimmed, exactly as `app/frames.py` holds it). A new STRONG candidate that has be
 alone for `switch_silence_s` takes the lock, which is how starting game B from
 game A's desktop works.
 
+Liveness of the lock is not the entry floor: a game rendering below
+`min_present_fps` never appears in the presenters set, and releasing it for that
+oscillated the panel on a healthy low-fps title — so while it is alive, the
+fallback evidence that qualifies it for entry (its own window fullscreen with the
+GPU busy, or a name from `game.processes` in the foreground) is what holds it. The
+two states must agree, or the boundary between them is where the panel flickers.
+
 SteamAppId/SteamGameId (app/steamid.py) is identity and enrichment — it names the
 game and keys per-game profiles — and a tiebreaker here, never the core signal:
 protected processes block the environment read and direct-launched exes bypass
@@ -253,14 +260,17 @@ class GameWatch:
         `presenters` is None when the present stream is unavailable — which is a
         different fact from an empty dict ("nothing is presenting") and has to be
         treated as one, or a machine without the ETW capture would drop out of game
-        mode every time the window heuristic could not see a present.
+        mode every time the window heuristic could not see a present. A game that
+        renders *below the present floor* produces the same empty dict — and the
+        floor is what ranks new candidates, not what measures the liveness of the
+        one already locked. Reading it as absence of rendering released a healthy
+        20 fps game every `exit_after_s` and let it re-enter seconds later, forever.
+        Liveness for the locked game is: it is presenting under its own identity,
+        or — alive — its window still carries the fallback evidence (`_window_holds`).
         """
         fg_pid, fg_name, covers, borderless, snap = ctx
         if presenters is None:
-            busy = (snap.gpu.load_pct is not None
-                    and snap.gpu.load_pct >= float(self.cfg["min_gpu_load"]))
-            same = fg_pid == self.game_pid and covers and borderless and busy
-            if same:
+            if self._window_holds(fg_pid, covers, borderless, snap):
                 self._quiet_s = 0.0
                 self.evidence = f"held {self.game_name}({self.game_pid}) on window heuristic"
                 return True
@@ -273,7 +283,14 @@ class GameWatch:
             return True
 
         pr = presenters.get(self.game_pid)
-        if pr is not None:
+        # Identity before liveness: presenting frames prove the pid is rendering,
+        # not that it is the process we locked onto — Windows recycles pids. When
+        # the lock recorded a creation time and it no longer matches, the thing
+        # presenting is a stranger and inherits nothing. (A lock that could not
+        # record one — a process psutil cannot open — has nothing to match
+        # against; presenting stays the best evidence there, as before.)
+        if pr is not None and (self._create_time is None
+                               or _alive(self.game_pid, self._create_time)):
             self._quiet_s = 0.0
             self._dead_s = 0.0
             self.evidence = (f"held {self.game_name}({self.game_pid}) {pr.fps:.0f}fps "
@@ -282,8 +299,10 @@ class GameWatch:
                              f"gpu={pr.gpu:.0f}%")
             return True
 
-        # Not presenting right now. Alive? Then this is an alt-tab, a loading screen
-        # or a paused game: stay, and let app/frames.py hold the last measurement.
+        # Not presenting right now — or presenting under a pid that is no longer
+        # the locked process, which to this state machine is the same fact.
+        # Alive? Then this is an alt-tab, a loading screen or a paused game:
+        # stay, and let app/frames.py hold the last measurement.
         if not _alive(self.game_pid, self._create_time):
             self._dead_s += dt
             self._quiet_s += dt
@@ -292,6 +311,18 @@ class GameWatch:
             if self._dead_s >= self.dead_exit_s:
                 self._release("target process exited")
                 return False
+            return True
+
+        # Alive and not in `presenters`: for a locked game, under the fps floor is
+        # not absent. The fallback that qualifies a below-threshold game on the way
+        # in — its own window fullscreen while the GPU works, or a configured name
+        # in the foreground — keeps it on the way through, so entry and hold cannot
+        # disagree and oscillate.
+        if self._window_holds(fg_pid, covers, borderless, snap):
+            self._quiet_s = 0.0
+            self._dead_s = 0.0
+            self.evidence = (f"held {self.game_name}({self.game_pid}) under the present "
+                             f"floor on window evidence")
             return True
 
         self._quiet_s += dt
@@ -312,6 +343,23 @@ class GameWatch:
             self.evidence = f"switch {old}→{cand!r} after {self._quiet_s:.0f}s silence"
             self._quiet_s = 0.0
         return True
+
+    def _window_holds(self, fg_pid: int | None, covers: bool, borderless: bool,
+                      snap) -> bool:
+        """The fallback liveness evidence, shared by both held paths (no capture
+        at all, and a capture whose fps floor the game renders under): the locked
+        game's own window, fullscreen and borderless, with the GPU working — the
+        same shape that qualifies it for entry — or, for a name in
+        `game.processes`, simply still being the foreground process the user named.
+        Only the locked pid can answer this, so the browser/non-game vetoes cannot
+        be smuggled back in here; they were applied when the lock was taken."""
+        if fg_pid is None or fg_pid != self.game_pid:
+            return False
+        if (self.game_name or "").lower() in [p.lower() for p in self.cfg["processes"]]:
+            return True
+        return (covers and borderless
+                and snap.gpu.load_pct is not None
+                and snap.gpu.load_pct >= float(self.cfg["min_gpu_load"]))
 
     def _lock(self, pid: int, name: str | None) -> None:
         self.game_pid = pid
@@ -337,9 +385,13 @@ class GameWatch:
         ignore = tuple(str(p).lower() for p in self.cfg["ignore"])
         fg_pid, fg_name, covers, borderless = _foreground_info()
         ctx = (fg_pid, fg_name, covers, borderless, snap)
+        # `present_detection: false` is a statement about the detector, not just
+        # about candidate scoring: held state must not use the present stream to
+        # make a decision idle state was told to make without it.
+        use_pres = bool(self.cfg.get("present_detection", True))
 
         if self.state == self.GAME:
-            if self._held(dt, presenters, ctx, steam, ignore):
+            if self._held(dt, presenters if use_pres else None, ctx, steam, ignore):
                 if self.game_pid is not None and steam is not None:
                     self.steam_appid = steam.appid(self.game_pid)
                 self._last_tier = STRONG
@@ -347,8 +399,19 @@ class GameWatch:
             return self.state
 
         cand = None
-        if presenters and self.cfg.get("present_detection", True):
+        if presenters and use_pres:
             cand = self._best(presenters, fg_pid or -1, fg_name, covers, steam, ignore)
+        # `game.processes` is documented as always triggering game mode, and it is
+        # the user's own answer — so it must not wait for the exe to clear the
+        # present floor, or for a capture to exist at all. The veto lists outrank
+        # it explicitly: a browser or the shell named there is still never the game.
+        if (fg_pid is not None and fg_pid != self._self_pid and fg_name
+                and fg_name in [p.lower() for p in self.cfg["processes"]]
+                and fg_name not in ignore and not self._is_non_game(fg_name)
+                and (cand is None or cand.pid != fg_pid)):
+            pr = (presenters or {}).get(fg_pid)
+            cand = Candidate(fg_pid, fg_name, STRONG, "configured",
+                             pr.fps if pr else 0.0, pr.gpu if pr else None)
         if cand is None and fg_pid is not None and fg_pid != self._self_pid \
                 and fg_name not in ignore \
                 and not self._is_non_game(fg_name) and covers and borderless:
