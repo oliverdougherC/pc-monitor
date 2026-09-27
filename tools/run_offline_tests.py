@@ -5,7 +5,7 @@
     .venv\Scripts\python tools\run_offline_tests.py --only panel_link
 
 The selftests are the contract — "everything behavioural has an offline proof
-that needs neither admin nor hardware" — but eight separate commands are eight
+that needs neither admin nor hardware" — but nine separate commands are nine
 chances to forget one, and a change cannot be judged by whoever remembers to
 run them. This runner is what CI calls and what a contributor runs before
 pushing: each selftest stays a separate process (its own `sys.path`, its own
@@ -63,6 +63,9 @@ CASES = [
      "geometry at the value extremes: collisions and panel overflow", "fonts", None),
     ("fault", ["tools/fault_selftest.py"],
      "per-tick guard contains faults; AST pass over the loop", None, None),
+    ("liveview", ["tools/liveview_selftest.py"],
+     "preview hot reload is transactional: bad edits keep the working generation",
+     None, None),
 ]
 
 

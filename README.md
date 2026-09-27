@@ -40,11 +40,15 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\panel_link_selftest.py     # link survives raise/hang, rebuilds, walks its device ladder
 .venv\Scripts\python tools\fault_selftest.py          # nothing outside the per-tick guard (AST-checked)
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
+.venv\Scripts\python tools\liveview_selftest.py       # hot reload is transactional: bad edits roll back
 ```
 
 `tools/liveview.py` renders **both** states from the same telemetry and
-hot-reloads `app/layout.py` / `app/power.py` / `config.yaml` on save — edit the
-layout and the browser updates within a tick (no restart). It also reports, per
+hot-reloads `app/layout.py` / `app/power.py` / `config.yaml` (or whatever
+`--config` points at) on save — edit the layout and the browser updates within
+a tick (no restart). The reload is transactional: a broken edit is refused,
+the previous working generation keeps rendering, and the error stays on the
+page until a complete valid one is running. It also reports, per
 state, how many bands a partial panel update would need (same math as
 `app/output.py`), and has zoom / brightness / grid / burn-in-shift overlays.
 
