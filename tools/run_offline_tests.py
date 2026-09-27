@@ -57,6 +57,13 @@ CASES = [
      "CloudStore night-mode decode, pinned to captured blobs", None, None),
     ("panel_link", ["tools/panel_link_selftest.py"],
      "link survives raise/hang, rebuilds, walks its device ladder", "vendor", None),
+    # Deliberately needs nothing: the ownership rules are the reason the panel goes
+    # missing in the first place, and a case for them that SKIPs on CI would leave the
+    # one invariant nobody can eyeball unguarded. It fakes the two names the link
+    # touches instead of reaching for the vendored tree.
+    ("panel_owner", ["tools/panel_owner_selftest.py"],
+     "one owner for the port: late writes, competing rebuilds, close mid-build",
+     None, None),
     ("lights", ["tools/lights_selftest.py"],
      "the one light decision end to end, incl. a rendered night frame", "vendor", None),
     ("layout", ["tools/layout_check.py"],
