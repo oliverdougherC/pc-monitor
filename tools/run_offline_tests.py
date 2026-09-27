@@ -55,6 +55,12 @@ CASES = [
      "Pinning that clock is issue #4, which should drop this advisory flag."),
     ("nightlight", ["tools/nightlight_probe.py", "--selftest"],
      "CloudStore night-mode decode, pinned to captured blobs", None, None),
+    # Needs nothing beyond psutil: the counter policy is the reason the panel can
+    # freeze on its last snapshot, and a case for it that needed the vendored tree
+    # would leave that invariant unguarded on CI.
+    ("sensor_counters", ["tools/sensor_counters_selftest.py"],
+     "disk/net counters re-prime after gaps, resets, topology change, suspend",
+     None, None),
     ("panel_link", ["tools/panel_link_selftest.py"],
      "link survives raise/hang, rebuilds, walks its device ladder", "vendor", None),
     ("lights", ["tools/lights_selftest.py"],
