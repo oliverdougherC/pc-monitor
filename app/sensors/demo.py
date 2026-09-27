@@ -57,6 +57,11 @@ class DemoBackend:
             f.low1_pct = 101 + 4 * w
             f.low01_pct = 58 + 6 * w
             f.latency_ms = None
+            # Everything here is invented, and the frame stats are the part that is
+            # easy to mistake for a measurement, so they carry the flag that makes
+            # the pane say SIMULATED. The real backends never set it: a missing
+            # sensor renders as `--`, which is the whole point of the flag.
+            f.simulated = True
             ram = 26_800 + 1_400 * slow
             snap.disk_read_bps = _burst(t, 4e6, 26e6, 9.0, 0.9, 1.0)
             snap.disk_write_bps = _burst(t, 1.6e6, 5e6, 14.0, 1.3, 2.0)

@@ -17,7 +17,38 @@ import time
 
 import psutil
 
-_STEAM_ENV = ("steamappid", "steamgameid")
+# The names as Steam writes them. Not as they come back: psutil's Windows
+# backend upper-cases every key it parses out of the PEB environment block, so
+# a Windows child of Steam reports STEAMAPPID, and a lookup written in lower
+# case finds nothing at all (issue #29). Matching is therefore done on a
+# case-folded view of the mapping, which is also what keeps the fixtures
+# portable: a test can hand over the dictionary Windows would have produced.
+_STEAM_ENV = ("SteamAppId", "SteamGameId")
+
+# Steam's own "this is not a game" content: an empty value, and the "0" it
+# leaves behind for a non-game entry. Neither is an identity.
+_NO_APPID = ("", "0")
+
+
+def steam_appid(env) -> str | None:
+    """The Steam AppID carried by a process environment mapping, or None.
+
+    `SteamAppId` wins over `SteamGameId` because it is the one Steam writes for
+    a real store title; `SteamGameId` covers the library-added ones. A missing
+    mapping (`None`, an unreadable environment) is *no information*, which is
+    the caller's business — this function never guesses.
+    """
+    if not env:
+        return None
+    folded = {str(k).lower(): v for k, v in env.items()}
+    for name in _STEAM_ENV:
+        value = folded.get(name.lower())
+        if value is None:
+            continue
+        value = str(value)
+        if value not in _NO_APPID:
+            return value
+    return None
 
 
 class SteamIdentity:
@@ -57,7 +88,7 @@ class SteamIdentity:
                 env = psutil.Process(pid).environ()
             except (psutil.AccessDenied, psutil.NoSuchProcess, OSError):
                 continue  # EAC/BE protected, or exited mid-scan — present-stream still sees it
-            appid = next((env[k] for k in _STEAM_ENV if env.get(k, "") not in ("", "0")), None)
+            appid = steam_appid(env)
             if appid:
                 games[pid] = appid
         self._games = games

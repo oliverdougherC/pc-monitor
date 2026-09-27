@@ -17,6 +17,12 @@ window and a synthetic stream clock, and asserts what the panel would have shown
   switch          a second game starts while the first goes quiet → the lock moves
   hold, don't lie  the game stops presenting while alive: the last measurement is
                   kept and marked stale, never replaced by a fabrication
+  held below floor a live 20 fps game never oscillates in and out on the 24 fps
+                  entry floor; a loading gap does not count against it either;
+                  `present_detection: false` holds the same contract as entering;
+                  a configured `game.processes` name enters and holds without any
+                  ETW at all; and a presenting pid whose identity no longer
+                  matches the lock cannot inherit it
 
 Pids are chosen so the liveness rule can be exercised both ways: the alive game is
 this test process (guaranteed to exist), the dead one is a pid nobody can own.
@@ -316,10 +322,141 @@ def case_legacy(cfg) -> None:
     check("after exit_after_s", 20 <= n <= 26, True)
 
 
+def case_low_fps_holds(cfg) -> None:
+    print("case: a live 20 fps game below the present floor must not oscillate")
+    # Entering through the fullscreen/GPU fallback is fine; the bug was that once
+    # locked, only `presenters is None` re-applied that fallback — a healthy capture
+    # that simply never lists a sub-floor game read as "not presenting", so the lock
+    # released every exit_after_s and re-entered four seconds later, forever.
+    m, s, w = new_pair(cfg)
+    fg(ALIVE, "lightgame.exe")
+    states = []
+    for _ in range(40):
+        s.present(ALIVE, "lightgame.exe", 1.0, 20.0, gpu_busy_pct=90.0)
+        states.append(tick(w, m))
+    check("in game mode", states[-1], "game")
+    check("never left across 40 s of live play", set(states[-10:]), {"game"})
+    check("entered once, no oscillation", w.switches, 1)
+    check("it really is below the present floor", m.presenters().get(ALIVE), None)
+    st = m.stats(ALIVE)
+    check("stats stay live", st is not None and not st.stale, True)
+    check("stats follow it at ~20 fps", round(float(st.fps)), 20)
+
+
+def case_loading_gap(cfg) -> None:
+    print("case: a loading screen below the floor is not an exit")
+    m, s, w = new_pair(cfg)
+    fg(ALIVE, "lightgame.exe")
+    for _ in range(6):
+        s.present(ALIVE, "lightgame.exe", 1.0, 20.0, gpu_busy_pct=90.0)
+        tick(w, m)
+    check("in game mode", w.state, "game")
+    # 10 s of nothing rendered and focus elsewhere — a real load behind a splash.
+    fg(7, "explorer.exe", covers=False, borderless=False)
+    for _ in range(10):
+        s.idle(1.0)
+        tick(w, m)
+    check("holds through the gap", w.state, "game")
+    # Back to sub-floor play: the quiet clock must reset, not carry over into
+    # exit_after_s and release a game that never stopped being the game.
+    fg(ALIVE, "lightgame.exe")
+    for _ in range(20):
+        s.present(ALIVE, "lightgame.exe", 1.0, 20.0, gpu_busy_pct=90.0)
+        tick(w, m)
+    check("never released across gap + sub-floor play", w.state, "game")
+    check("entered once, switched none", w.switches, 1)
+
+
+def case_present_detection_off(cfg) -> None:
+    print("case: present_detection off is honored in the held state too")
+    c = dict(cfg)
+    c["game"] = dict(cfg["game"])
+    c["game"]["present_detection"] = False
+    m, s, w = new_pair(c)
+    fg(ALIVE, "re9.exe")
+    for _ in range(6):
+        s.present(ALIVE, "re9.exe", 1.0, 118.0, gpu_busy_pct=99.0)
+        tick(w, m)
+    check("entered on the window heuristic", w.state, "game")
+    check("the window is the contract", "window heuristic" in w.evidence, True)
+    # Alt-tab: the capture still says the game presents 118 fps, but the user said
+    # present-based detection is off — held state must not contradict idle state by
+    # using it anyway, or "off" only means "not for entry".
+    fg(4321, "chrome.exe", covers=False, borderless=False)
+    n = 0
+    while w.state == "game" and n < 40:
+        s.present(ALIVE, "re9.exe", 1.0, 118.0, gpu_busy_pct=99.0)
+        tick(w, m)
+        n += 1
+    check("lets go on the window clock", w.state, "idle")
+    check("after exit_after_s", 24 <= n <= 27, True)
+
+
+def case_configured(cfg) -> None:
+    print("case: a configured executable without usable ETW")
+    # `game.processes` is documented as always triggering game mode — it is the
+    # user's own answer, so it must not wait for the exe to clear the present floor
+    # or for a capture to exist at all.
+    c = dict(cfg)
+    c["game"] = dict(cfg["game"])
+    c["game"]["processes"] = ["mygame.exe"]
+    m, s, w = new_pair(c)
+    m.ok = False                                  # no present stream at all
+    fg(ALIVE, "mygame.exe", covers=False, borderless=False)   # windowed, not fullscreen
+    states = [tick(w, m) for _ in range(4)]
+    check("enters on the name alone", states[-1], "game")
+    entered_at = (states.index("game") + 1) if "game" in states else -1
+    check("on the strong clock, not the flat four", 1 <= entered_at <= 3, True)
+    check("target is the configured process", w.game_pid, ALIVE)
+    # Configured is not "forever": tab away and the intentional exit hysteresis
+    # still applies — the name qualifies the *foreground* process.
+    fg(7, "explorer.exe", covers=False, borderless=False)
+    n = 0
+    while w.state == "game" and n < 40:
+        tick(w, m)
+        n += 1
+    check("lets go on the window clock", w.state, "idle")
+    check("after exit_after_s", 24 <= n <= 27, True)
+    # The explicit veto lists outrank the configured name.
+    c2 = dict(cfg)
+    c2["game"] = dict(cfg["game"])
+    c2["game"]["processes"] = ["discord.exe"]
+    m2, s2, w2 = new_pair(c2)
+    m2.ok = False
+    fg(4321, "discord.exe")
+    for _ in range(8):
+        tick(w2, m2)
+    check("a non-game name in game.processes is still vetoed", w2.state, "idle")
+
+
+def case_pid_reuse(cfg) -> None:
+    print("case: a presenting pid whose identity no longer matches must not hold the lock")
+    m, s, w = new_pair(cfg)
+    fg(ALIVE, "re9.exe")
+    for _ in range(3):
+        s.present(ALIVE, "re9.exe", 1.0, 118.0, gpu_busy_pct=99.0)
+        tick(w, m)
+    check("in game mode", w.state, "game")
+    check("identity recorded at lock", w._create_time is not None, True)
+    # Windows recycles pids. The thing presenting under this pid now was created at
+    # a different time than the process we locked onto — the exact shape of reuse —
+    # and presenting alone must not inherit the lock.
+    w._create_time -= 10_000.0
+    n = 0
+    while w.state == "game" and n < 10:
+        s.present(ALIVE, "re9.exe", 1.0, 118.0, gpu_busy_pct=99.0)
+        tick(w, m)
+        n += 1
+    check("released, not inherited", w.state, "idle")
+    check("on the dead-exit clock", 2 <= n <= 5, True)
+    check("no target left", w.game_pid, None)
+
+
 def main() -> int:
     cfg = cfgmod.load(None)
     for fn in (case_enter_fast, case_alt_tab, case_quit, case_video, case_ourselves,
-               case_switch, case_legacy):
+               case_switch, case_legacy, case_low_fps_holds, case_loading_gap,
+               case_present_detection_off, case_configured, case_pid_reuse):
         fn(cfg)
         print()
     print("SELFTEST PASSED" if not fails else f"SELFTEST FAILED: {fails}")
