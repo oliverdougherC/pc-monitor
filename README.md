@@ -6,47 +6,99 @@ Telemetry → 5" USB-C "Turing-family" LCD via
 identifies itself as `chs_5inch.dev1_rom1.88`, i.e. the classic 5" **revision C**
 (CDC-ACM COM port), not a `TUR_USB` TURZX board — see "The panel on this desk".
 
-## Run now (no hardware needed)
+## From a clone to running
 
 ```
+powershell -File tools\bootstrap.ps1        # venv + pinned deps + vendored library + PresentMon, then prove it
+
+That is the whole first-time path: it creates `.venv`, installs
+`requirements.txt` (`-r requirements-lhm.txt` with `-WithLhm`, which adds
+pythonnet for the LibreHardwareMonitor backend), fetches the vendored panel
+library **at the revision `vendor/LOCK.txt` names**, fetches the sha256-pinned
+PresentMon binary, and then runs three proofs — `tools\env_check.py`, the
+offline selftests, and a headless render. Every step verifies before it
+installs, so running it twice is free, and a step that fails stops the script
+with the failing command's own output above it. It does not register a
+scheduled task, start the app, or touch a device; that is
+`tools\install_autostart.ps1`, elevated, on purpose.
+
+Two pins, both checked rather than assumed:
+
+.venv\Scripts\python tools\env_check.py             # is what is installed what was reviewed?
+powershell -File tools\vendor_lock.ps1 -Verify      # the vendored tree alone
+
+## Run now (no hardware needed)
+
 .venv\Scripts\python main.py --backend demo          # simulated screen at http://localhost:5678
 .venv\Scripts\python tools\liveview.py               # LIVE two-up layout editor preview → http://localhost:5680
 .venv\Scripts\python tools\layout_check.py --no-trends  # geometry guard (collisions / panel overflow)
 .venv\Scripts\python main.py                         # real sensors (psutil+NVML), simulated screen
 .venv\Scripts\python main.py --dump x.png --force-state game   # headless frame preview
-```
 
 Real fps/frametime (game pane, `--backend auto|lhm|fallback`) additionally needs
 the pinned PresentMon binary and Administrator — everything else degrades to
-honest `--`, never fake numbers:
+honest `--`, never fake numbers. That includes the developer preview:
+`tools/liveview.py` invents frame stats only when `--synth-fps on` asks it to, and
+then paints `SIMULATED` over the pane that shows them:
 
-```
 powershell -File tools\fetch_presentmon.ps1          # download + sha256-lock vendor/presentmon/
 .venv\Scripts\python tools\frames_probe.py 10        # what the present stream sees (elevated)
-```
 
 Everything behavioural has an offline proof that needs neither admin nor hardware —
 run them all before trusting a change. One command runs all of them and returns one
 exit code (this is also what CI runs; a case that cannot run for want of the vendored
 library reports SKIP, which is never counted as coverage):
 
-```
 .venv\Scripts\python tools\run_offline_tests.py       # all of the below, one exit code
+.venv\Scripts\python tools\gate_selftest.py           # the gate itself: verdict contract, hung-case kill
 .venv\Scripts\python tools\frames_selftest.py         # fps/GPU/mode parsing, held values, stream guards
+.venv\Scripts\python tools\units_selftest.py         # counter to pixels: net in bits, disk in bytes
 .venv\Scripts\python tools\gamewatch_selftest.py      # entry speed, alt-tab keeps the game's numbers
+.venv\Scripts\python tools\steamid_selftest.py        # Steam identity vs the environment psutil really returns
+.venv\Scripts\python tools\liveview_selftest.py       # the preview invents nothing it does not say so on
 .venv\Scripts\python tools\hoststate_selftest.py      # sleep / displays-off / lock / frozen loop
+.venv\Scripts\python tools\eventwindow_selftest.py    # native ABI, handle lifecycle, pump recovery
+.venv\Scripts\python tools\wake_gap_selftest.py       # the frozen loop's gap, on main.py's own dt
+.venv\Scripts\python tools\recovery_selftest.py       # recovery asks instead of blocking the loop
+.venv\Scripts\python tools\idle_clock_selftest.py     # idle arithmetic at the 25- and 50-day tick boundaries
 .venv\Scripts\python tools\lights_selftest.py         # what the panel does about each of those
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
+.venv\Scripts\python tools\gamma_ramp_selftest.py   # the ramp read hits the DLL that exports the call
 .venv\Scripts\python tools\panel_link_selftest.py     # link survives raise/hang, rebuilds, walks its device ladder
+.venv\Scripts\python tools\panel_recovery_selftest.py # the USB disable journal, killed at every transition
+.venv\Scripts\python tools\diff_cache_selftest.py     # diff cache commits only acknowledged pushes
+.venv\Scripts\python tools\power_estimate_selftest.py  # missing sensors never become a low "measured" total
 .venv\Scripts\python tools\fault_selftest.py          # nothing outside the per-tick guard (AST-checked)
+.venv\Scripts\python tools\config_schema_selftest.py  # knobs reach consumers; bad values die at load, key named
+.venv\Scripts\python tools\sweep_selftest.py          # burn-in sweep: one frame per tick, and outranked
+.venv\Scripts\python tools\recovery_selftest.py       # bad morning: start-up, death, hang, budget
+.venv\Scripts\python tools\owned_process_selftest.py  # install/remove stops only what this install owns
+.venv\Scripts\python tools\env_check_selftest.py      # the dependency pin verifies; it does not bless what it finds
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
-```
+.venv\Scripts\python tools\liveview_selftest.py       # hot reload is transactional: bad edits roll back
+
+Which open repair fixes which tracked failure, in what order they should land,
+and — just as plainly — what no offline run can yet claim, is written up in
+[`docs/reliability-plan.md`](docs/reliability-plan.md) (the deliverable of the
+#33 tracker).
 
 `tools/liveview.py` renders **both** states from the same telemetry and
-hot-reloads `app/layout.py` / `app/power.py` / `config.yaml` on save — edit the
-layout and the browser updates within a tick (no restart). It also reports, per
+hot-reloads `app/layout.py` / `app/power.py` / `config.yaml` (or whatever
+`--config` points at) on save — edit the layout and the browser updates within
+a tick (no restart). The reload is transactional: a broken edit is refused,
+the previous working generation keeps rendering, and the error stays on the
+page until a complete valid one is running. It also reports, per
 state, how many bands a partial panel update would need (same math as
 `app/output.py`), and has zoom / brightness / grid / burn-in-shift overlays.
+
+Its game pane follows the real present stream, so a preview run with
+`--backend auto` shows the same numbers the panel would. When that stream is off,
+denied, quiet or has no usable target, the pane shows `--` — it does not fill
+itself in. `--synth-fps on` is there for designing the layout without a game
+running, and it is explicit and marked: the pane is painted `SIMULATED`, in the
+frame itself, so an exported PNG cannot be mistaken for a measurement. The status
+line reports the provenance of the numbers on screen (`displayed:
+real|simulated|none`), not of the capture underneath them.
 
 ## Architecture
 
@@ -55,29 +107,47 @@ state, how many bands a partial panel update would need (same math as
 | `main.py` | entry: 1 Hz loop, wiring, and the per-tick guard that keeps one subsystem's raise from ending the app |
 | `app/display.py` | builds the panel object for `display.revision` (the only module that imports the vendored `library.*`) |
 | `app/panel.py` | the panel as a **link that can fail**: guarded/timed device calls, rebuild on its own clock, replays orientation+brightness, and asks Windows to restart the USB device when reopening the port cannot help |
-| `app/hoststate.py` | what the machine is doing: asleep / monitors off / locked, from `WM_POWERBROADCAST` + the console-display power setting + session notifications, with a tick-gap fallback |
+| `app/hoststate.py` | what the machine is doing: asleep / monitors off / locked, from `WM_POWERBROADCAST` + the display-status power settings + session notifications, with a tick-gap fallback |
 | `app/nightlight.py` | is the user's night mode on, and how warm: Windows Night light read out of CloudStore (CompactBinary), plus the gamma ramp as a second opinion for f.lux-style tools |
 | `app/lights.py` | the one light decision: dark? how bright? which warmth LUT? (asleep → locked → monitor-off → idle → game/idle/dim, night applied on top) |
 | `app/sensors/` | backends: `lhm` (LibreHardwareMonitorLib via pythonnet, full fidelity incl. package power & per-core clocks), `fallback` (psutil+NVML, no admin), `demo` |
 | `app/frames.py` | real fps/frametime/1%–0.1% low per process: spawns PresentMon (ETW, admin), parses the present stream, answers "who is rendering" and "at what frame rate", and *holds* a stopped game's last number (marked stale) instead of inventing one |
-| `app/steamid.py` | Steam identity: `SteamAppId`/`SteamGameId` env vars → which pids are Steam games + AppID (enrichment, never the detection core) |
-| `app/power.py` | total-watt estimate (base+cpu+gpu) & green→red 50–1000 W gradient |
+| `app/steamid.py` | Steam identity: `SteamAppId`/`SteamGameId` env vars → which pids are Steam games + AppID (enrichment, never the detection core); matched case-folded, because psutil hands back Windows' upper-cased environment keys |
+| `app/power.py` | total-watt estimate (base+cpu+gpu) that carries its own provenance (measured/modelled/partial/stale) & green→red 50–1000 W gradient |
 | `app/gamewatch.py` | idle/game state, scored by confidence (STRONG/MED/LEGACY/NONE) with a **locked frame target** an alt-tab cannot steal; hysteresis per tier |
 | `app/layout.py` | 800×480 rendering: permanent top half + mode strip, trend bands, worst-case-fit type, night-mode LUT applied to the finished frame |
 | `app/history.py` | bounded ring buffers feeding the trend bands |
 | `app/output.py` | numpy diff → only changed bands are sent to the panel |
-| `app/burnin.py` | 3-px layout shift and the periodic color sweep (brightness/screen-off moved out to `app/lights.py`) |
-| `tools/liveview.py` | dev server: live idle+game two-up, hot-reload, push-cost stats, real present-stream fps |
+| `app/burnin.py` | 3-px layout shift and the periodic color sweep — opt-in, and stepped one frame per tick by `main.sweep_step` so the current light/game/link state can veto it (brightness/screen-off moved out to `app/lights.py`) |
+| `app/owned.py` | which processes this install actually owns: the record the app writes about itself, canonical-path identity, the collector's session, and the graceful-then-bounded stop the installer runs |
+| `app/bootlog.py` | the start-up story without the vendored logger: stdlib-only, bounded, never raises — `log.log` is written by `library.log`, which a clean install does not have |
+| `app/liveness.py` | the heartbeat file, the deliberate-shutdown marker, and the restart decision (ok / hold / backoff / permanent / restart / start) with a bounded budget and doubling backoff |
+| `tools/liveview.py` | dev server: live idle+game two-up, hot-reload, push-cost stats, real present-stream fps; invented fps is opt-in and painted `SIMULATED` |
 | `tools/layout_check.py` | geometry guard: value extremes → collisions / panel overflow |
 | `tools/frames_probe.py` | what the PresentMon stream sees right now: presenters, AppIDs, fps/frametime |
 | `tools/frames_health.ps1` | no admin: which of LIVE / STARVED / DENIED / QUIET the capture is in, straight from `log.log` |
 | `tools/frames_selftest.py` | no admin: replays synthetic present streams through the real parser; fps math, GPU-busy/mode parsing, the held-value window, and the silence/column guards |
 | `tools/gamewatch_selftest.py` | no admin: fake present streams + fake focus through the real detector — fast entry, alt-tab holds the game's numbers, quick exit on quit, video is not a game, target handover |
+| `tools/liveview_selftest.py` | no admin, no fonts, no vendored library: the preview's game pane through the five shapes a capture comes in — off, denied, quiet, no stats, measured. Nothing is invented unless `--synth-fps on` was asked for, and then the marking is in the pixels and in the status line at once |
 | `tools/hoststate_selftest.py` | no admin: replays power/session broadcasts through the real state machine (sleep, monitor timeout, lock, frozen-loop fallback, slow start) |
+| `tools/eventwindow_selftest.py` | no admin: the layer under it - declared signatures for every native call, handles that keep all 64 bits, each notification handle unregistered once, readiness only when registered, and a dead event pump said in the health line and rebuilt by the next tick |
+| `tools/wake_gap_selftest.py` | no admin, no live clock: the loop's own tick arithmetic (`main.elapsed_dt`) against the gap watchdog — 6/30/60/120 s of freeze each ask for exactly one recovery, while start-up, jitter and a deliberately slow panel rebuild ask for none |
+| `tools/recovery_selftest.py` | no admin, no panel: drives recovery events at `app/recovery.py` against a link with scripted handshake and device-reset times - the loop stays responsive, a burst is one pass, a display event costs a frame, nothing is lit or pushed mid-rebuild, a replug is retried on arrival, and a wake while the panel is meant to be dark does not light it |
+| `tools/idle_clock_selftest.py` | no admin: replays 25 and 50 days of uptime at the idle clock against a scripted boot clock - the signed tick boundary, the 32-bit wrap, and a clock that cannot be read |
+| `tools/steamid_selftest.py` | no admin, no Steam: the identity lookup against the environment dictionaries psutil actually returns (upper-cased on Windows), plus one live child process and the vanished-process case |
 | `tools/nightlight_probe.py` | prints what Windows actually stores; `--selftest` replays the captured blobs, `--watch 30` follows a manual toggle |
+| `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the fact that the destructive rung is journaled while the device is down |
+| `tools/panel_recovery_selftest.py` | no admin: the USB disable journal against injected `os._exit` crashes at every transition, an unwritable state directory, `pnputil` wording that lies, a device node that answers in German, and a restart from a different working directory |
+| `tools/gamma_ramp_selftest.py` | no admin: the gamma-ramp read against fakes that only export what User32/Gdi32 really export — right DLL, declared handles, DC always released, and a failure that stays a stated reason instead of a fake neutral |
 | `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the disable/enable journaling (including "a refused disable is never followed by an enable") |
+| `tools/diff_cache_selftest.py` | the diff cache is transactional: a failed, half-sent, or relink-overtaken push leaves a full refresh pending, and only an acknowledged push on one connection generation commits the shadow frame |
+| `tools/power_estimate_selftest.py` | the power model + strip across every input shape: all sensors missing, one side missing, complete measured, load-only modelling, stale data and recovery - no missing-data case may render as an apparently-measured low total, with the drawn text and units asserted, not just the model |
 | `tools/lights_selftest.py` | the light decision end to end: sleep, displays-off, idle, dim, precedence, the night cap and LUT, and a rendered frame measured before/after the warmth |
+| `tools/recovery_selftest.py` | the bad morning: the bootstrap log with no vendored logger, the heartbeat file, every branch of the restart decision (including the one that refuses), guard-installed-before-the-risky-calls (AST), the degraded no-sensor tick, and what the installer registers |
+| `tools/watchdog_autostart.ps1` | the outside observer: reads `.heartbeat`, asks `python -m app.liveness decide`, and stops/starts **the task** (never a process) on the answer |
+| `tools/owned_process_selftest.py` | who the installer is allowed to stop: a scripted process list with another project's `main.py`, a similarly named path, this tree's other scripts, a dev-role collector, a recycled parent pid and an unreadable process — plus the graceful-then-forced sequence, with the killer receiving exactly the proven pids |
 | `tools/fault_selftest.py` | the per-tick guard: fallback + one log line per fault, `SystemExit` contained, Ctrl-C not — plus an AST pass that fails if any subsystem call in the loop has escaped the guard |
+| `tools/config_schema_selftest.py` | no admin: every behavioural knob is driven through the real YAML load into its real consumer (GameWatch, BurnIn, Layout, the wipe and the gradient), and every value class that used to reach the loop (zero intervals, bad brightness, equal gradient ends, wrong shapes, bad geometry) must now stop at `load()` naming its key |
 | `tools/hoststate_probe.py` | live watcher at 2 Hz: what each power/session event did to the state (`--trace` for raw window messages) |
 | `tools/screen_wake_probe.py` | raw serial HELLO / TURNON / RESTART: is the panel deaf, and does anything bring it back |
 | `tools/presentmon_matrix.py` | elevated: A/Bs the capture invocations (drop filter, tracking, `--v1_metrics`, name reuse) |
@@ -292,11 +362,10 @@ one owner (`app/lights.py`), evaluated in this order — and the reason that los
 panel before is that the inputs did not exist as data anywhere:
 
 | reason | where it comes from | panel |
-|---|---|---|
 | `asleep` | `WM_POWERBROADCAST` `QUERYSUSPEND`/`SUSPEND` → back on `RESUME`/`RESUMEAUTOMATIC` | off, and the loop stops pushing |
 | `locked` | `WTSRegisterSessionNotification` → `WTS_SESSION_LOCK`/`_UNLOCK`, reconciled against `WTSGetActiveConsoleSessionId` on every tick | off — nobody is at the desk |
 | `console-lost` | our session is still running but another one took the console (fast user switching) | off |
-| `monitor-off` | the `GUID_CONSOLE_DISPLAY_STATE` power setting (+ `GUID_MONITOR_POWER_ON`) — Windows' own display timeout, screensaver blank, or `nircmd`-style sleep | off |
+| `monitor-off` | the `GUID_SESSION_DISPLAY_STATUS` power setting, falling back to `GUID_CONSOLE_DISPLAY_STATE` and then the legacy `GUID_MONITOR_POWER_ON` — Windows' own display timeout, screensaver blank, or `nircmd`-style sleep | off |
 | `idle` | `GetLastInputInfo` past `display.screen_off_after_min` — held while a game is presenting live frames | off (as before) |
 | `dim` | quiet past `display.dim_after_s` (also held during live frames) | `brightness_dim` |
 | `lit` | otherwise | `brightness_game` in game mode, `brightness_idle` not |
@@ -324,6 +393,24 @@ Dark means `ScreenOff` **and** no rendering: on revision C a full frame is ~0.82
 the link, so a dark panel is also the one setting that costs the bus nothing. The
 diff is invalidated on the way back, so the first frame after a wake is whole rather
 than a few bands of a picture the panel no longer has.
+
+**Two kinds of change, and only one of them rebuilds anything.** A resume means the
+machine stopped: the COM port may be gone, the panel may have rebooted into portrait,
+the ETW session may be a husk, and the game it locked onto was frozen mid-frame. A
+monitor coming back on, a session unlock or a `WM_DISPLAYCHANGE` means none of that -
+it means the panel has something new to show. `app/hoststate.py` raises a separate edge
+for each (`take_resume()` and `take_refresh()`), and `app/recovery.py` folds a burst of
+either into one request: one pass, one rebuild and only if the link is actually down,
+one whole frame. The work that may block - the bring-up, and the `pnputil` device rungs
+behind it - runs on the coordinator's thread, so a slow screen cannot stop the render
+loop any more; it used to, for tens of seconds, and the loop's own watchdog read that as
+a suspend and recovered from a sleep that had not happened. A wake that arrives while
+the panel is meant to be dark defers its rebuild until there is something to show,
+because a bring-up lights this hardware up on its own: that is how an unattended 3 a.m.
+wake-up used to end with a lit panel in a dark room. While a rebuild is outstanding the
+loop is told to hold - no brightness command, no frame - so the picture that comes back
+is the current one and not the one composed before the event. All of it is quiet in the
+log unless it happens: `recovery=1 pass coalesced=4` on the `[beat]` line.
 
 **Why events, and not polling.** The loop is frozen while the PC sleeps, so "turn the
 panel off when the PC sleeps" cannot be a rule evaluated after the fact — nothing is
@@ -362,9 +449,7 @@ sunset/sunrise variant). Because that store is the OS's own, the Quick Settings
 toggle *and* the scheduled transitions both land within `night.refresh_s` (3 s), and
 `log.log` says which of the two fired:
 
-```
 [night] night=on src=windows temp=2525K (state enabled=True schedule-now=False, changed 21:00:03; schedule=True set-hours 21:00-07:00 temp=2525K)
-```
 
 Night light writes nothing into the gamma ramp on this build (`GetDeviceGammaRamp`
 returns identity with it on), but third-party warmers do, so the ramp is read as a
@@ -419,13 +504,29 @@ bring the pipe back (a read returned where the write had blocked) but HELLO came
 **empty**: pipe alive, MCU not.
 
 Rung 3 has a real hazard: a device left **disabled** stays disabled through a reboot,
-which would turn a dark panel into an absent one. So the intent is written to
-`.panel_reset_pending` before the disable, the enable is retried three times, the
-marker is deleted on success, and any start that finds the marker enables the device
-before it does anything else. If even the retries fail, the log says so in capitals and
-names the click that undoes it — because at that point the app has made the desk worse
-and must not pretend otherwise. `tools/panel_link_selftest.py` pins all four of those
-paths, including "a refused disable is never followed by an enable".
+which would turn a dark panel into an absent one. So the intent is committed to a
+recovery journal — `%LOCALAPPDATA%\PCMonitor\usb_recovery.json`, written through a temp
+file with an `fsync` and one atomic replace — *before* the disable, and the cycle is
+refused outright when that write fails: an escalation the app declined is a worse
+evening than one it cannot finish. The record moves through `disabling` → `disabled` →
+`enabling` as the cycle does, the enable is retried three times, and the record is
+deleted only when Windows says the device is no longer disabled
+(`Win32_PnPEntity.ConfigManagerErrorCode`, where 22 means disabled and 0 means working):
+`pnputil` exits 0 even when it refuses and its text is localized, so its wording is
+never the reason a record is cleared. Any bring-up that finds a record finishes the job
+first — one enable per attempt, since the retry cadence is the repetition — and a record
+that cannot be parsed is renamed `.unreadable` rather than deleted, because an unreadable
+journal is exactly the case where a device may be sitting disabled. If even the retries
+fail, the log says so in capitals and names the click that undoes it — because at that
+point the app has made the desk worse and must not pretend otherwise.
+
+The journal used to be `.panel_reset_pending` in the working directory, which was the
+bug: a run started from anywhere else could not see the previous run's debt. An old file
+left behind by an earlier version is adopted into the journal instead of dropped.
+`tools/panel_recovery_selftest.py` pins this by killing real child processes with
+`os._exit` at each transition and reading the record back from a different directory,
+and `tools/panel_link_selftest.py` pins the ladder's order and that rung 3 is journaled
+while the device is down.
 
 Honest limit, measured the same night: both restarts were run against this wedged panel
 and it stayed deaf — pnputil reported success, the device re-enumerated, HELLO still
@@ -454,7 +555,6 @@ panel simply stops updating and the log says nothing wrong. So the tick body has
 layers of noise:
 
 | what | line | scope |
-|---|---|---|
 | a subsystem raised | `[fault] render raised (3 total): … — the tick continues without it` | `main.Guard` around every external call in the loop; the tick is abandoned, the next one tries again |
 | a thread died | `[fault] thread panel-bring-up raised: …` | `threading.excepthook` — otherwise a crashed rebuild thread just looks like a panel that stopped being retried |
 | start-up failed | `[fatal] Traceback…` | the only death that is still final (unreadable config, missing sensor library, port denied) |
@@ -480,21 +580,28 @@ handler. Add a bare `layout.render(...)` to the loop and the test says so.
 
 `vendor/` holds an **unmodified** copy of turing-smart-screen-python and is
 git-ignored: the upstream tree is 1.1 GB, 1.05 GB of which is theme artwork this
-app never loads. Only `vendor/README.md` (provenance: byte-for-byte upstream
-`main`, CRLF endings) and `vendor/LOCK.txt` (sha256 of the 20 files we import)
-are tracked. On a fresh clone:
+app never loads. What is tracked is the dependency itself — `vendor/LOCK.txt`,
+one upstream commit plus a sha256 for each of the 55 files we import (the
+library, the three theme fonts, and `external/LibreHardwareMonitor`, whose DLL
+`app/sensors/lhm.py` loads), and `vendor/README.md`, which says how that was
+established. On a fresh clone:
 
-```
-powershell -File tools\vendor_lock.ps1 -Fetch     # sparse clone + write LOCK.txt
+powershell -File tools\vendor_lock.ps1 -Fetch     # install the revision LOCK.txt names
 powershell -File tools\vendor_lock.ps1 -Verify    # prove the copy did not drift
-```
+
+`-Fetch` stages a sparse checkout of the pinned commit, verifies it against the
+lock, and only then moves it into place; a failure anywhere leaves the previous
+tree and lock exactly as they were. It cannot write the lock — that is
+`-Update -Sha <40 hex>`, a maintainer moving a dependency, which prints every
+file that moved and refuses a branch name. A lock that says `main` describes
+whatever upstream heads to the next time someone installs, and the `-Verify`
+after it stops meaning anything.
 
 ## Bandwidth budget (it decides what the layout may animate)
 
 A push is **not** `w*h*2` bytes on every revision:
 
 | revision | how a push is encoded | full 800×480 frame | one trend strip (382×40) |
-|---|---|---|---|
 | `TUR_USB` (TURZX) | driver PNG-encodes each push (`send_pil_image_auto`, 1 MB cap) | **~50 KB** | ~3.4 KB |
 | `C` (this panel) | raw BGRA, one `0x00` per 249 payload bytes, 115200-baud CDC port | **1.51 MB ≈ 0.82 s** | ~46 KB ≈ **25 ms** |
 | `A/B/D`, WeAct | raw pixels over the same kind of CDC port | ~750 KB–1.5 MB (same order) | ~30–46 KB |
@@ -512,7 +619,10 @@ Consequence: **the whole screen may redraw every second on this panel**, so the
 1 Hz tick, so the diff transport in `app/output.py` is still what keeps the loop
 comfortable: a typical tick pushes a few bands (~25 ms each), and only the
 burn-in shift, the exercise sweep and the first frame pay the full 0.82 s.
-`layout.trend_bands: false` remains the knob for a genuinely slow link.
+`layout.trend_bands: false` remains the knob for a genuinely slow link. The sweep is
+also opt-in (`burnin.exercise_enabled`, off by default) and now advances one frame per
+control-loop tick, so it cannot spend twelve seconds of that budget ignoring a
+monitor-off, a lock, a suspend or a game start.
 
 ## The panel on this desk (connected 2026-09-23)
 
@@ -520,7 +630,6 @@ Plug it in and the host sees a **hub inside the screen** with two CDC-ACM
 gadgets behind it:
 
 | what | where | role |
-|---|---|---|
 | `1A40:0101` "USB2.0 HUB" | on the root-hub port | the screen's internal hub |
 | `1A86:CA21` "UsbMonitor", serial `CT21INCH` | COM3 | sleeping side: opening it **wakes** the panel |
 | `1D6B:0106` "Android", serial `20080411` | COM4 | the live link — this is the port to talk to |
@@ -563,20 +672,52 @@ problem; the awake gadget only exists once the panel has enumerated properly.
 
    Remove it again with `tools\install_autostart.ps1 -Remove` (elevated). To watch
    what it did: `schtasks /query /tn PCMonitor /v /fo LIST`, and the app's own
-   start-up trace lands in `log.log` next to `main.py`.
+   start-up trace lands in `log.log` next to `main.py` — plus `boot.log`, which is
+   the same story written without the vendored logger, for the case where the
+   vendored logger is part of what went wrong.
+
+   **When it stops.** Three failures, three mechanisms, because they look identical
+   from the outside (a frozen panel) and nothing else:
+
+   * *a fatal start-up* exits non-zero, and the task restarts it — a bounded 3 times
+     per 5 minutes. A bad config is reported once and stays dead: retrying a
+     permanent mistake is how an outage becomes a relaunch loop.
+   * *a crash* is the same path, and `app/liveness.py` keeps the attempts honest.
+   * *a hung loop* cannot report itself — the `[beat]` line is written by the loop
+     that hung, and `ExecutionTimeLimit` is unlimited because this task runs for
+     weeks. So `.heartbeat` is written once per tick and `PCMonitorWatchdog` checks it
+     every 5 minutes; six hundred seconds of silence is a restart, and the whole
+     policy (stall threshold, budget, backoff, `permanent`) is
+     `python -m app.liveness decide`, which is what makes it testable without waiting
+     for a hang. It stops and starts **the task**, never a process, and a deliberate
+     Ctrl-C writes `.stopped` so recovery does not undo it. Incidents go to
+     `watchdog.log`.
+
+   **"Stops any running instance" means this install's instance.** Both the stop and
+   the health check used to ask a filename question — any `python`/`pythonw` whose
+   command line contained `main.py`, force-killed — which on a development machine
+   means somebody else's server, notebook kernel or language server. They now ask
+   `python -m app.owned` instead, which decides from the record the app writes about
+   itself (`.owner`: pid, that instance's creation time, canonical paths, the ETW
+   session its collector owns) and from canonical paths, and *reports and leaves
+   running* anything it cannot positively prove: another project's `main.py`, a
+   directory whose name merely starts with ours, this tree's other scripts, another
+   application's PresentMon, a collector whose parent pid has been recycled, a process
+   whose paths it cannot read. The app is asked to stop (`.stop`, watched once per
+   tick) so it closes its own COM port and its own collector; only an instance that
+   ignores that for 12 s is forced. If the process query itself fails, it stops nothing
+   and says so, rather than concluding that nothing is running.
 
    A healthy start looks like this (the app logs its own banner, because
    `pythonw.exe` has no stdout and every `print()` would otherwise vanish):
 
-   ```
    [start] pid=40092 ppid=50412 backend=LhmBackend revision=C port=AUTO panel=800x480 frames=starting
-   [host] asleep=False(-) monitor=? locked=False console-lost=False idle=- events=console-display,monitor-power,session
+   [host] asleep=False(-) monitor=? locked=False console-lost=False idle=- events=session-display,console-display,monitor-power,session
    [monitor] off: idle 13424s vs 300s display timeout
    [night] night=off src=windows temp=2525K (state enabled=False schedule-now=False, changed 06:25:12; schedule=False sunset-sunrise 21:00-07:00 temp=2525K)
    [frames] presentmon session live — present-based detection on
    [state] game pid=12345 steam=1245620 frames=118 | strong:foreground-presenter (88% of present rows)   # only on idle <-> game changes
    [beat] up=1m00s game light=lit 70 panel=up frames=118 | asleep=False(-) monitor=True locked=False …
-   ```
 
    `[start] panel=800x480` is the configured geometry, not a claim that the panel
    answered — `panel=up/down` in `[beat]` is the live link, and `[beat]` is the proof
@@ -590,20 +731,16 @@ problem; the awake gadget only exists once the panel has enumerated properly.
    and `CallNtPowerInformation(SystemPowerState)` reports the machine's sleep state, not
    the screen's. The lines that only appear when something happens:
 
-   ```
    [light] panel off (asleep) — asleep=True(query-suspend) monitor=? locked=False …
    [resume] gap:412s (auto-suspend) — relinking panel, restarting capture, clearing the game lock
    [panel] link rebuilt (auto-suspend; rebuild #2) — full repaint
    [panel] no screen on start (bring-up said deaf) — continuing anyway, the loop keeps retrying every 10 s
    [panel] restarted the panel's USB port (USB\VID_1D6B&PID_0106&MI_00\8&…) — waiting for it to come back
-   ```
 
    A live-but-empty capture says so instead of going quiet:
 
-   ```
    [frames] no rows from presentmon for 20+ s of rendering (header=no, args: --no_console_stats …);
    child said: printed nothing at all — frame stats stay -- and present-based detection is off
-   ```
 
    Expect **two** `pythonw.exe` PIDs for one app: the venv launcher and the
    interpreter it re-execs. The banner is printed by the real one (`ppid` matches
