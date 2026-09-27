@@ -46,6 +46,8 @@ VENDOR = ROOT / "vendor" / "turing-smart-screen-python"
 CASES = [
     ("frames", ["tools/frames_selftest.py"],
      "present-stream parsing: fps, GPU-busy, held values, stream guards", None, None),
+    ("frames_shutdown", ["tools/frames_shutdown_selftest.py"],
+     "job adoption really happens (native), and close() cannot lose a child to a racing spawn", None, None),
     ("gamewatch", ["tools/gamewatch_selftest.py"],
      "game entry/exit, alt-tab keeps the locked target, video is not a game", None, None),
     ("hoststate", ["tools/hoststate_selftest.py"],
