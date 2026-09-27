@@ -148,8 +148,12 @@ def main() -> int:
         print(f"FAIL — {len(problems)} layout problem(s):")
         for p in problems:
             print("  -", p)
+        print("SELFTEST FAILED: layout")
         return 1
     print("ok — no collisions, no panel overflow, both states, all value extremes")
+    # The gate reads this line rather than trusting the exit code: a check that
+    # stops early can still exit 0, and that looks exactly like a check that ran.
+    print("SELFTEST PASSED")
     return 0
 
 

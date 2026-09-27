@@ -85,11 +85,23 @@ def run(case, only):
         return "skip"
     print(f"----           {selector}: {' '.join(argv)}")
     sys.stdout.flush()
-    proc = subprocess.run([sys.executable, *argv], cwd=str(ROOT))
-    if proc.returncode == 0:
+    proc = subprocess.run([sys.executable, *argv], cwd=str(ROOT),
+                          capture_output=True, text=True, errors="replace")
+    out = (proc.stdout or "") + (proc.stderr or "")
+    sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
+    sys.stdout.flush()
+    if proc.returncode == 0 and "SELFTEST PASSED" in out:
         print(f"PASS           {selector:<11} {proves}  (exit 0)")
         sys.stdout.flush()
         return "pass"
+    if proc.returncode == 0:
+        # Exit 0 is not a verdict. A case that stops early - SystemExit from an
+        # import, an empty main, a vendored module that calls sys.exit(0) when its
+        # own optional dependency is missing - is otherwise indistinguishable from
+        # one that ran every check it has. The house verdict line is the contract.
+        print(f"FAIL           {selector:<11} {proves}  (exit 0 with no SELFTEST PASSED line)")
+        sys.stdout.flush()
+        return "fail"
     if advisory:
         print(f"ADVISORY-FAIL  {selector:<11} {proves}  (exit {proc.returncode})")
         print(f"               not gating: {advisory}")
