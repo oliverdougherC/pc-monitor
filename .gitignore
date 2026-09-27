@@ -11,6 +11,14 @@ lhm_dump.txt
 # specific, and its presence means "a device needs re-enabling" - never a source file.
 .panel_reset_pending
 
+# .owner is the running app saying who it is (pid, creation time, canonical paths, the
+# ETW session its collector owns) so the installer can stop *it* instead of anything with
+# main.py on a command line. .stop is the installer's polite request. Both are per-process
+# runtime state: committing .owner would let one machine's pid be read as another's, and
+# committing .stop would make every checkout shut down seconds after starting.
+.owner
+.stop
+
 # theme/render scratch
 preview/
 shots/

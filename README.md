@@ -39,6 +39,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
 .venv\Scripts\python tools\panel_link_selftest.py     # link survives raise/hang, rebuilds, walks its device ladder
 .venv\Scripts\python tools\fault_selftest.py          # nothing outside the per-tick guard (AST-checked)
+.venv\Scripts\python tools\owned_process_selftest.py  # install/remove stops only what this install owns
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
 ```
 
@@ -66,6 +67,7 @@ state, how many bands a partial panel update would need (same math as
 | `app/layout.py` | 800×480 rendering: permanent top half + mode strip, trend bands, worst-case-fit type, night-mode LUT applied to the finished frame |
 | `app/history.py` | bounded ring buffers feeding the trend bands |
 | `app/output.py` | numpy diff → only changed bands are sent to the panel |
+| `app/owned.py` | which processes this install actually owns: the record the app writes about itself, canonical-path identity, the collector's session, and the graceful-then-bounded stop the installer runs |
 | `app/burnin.py` | 3-px layout shift and the periodic color sweep (brightness/screen-off moved out to `app/lights.py`) |
 | `tools/liveview.py` | dev server: live idle+game two-up, hot-reload, push-cost stats, real present-stream fps |
 | `tools/layout_check.py` | geometry guard: value extremes → collisions / panel overflow |
@@ -77,6 +79,7 @@ state, how many bands a partial panel update would need (same math as
 | `tools/nightlight_probe.py` | prints what Windows actually stores; `--selftest` replays the captured blobs, `--watch 30` follows a manual toggle |
 | `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the disable/enable journaling (including "a refused disable is never followed by an enable") |
 | `tools/lights_selftest.py` | the light decision end to end: sleep, displays-off, idle, dim, precedence, the night cap and LUT, and a rendered frame measured before/after the warmth |
+| `tools/owned_process_selftest.py` | who the installer is allowed to stop: a scripted process list with another project's `main.py`, a similarly named path, this tree's other scripts, a dev-role collector, a recycled parent pid and an unreadable process — plus the graceful-then-forced sequence, with the killer receiving exactly the proven pids |
 | `tools/fault_selftest.py` | the per-tick guard: fallback + one log line per fault, `SystemExit` contained, Ctrl-C not — plus an AST pass that fails if any subsystem call in the loop has escaped the guard |
 | `tools/hoststate_probe.py` | live watcher at 2 Hz: what each power/session event did to the state (`--trace` for raw window messages) |
 | `tools/screen_wake_probe.py` | raw serial HELLO / TURNON / RESTART: is the panel deaf, and does anything bring it back |
@@ -564,6 +567,21 @@ problem; the awake gadget only exists once the panel has enumerated properly.
    Remove it again with `tools\install_autostart.ps1 -Remove` (elevated). To watch
    what it did: `schtasks /query /tn PCMonitor /v /fo LIST`, and the app's own
    start-up trace lands in `log.log` next to `main.py`.
+
+   **"Stops any running instance" means this install's instance.** Both the stop and
+   the health check used to ask a filename question — any `python`/`pythonw` whose
+   command line contained `main.py`, force-killed — which on a development machine
+   means somebody else's server, notebook kernel or language server. They now ask
+   `python -m app.owned` instead, which decides from the record the app writes about
+   itself (`.owner`: pid, that instance's creation time, canonical paths, the ETW
+   session its collector owns) and from canonical paths, and *reports and leaves
+   running* anything it cannot positively prove: another project's `main.py`, a
+   directory whose name merely starts with ours, this tree's other scripts, another
+   application's PresentMon, a collector whose parent pid has been recycled, a process
+   whose paths it cannot read. The app is asked to stop (`.stop`, watched once per
+   tick) so it closes its own COM port and its own collector; only an instance that
+   ignores that for 12 s is forced. If the process query itself fails, it stops nothing
+   and says so, rather than concluding that nothing is running.
 
    A healthy start looks like this (the app logs its own banner, because
    `pythonw.exe` has no stdout and every `print()` would otherwise vanish):

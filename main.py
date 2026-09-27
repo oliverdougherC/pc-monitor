@@ -46,6 +46,7 @@ from app.hoststate import HostState                    # noqa: E402
 from app.layout import Layout                          # noqa: E402
 from app.lights import LightPlanner                    # noqa: E402
 from app.nightlight import NightLight                  # noqa: E402
+from app.owned import clear_record, stop_requested, write_record   # noqa: E402
 from app.output import DiffPusher, wipe, wipe_supported   # noqa: E402
 from app.panel import PanelLink                        # noqa: E402
 from app.power import estimate                         # noqa: E402
@@ -197,6 +198,24 @@ def main() -> None:
         if frames_mon.error:
             status(f"[frames] {frames_mon.error} — frame stats off, legacy detection only")
 
+    # Say who this process is, in the one place the installer is allowed to look.
+    # `tools/install_autostart.ps1` recognised "the app" by a substring of a command
+    # line and force-killed everything that matched — which on any dev machine includes
+    # every other Python program that has a file called main.py. A record written by the
+    # app about itself (this pid, this instance's creation time, canonical paths, and the
+    # ETW session its own collector was told to own) is what turns "stop the app" into a
+    # statement about one specific process instead of one specific filename.
+    session = (frames_mon.session_name if frames_mon is not None
+               else f"PCMonitor-{cfg['frames'].get('role', 'main')}")
+    write_record(session=session,
+                 collector=str(ROOT / str(cfg["frames"].get("presentmon_path", ""))))
+    import atexit
+    atexit.register(clear_record)
+    # A request left behind by a run that died between "stop" and "exited" belonged to
+    # that run. Consumed here, once, or every later start would quit immediately.
+    if stop_requested():
+        status("[stop] cleared a stop request left by a previous run")
+
     panel = None
     pusher = None
     dump_mode = bool(args.dump)
@@ -286,6 +305,13 @@ def main() -> None:
     started = time.monotonic()
     while True:
         t0 = time.monotonic()
+        # A shutdown the installer asked for, taken the normal way. The app closes its
+        # own COM port and stops its own collector on the way out — which a forced stop
+        # never lets it do, and that is exactly where an orphaned ETW session comes from.
+        # Checked at the top of a tick, so the worst-case answer is one interval.
+        if g.run("stop-request", stop_requested, False):
+            status("[stop] shutdown requested — closing the link and exiting cleanly")
+            return
         try:
             snap = hub.tick()
         except Exception as e:  # noqa: BLE001 - a sensor that throws once must not stop the panel
