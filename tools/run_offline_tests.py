@@ -63,6 +63,8 @@ CASES = [
      "geometry at the value extremes: collisions and panel overflow", "fonts", None),
     ("fault", ["tools/fault_selftest.py"],
      "per-tick guard contains faults; AST pass over the loop", None, None),
+    ("owned", ["tools/owned_process_selftest.py"],
+     "install/remove stops this app and its collector, and only those", None, None),
 ]
 
 
