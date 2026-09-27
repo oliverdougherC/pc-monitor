@@ -9,11 +9,25 @@ that hold its state (Bond CompactBinary v1 inside a CloudStore wrapper). That is
 reverse-engineered territory, so the decode is pinned to blobs captured on this
 desk and to the annotated example from the format documentation: if a Windows
 update changes the encoding, `--selftest` fails instead of the panel quietly
-never going amber again.
+never going amber again. The schedule-on, override and missing-endpoint shapes
+are re-encoded by hand into the captured blob's own frame (`wrap`), because the
+combinations that matter — OFF inside an open window, a schedule whose endpoints
+are gone — exist live only on a desk where someone has just changed Night light,
+and the tests must never change this machine's.
 
 `--watch` is for the verification you can only do by hand: run it, toggle Night
 light in Quick Settings (or push its schedule past a transition), and watch
 `enabled`/`temp` follow — the same values the panel will act on.
+
+Two integration contracts are pinned here, because this file is where the merge
+of #14 (manual override), #15 (hold the last confirmed look) and #16 (gamma-ramp
+read) has to keep exactly one of each:
+
+* `NightLight._read_windows` returns exactly five values —
+  ``(on, temp_k, source, detail, state_mtime)`` (see `read_at`).
+* `NightLight.lut(strength, temp_k)` renders the *effective* temperature the
+  planner resolved; it makes no temperature decision of its own (issue #53).
+  `gamma_gains()` returns a `RampReading`, never a bare tuple.
 """
 import argparse
 import sys
@@ -33,6 +47,27 @@ LIVE_STATE_ON = bytes.fromhex(
 LIVE_SETTINGS = bytes.fromhex(
     "434201000A0201002A06A38783D4062A2B0E21"
     "43420100CA140E1500CA1E0E0700CF28BA27CA320E142E0300CA3C0E062E1A00000000")
+
+# The schedule side of the same encoding, re-encoded by hand into the frame
+# `wrap()` builds: field 0 bool 1 (schedule on), field 10 bool 1 ("set hours"),
+# start 21:00 and end 07:00 structs, temperature 2525 K. The captured blob
+# above pins the field numbers and types; this one pins the shape Windows
+# writes when the schedule is *on*, so the override and transition cases below
+# have a real schedule to contradict. Re-encoding the captured frame is the
+# honest stand-in for a second capture: producing these blobs live would mean
+# changing this machine's Night light, which the tests must never do.
+INNER_SETTINGS_SCHED = bytes.fromhex(
+    "434201000201C20A01CA140E1500CA1E0E0700CF28BA2700")
+# "Set hours" is on but fields 20/30 are missing — the endpoints cannot be read.
+INNER_SETTINGS_NO_HOURS = bytes.fromhex("434201000201C20A01CF28BA2700")
+# Sunset→sunrise mode (no field 10) with fields 50/60 missing: no window can
+# honestly be evaluated from this, and inventing 20:00→07:00 would go amber on
+# a guess about where the user lives.
+INNER_SETTINGS_NO_SUN = bytes.fromhex("434201000201CF28BA2700")
+# The schedule-on fixture after a warmth change (field 40 = 2200 K): the panel
+# must read warmth from settings whatever the schedule or state says.
+INNER_SETTINGS_WARM_2200 = bytes.fromhex(
+    "434201000201C20A01CA140E1500CA1E0E0700CF28B02200")
 
 
 def wrap(inner: bytes, ts: int = 1790313464) -> bytes:
@@ -71,6 +106,55 @@ def _drop_field0(inner: bytes) -> bytes:
     """
     assert inner[:6] == bytes.fromhex("434201001000"), inner[:12].hex()
     return inner[:4] + inner[6:]
+
+
+def blind_refresh(n, now: float):       # noqa: ANN001
+    """`refresh` with a pinned monotonic clock.
+
+    Before the fix `refresh` took no clock, so the TypeError *is* the result:
+    "how long have we been holding" could not even be expressed, let alone
+    tested.
+    """
+    try:
+        return n.refresh(now=now)
+    except TypeError:
+        return None
+
+
+def fake_night(state_inner: bytes | None = None, settings_inner: bytes | None = None):
+    """A `NightLight` that reads the fixtures instead of the registry.
+
+    `_blob` is the only door the reader opens onto Windows, so faking it replays
+    any captured pair — including OFF-state-inside-an-open-window, a combination
+    that exists live only on a desk whose Night light someone just turned off.
+    """
+    n = nl.NightLight({}, refresh_s=0.0)
+    blobs: dict[str, bytes] = {}
+    if state_inner is not None:
+        blobs[nl._STATE_KEY] = wrap(state_inner)
+    if settings_inner is not None:
+        blobs[nl._SETTINGS_KEY] = wrap(settings_inner)
+    n._blob = lambda key: blobs.get(key)
+    return n
+
+
+def read_at(n, hhmm: str):        # noqa: ANN001
+    """`_read_windows` with a pinned clock, returning its ONE documented contract.
+
+    ``(on, temp_k, source, detail, state_mtime)`` — five values, because the
+    merged `_read_windows` publishes the CloudStore write time alongside the
+    state (#15) *and* keeps the manual override authoritative (#14). The unpack
+    here is the whole contract: a four-value reader no longer exists, so a
+    regression that drops the timestamp fails loudly rather than silently.
+
+    Before the #14 fix the method read the wall clock and took no clock
+    argument, so the TypeError *is* the result: the contradiction the issue
+    describes could not even be evaluated deterministically.
+    """
+    try:
+        return n._read_windows(now=time.strptime(hhmm, "%H:%M"))
+    except TypeError:
+        return None, None, "no pinned clock", "TypeError", 0.0
 
 
 def selftest() -> int:
@@ -134,6 +218,184 @@ def selftest() -> int:
                                                       time.strptime("23:00", "%H:%M")), True)
     check("config fallback outside", nl._in_clock_range("21:00-07:00",
                                                         time.strptime("09:00", "%H:%M")), False)
+
+    print("case: a transient read failure keeps the last confirmed appearance (issue #15)")
+    # `getattr(n, "stale", ...)`-style reads: before the fix these attributes
+    # do not exist, and the selftest should report FAIL lines, not crash.
+    inner_on = nl.unwrap(LIVE_STATE_ON)[1]
+    inner_off = _drop_field0(inner_on)
+    blobs = {nl._STATE_KEY: LIVE_STATE_ON, nl._SETTINGS_KEY: LIVE_SETTINGS}
+    # check_gamma_ramp off: these cases pin the state-store behaviour, and the
+    # gamma ramp is this desk's second opinion, not a fixture.
+    n = nl.NightLight({"night": {"hold_grace_s": 300, "check_gamma_ramp": False}},
+                      refresh_s=0.0)
+    n._blob = lambda key: blobs.get(key)
+    blind_refresh(n, 100.0)
+    check("established from the live blob", (n.on, n.temp_k, n.source),
+          (True, 2525, "windows"))
+    check("the appearance records when Windows wrote the state",
+          bool(getattr(n, "appearance", None))
+          and 1760000000 < n.appearance.state_mtime < 1900000000, True)
+
+    # The acceptance injections: a missing key, a torn/truncated blob, a read
+    # exception, a settings-only failure. For every shape the panel must not
+    # even briefly see day brightness: the held appearance keeps on/temp/gains
+    # identical until a *confirmed* read replaces them.
+    blobs.clear()
+    blind_refresh(n, 103.0)
+    check("missing keys hold the appearance",
+          (n.on, n.temp_k, getattr(n, "stale", None)), (True, 2525, True))
+    check("the detail explains the hold", "holding last confirmed" in n.detail, True)
+    blobs[nl._STATE_KEY] = LIVE_STATE_ON[:20]        # torn / truncated wrapper
+    blind_refresh(n, 106.0)
+    check("a torn blob holds too",
+          (n.on, n.temp_k, getattr(n, "stale", None)), (True, 2525, True))
+
+    def boom(key):                                   # noqa: ANN001
+        raise OSError("CloudStore key vanished mid-read")
+
+    n._blob = boom
+    blind_refresh(n, 109.0)
+    check("a raising read holds too",
+          (n.on, n.temp_k, getattr(n, "stale", None)), (True, 2525, True))
+    check("and names the failure", "read failed" in n.detail, True)
+
+    # Settings-only failure: the state is readable, the warmth is not. The
+    # appearance must stay coherent - the new state never mixes with the old
+    # temperature silently, and says where the warmth came from.
+    n._blob = lambda key: blobs.get(key)
+    blobs.clear()
+    blobs[nl._STATE_KEY] = LIVE_STATE_ON
+    blind_refresh(n, 112.0)
+    check("new state, warmth held from the last good read",
+          (n.on, n.temp_k, getattr(n, "stale", None)), (True, 2525, False))
+    check("and the detail says so", "warmth held" in n.detail, True)
+
+    # A confirmed OFF must still apply promptly, whatever came before it.
+    blobs.clear()
+    blobs[nl._STATE_KEY] = wrap(inner_off)
+    blobs[nl._SETTINGS_KEY] = LIVE_SETTINGS
+    blind_refresh(n, 115.0)
+    check("a later confirmed OFF applies promptly",
+          (n.on, n.temp_k, getattr(n, "stale", None)), (False, 2525, False))
+
+    # Blind again after that, and the hold is the OFF: unknown must never
+    # resurrect an old warmth.
+    n._blob = lambda key: None
+    check("the OFF is logged", n.changed_to_log() is not None, True)
+    blind_refresh(n, 118.0)
+    check("holding an OFF: still off, marked stale",
+          (n.on, getattr(n, "stale", None)), (False, True))
+    line = n.changed_to_log()
+    check("entering the hold logs exactly one line",
+          line is not None and "holding" in line, True)
+    blind_refresh(n, 150.0)
+    check("a steady failure logs nothing more", n.changed_to_log(), None)
+    blind_refresh(n, 600.0)          # 482 s blind: past hold_grace_s
+    check("grace expiry never brightens the panel", (n.on, n.temp_k), (False, 2525))
+    line = n.changed_to_log()
+    check("the expiry policy is stated once",
+          line is not None and "hold_grace_s" in line, True)
+    blind_refresh(n, 603.0)
+    check("and then it stays quiet", n.changed_to_log(), None)
+
+    print("case: startup with no prior valid state (nothing to hold)")
+    m = nl.NightLight({"night": {"check_gamma_ramp": False}}, refresh_s=0.0)
+    m._blob = lambda key: None
+    blind_refresh(m, 10.0)
+    check("startup with nothing known is unknown, not off",
+          (m.on, m.source, getattr(m, "stale", None)), (None, "unknown", False))
+    check("and says there was nothing to hold", "nothing confirmed to hold" in m.detail,
+          True)
+    check("no appearance was invented", getattr(m, "appearance", "x"), None)
+    q = nl.NightLight({"night": {"mode": "on", "color_temp_k": 2700}}, refresh_s=0.0)
+    q._blob = lambda key: None
+    blind_refresh(q, 10.0)
+    check("config mode on establishes an appearance",
+          (q.on, q.temp_k, q.source), (True, 2700, "config"))
+
+    print("case: the schedule fixture decodes as an enabled set-hours window")
+    se2 = nl.parse_settings(INNER_SETTINGS_SCHED)
+    check("schedule enabled", (se2 or {}).get("schedule"), True)
+    check("set hours", (se2 or {}).get("set_hours"), True)
+    check("start", (se2 or {}).get("start"), (21, 0))
+    check("end", (se2 or {}).get("end"), (7, 0))
+    check("temp", (se2 or {}).get("temp_k"), 2525)
+    for hhmm, want in (("20:59", False), ("21:00", True), ("06:59", True), ("07:00", False)):
+        h, m = (int(x) for x in hhmm.split(":"))
+        check(f"{hhmm} in 21:00-07:00 window", nl._in_window(h * 60 + m, se2), want)
+
+    print("case: a decoded OFF outranks an open schedule window (issue #14)")
+    state_on = nl.unwrap(LIVE_STATE_ON)[1]
+    state_off = _drop_field0(state_on)
+    # The deterministic contradiction from the issue: the state blob says OFF
+    # (field 0 absent — exactly what Windows writes when you turn Night light
+    # off by hand for the rest of the window) while the schedule is open. The
+    # OFF is the effective state and must win; OR-ing the window back in is
+    # what kept the panel amber after the user had turned the light off.
+    on, temp, src, det, _mtime = read_at(fake_night(state_off, INNER_SETTINGS_SCHED), "22:00")
+    check("OFF inside an open window stays OFF", on, False)
+    check("answer came from the effective state", src, "windows")
+    check("detail names the honoured override", "override" in det, True)
+    check("warmth still comes from settings", temp, 2525)
+    # …and turning it back on by hand inside the same window must go warm again.
+    on, temp, src, det, _mtime = read_at(fake_night(state_on, INNER_SETTINGS_SCHED), "22:00")
+    check("manual ON inside the window is ON", on, True)
+    check("still from the effective state", src, "windows")
+    # Windows rewrites the state blob at each scheduled transition, so the
+    # boundary crossings follow it, not a re-derived window.
+    for hhmm, enabled in (("20:59", False), ("21:00", True), ("06:59", True), ("07:00", False)):
+        on, temp, src, det, _mtime = read_at(
+            fake_night(state_on if enabled else state_off, INNER_SETTINGS_SCHED), hhmm)
+        check(f"{hhmm}: follows the transition state", on, enabled)
+        check(f"{hhmm}: provenance is the state", src, "windows")
+
+    print("case: with no state blob, the schedule is the honest source — and says so")
+    on, temp, src, det, _mtime = read_at(fake_night(None, INNER_SETTINGS_SCHED), "22:00")
+    check("inside window → on", on, True)
+    check("provenance says schedule inference", src, "windows-schedule")
+    on, temp, src, det, _mtime = read_at(fake_night(None, INNER_SETTINGS_SCHED), "12:00")
+    check("outside window → off", on, False)
+    check("provenance still says schedule inference", src, "windows-schedule")
+
+    print("case: unreadable endpoints → unknown, never an invented window")
+    check("set-hours without start/end",
+          nl._in_window(22 * 60, nl.parse_settings(INNER_SETTINGS_NO_HOURS)), None)
+    check("sunset mode without sunset/sunrise",
+          nl._in_window(22 * 60, nl.parse_settings(INNER_SETTINGS_NO_SUN)), None)
+    on, temp, src, det, _mtime = read_at(fake_night(None, INNER_SETTINGS_NO_HOURS), "22:00")
+    check("no guess is made", on, None)
+    check("provenance is unknown", src, "unknown")
+    check("detail admits it did not guess", "not guessing" in det, True)
+    on, temp, src, det, _mtime = read_at(fake_night(None, None), "22:00")
+    check("nothing readable → unknown", (on, src), (None, "unknown"))
+
+    print("case: warmth follows the settings blob whatever the state says")
+    check("2200 K decodes", nl.parse_settings(INNER_SETTINGS_WARM_2200).get("temp_k"), 2200)
+    on, temp, src, det, _mtime = read_at(fake_night(state_off, INNER_SETTINGS_WARM_2200), "22:00")
+    check("temperature reported alongside an OFF state", temp, 2200)
+    check("state still decides on/off", on, False)
+
+    print("case: _read_windows publishes exactly ONE contract (5 values)")
+    got = read_at(fake_night(state_on, INNER_SETTINGS_SCHED), "22:00")
+    check("five values, in the documented order", len(got), 5)
+    check("the last one is the CloudStore write time", 1760000000 < got[4] < 1900000000, True)
+    check("and the first four are still on/temp/source/detail",
+          (got[0], got[1], got[2], isinstance(got[3], str)), (True, 2525, "windows", True))
+
+    print("case: lut() renders the temperature it is handed (issue #53)")
+    # The defect: the planner resolved 2700 K for *reporting* while `lut()` asked
+    # its own `None` temperature and returned no LUT, so the panel reported a
+    # night temperature and rendered nothing. There is one temperature decision
+    # and it arrives as this argument; no independent `self.temp_k` read is left.
+    bare = nl.NightLight({}, refresh_s=0.0)
+    check("no effective temperature handed in → no LUT", bare.lut(1.0), None)
+    check("the planner's 2700 K fallback renders",
+          bare.lut(1.0, 2700), nl.warm_lut(2700, 1.0))
+    check("a 2700 K LUT is not None", bare.lut(1.0, 2700) is not None, True)
+    check("a warmer effective temperature warms further",
+          bare.lut(1.0, 2200)[767] < bare.lut(1.0, 2700)[767], True)
+    check("no gains, no temperature → still nothing", bare.lut(1.0, None), None)
 
     print("case: the warm LUT is a colour temperature, not a hue tint")
     g65 = nl.temp_gains(6500)
