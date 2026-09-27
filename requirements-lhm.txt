@@ -1,0 +1,18 @@
+# The LibreHardwareMonitor backend's extra, on top of the reviewed set.
+#
+#    .venv\Scripts\python -m pip install -r requirements-lhm.txt
+#
+# `app/sensors/lhm.py` imports `clr`, which comes from pythonnet, and loads
+# vendor/turing-smart-screen-python/external/LibreHardwareMonitor/LibreHardwareMonitorLib.dll
+# through it. Without this the app still runs — it falls back to psutil, and the panel
+# shows `--` for CPU temperature and package power — so it is a separate file rather
+# than a line in requirements.txt. The elevated scheduled task exists largely to give
+# this backend its ring0 access, so `tools\install_autostart.ps1` asks for it and
+# refuses to register a task that would silently do less than the user asked for.
+#
+# The DLL is not a pip package: it is vendored, pinned by sha256 in vendor/LOCK.txt,
+# and fetched by `tools\vendor_lock.ps1 -Fetch`. Having pythonnet without the DLL gets
+# you a start-up error about a missing file, which is what `tools\env_check.py` checks
+# for.
+-r requirements.txt
+pythonnet==3.1.0

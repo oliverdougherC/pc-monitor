@@ -9,7 +9,33 @@ probe.txt
 lhm_dump.txt
 # Journal of an in-progress USB disable/enable (app/panel.py). Transient, machine
 # specific, and its presence means "a device needs re-enabling" - never a source file.
+# It now lives under %LOCALAPPDATA%\PCMonitor; this name is kept ignored because it is
+# where the journal used to be written, and a leftover from an older run must never be
+# committed by whoever happens to clean up after one.
 .panel_reset_pending
+
+# The observer's three files (app/liveness.py): the beat the watchdog reads, the marker
+# saying a shutdown was on purpose, and the restart budget. All per-machine runtime
+# state - and committing the stop marker would let one developer's Ctrl-C silently
+# disable recovery on every machine that later checks out this branch.
+.heartbeat
+.stopped
+.restarts
+
+# boot.log is the diagnostic path that still works with no vendored logger
+# (app/bootlog.py), so it is written on every start; watchdog.log is the observer's
+# incident record. Both are logs, not sources.
+boot.log
+watchdog.log
+watchdog.log.old
+
+# .owner is the running app saying who it is (pid, creation time, canonical paths, the
+# ETW session its collector owns) so the installer can stop *it* instead of anything with
+# main.py on a command line. .stop is the installer's polite request. Both are per-process
+# runtime state: committing .owner would let one machine's pid be read as another's, and
+# committing .stop would make every checkout shut down seconds after starting.
+.owner
+.stop
 
 # theme/render scratch
 preview/
@@ -30,3 +56,8 @@ shots/
 !/vendor/presentmon/
 /vendor/presentmon/*
 !/vendor/presentmon/LOCK.txt
+
+# The integration workspace: scratch merge/resolve scripts and gate transcripts from
+# assembling this branch out of the per-issue PRs. Working notes, not sources - the
+# suites that came out of them live in tools/ where the gate can run them.
+.integ/

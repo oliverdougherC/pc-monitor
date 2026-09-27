@@ -1,0 +1,28 @@
+# What the app and its offline tests import, pinned exactly.
+#
+#    .venv\Scripts\python -m pip install -r requirements.txt
+#
+# Every line is `==`, on purpose. A fresh checkout is supposed to reproduce the
+# environment the code was reviewed against, and `>=` reproduces whatever the index
+# serves that day. When one of these is deliberately moved, change the line, run the
+# offline gate, and commit the line — that diff is the dependency-change record this
+# repository did not used to have.
+#
+# Keep this list honest: `tools\env_check.py --manifest` fails if `app/` or `tools/`
+# imports something that is not named here, or if a line stops being an exact pin. It
+# is a gating case in `tools\run_offline_tests.py`, so the drift is caught by CI and
+# not by the next person to clone.
+#
+# Requires Python 3.10 or newer: several modules write `str | None` without
+# `from __future__ import annotations`, so the union is evaluated at import time.
+# Development, and the offline gate, use 3.12.
+#
+# Import name and pip name are not the same language: PIL is pillow, serial is
+# pyserial, pynvml is nvidia-ml-py. The mapping lives in tools/env_check.py.
+numpy==2.5.3
+nvidia-ml-py==13.610.43
+pillow==12.3.0
+psutil==7.2.2
+pyserial==3.5
+pyusb==1.3.1
+PyYAML==6.0.3
