@@ -27,6 +27,7 @@ from __future__ import annotations
 import csv
 import ctypes
 import io
+import math
 import os
 import subprocess
 import threading
@@ -46,6 +47,11 @@ _STREAM_SILENT_S = 20.0         # header up but no rows for this long → say so
 _SESSION_SETTLE_S = 2.5         # grace after stopping a previous run's session, see _reclaim_session
 _RESTART_MAX_S = 60.0           # backoff ceiling for a capture that keeps dying
 _HEALTHY_S = 120.0              # alive this long with rows → the streak of failures resets
+_EXIT_REAP_S = 5.0              # per step of terminate → wait → kill → reap: a child
+                                # with an undrained pipe blocks mid-write forever, and
+                                # an unbounded wait on it wedges the supervisor with it
+_BAD_SAMPLES = 3                # malformed rows kept verbatim for the log; the count
+                                # is free, the storage is not, so it is bounded
 # Present modes worth distinguishing, from the column of the same name. `Hardware:`
 # without "Composed" is a true exclusive-flip path; everything else goes through the
 # compositor like any other window. dwm.exe's own rows are the compositor presenting
@@ -267,6 +273,8 @@ class FrameMonitor:
         self.header: list[str] = []         # CSV columns as they actually arrived
         self.rows = 0                       # data rows seen after the header
         self.parsed = 0                     # … of those, the ones we could ingest
+        self.bad_rows = 0                   # … and the ones rejected as malformed
+        self._bad: list[str] = []           # up to _BAD_SAMPLES of them, verbatim
         self.silent_busy_s = 0.0            # seconds of "GPU busy, stream empty"
         self.last_args: list[str] = []      # spawn line, for the log/warning text
         self.starts = 0                     # successful spawns, including restarts
@@ -363,11 +371,20 @@ class FrameMonitor:
                 continue
             self.starts += 1
             self._proc = proc
+            failure = None
             try:
                 self._read_stream(proc)
-            except Exception:  # noqa: BLE001 - never let a parse bug kill the stream silently
-                pass
-            rc = proc.wait()
+            except Exception as e:  # noqa: BLE001 - a faulting reader must not die silently
+                failure = repr(e)
+            if failure is not None:
+                # The reader is gone but the child may still be alive and
+                # writing into a pipe nobody drains: it fills the buffer and
+                # blocks mid-write, and the old silent `pass` followed by an
+                # unbounded proc.wait() then waited on it forever - one wedged
+                # capture became a wedged supervisor, reporting `live` while
+                # doing nothing. Say so, and reap on a bound before retrying.
+                self._fail(f"presentmon reader failed: {failure}")
+            rc = self._reap(proc)
             if self._stop.is_set():
                 return
             alive = time.monotonic() - t_start
@@ -382,11 +399,50 @@ class FrameMonitor:
             self._streak += 1
             delay = min(_RESTART_MAX_S, 2.0 ** min(self._streak, 6))
             self.ok = False
-            tail = " | ".join(self._out[-3:]) or f"exit code {rc}"
-            self.error = (f"presentmon exited after {alive:.0f}s: {tail} — retrying in "
-                          f"{delay:.0f}s (attempt {self._streak})")
+            if failure is not None:
+                reaped = (f"reaped, exit {rc}" if rc is not None
+                          else "ignored even kill; the job object holds it")
+                self.error = (f"presentmon reader failed: {failure} — child {reaped}, "
+                              f"retrying in {delay:.0f}s (attempt {self._streak})")
+            else:
+                tail = " | ".join(self._out[-3:]) or f"exit code {rc}"
+                self.error = (f"presentmon exited after {alive:.0f}s: {tail} — retrying in "
+                              f"{delay:.0f}s (attempt {self._streak})")
             if self._stop.wait(delay):
                 return
+
+    def _reap(self, proc: subprocess.Popen) -> int | None:
+        """Bounded terminate → wait → kill → reap; None if it still refused to die.
+
+        Every caller reaches this only when the reader is done with the child:
+        either its output hit EOF or the reader died with the pipe undrained.
+        A child still writing then blocks on the pipe buffer forever, so the
+        wait here may never run past its bound - if even TerminateProcess is
+        ignored (a process stuck in a kernel call), kill it, and if that too
+        goes unanswered, walk away: the kill-on-close job object is the last
+        backstop, and a supervisor parked beside a corpse serves no future
+        capture.
+        """
+        rc = proc.poll()
+        if rc is not None:
+            return rc
+        self.ok = False
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        try:
+            return proc.wait(_EXIT_REAP_S)
+        except subprocess.TimeoutExpired:
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            return proc.wait(_EXIT_REAP_S)
+        except subprocess.TimeoutExpired:
+            return None
 
     def restart(self, reason: str = "") -> None:
         """Throw the capture away and open a clean one. Called after a resume.
@@ -401,7 +457,8 @@ class FrameMonitor:
             self._rings.clear()
             self._pids.clear()
             self._pid_t.clear()
-        self.rows = self.parsed = 0
+        self.rows = self.parsed = self.bad_rows = 0
+        self._bad = []
         self._held.clear()
         self._last_t = 0.0
         self.ok = False
@@ -436,33 +493,70 @@ class FrameMonitor:
                 continue
             self.rows += 1
             self._last_row = time.monotonic()
-            self._ingest(row, idx)
+            # One bad row is a row, not a stream fault: reject it individually
+            # and keep reading. An IndexError used to escape _ingest from the
+            # row it had only half-validated (pid and time by, SwapChainAddress
+            # missing), the reader died with the child still streaming, and the
+            # supervisor's unbounded wait inherited the wedge - a truncated
+            # line could end the capture for the rest of the session.
+            try:
+                ok = self._ingest(row, idx)
+                why = None
+            except Exception as e:  # noqa: BLE001 - isolate the row, keep the stream
+                ok, why = False, repr(e)
+            if not ok:
+                self.bad_rows += 1
+                if len(self._bad) < _BAD_SAMPLES:
+                    self._bad.append(((why + " ") if why else "") + ",".join(row)[:160])
 
-    def _ingest(self, row: list[str], idx: dict[str, int]) -> None:
+    def _ingest(self, row: list[str], idx: dict[str, int]) -> bool:
         # Time by name, never by position: the pre-name-lookup version read
         # row[-1], which on this header is MsClickToPhotonLatency — a mostly-empty
         # unrelated column, which is how "fps never appears" survived as long as
         # it did. _TIME_COL says which column and why; TimeInSeconds is a trap
         # (measured: consecutive re9 rows at 48 fps advanced it by +20.8
         # *seconds* per frame, and its origin differs per process).
+        #
+        # Every accessed field is position-checked before it is indexed, and
+        # the required schema is checked by name first: SwapChainAddress,
+        # PresentMode and Application used to be indexed directly after a try
+        # block that covered only pid and time, so a row truncated by a killed
+        # writer raised IndexError out of here and took the reader with it.
+        # The issue's minimal shape - header ProcessID=0, CPUStartQPCTimeInMs=1,
+        # SwapChainAddress=2, row ['123', '1000'] - reproduced it on demand.
+        jp = idx.get("ProcessID")
         i = idx.get(_TIME_COL)
+        if jp is None or i is None or jp >= len(row) or i >= len(row):
+            return False
         try:
-            pid = int(row[idx["ProcessID"]])
-            t = float(row[i]) if i is not None and i < len(row) else None
-        except (ValueError, IndexError):
-            return
-        if t is None:
-            return
+            pid = int(row[jp])
+            t = float(row[i])
+        except ValueError:
+            return False
+        if not math.isfinite(t):
+            # NaN or ±Inf on the clock poisons everything downstream: max()
+            # turns _last_t into a NaN that never recovers, every age computes
+            # as NaN or ±Inf, and the damage outlives the row that caused it.
+            # Dropping the row is the only safe reading.
+            return False
+        # A row that ends before a column the header declares was cut off
+        # mid-write: guessing SwapChainAddress would key a real frame to a
+        # swapchain that never made it, blending it into a ghost ring. The
+        # defaults in _s are for columns the *schema* does not have at all.
+        for col in ("SwapChainAddress", "PresentMode", "Application"):
+            j = idx.get(col)
+            if j is not None and j >= len(row):
+                return False
         between = self._f(row, idx, "MsBetweenPresents")
         display = self._f(row, idx, "MsBetweenDisplayChange")
-        swap = row[idx["SwapChainAddress"]] if "SwapChainAddress" in idx else "-"
+        swap = self._s(row, idx, "SwapChainAddress", "-")
         # GPU busyness for this frame, as a percentage of the frame's own span.
         busy = self._f(row, idx, "MsGPUBusy")
         span = between or self._f(row, idx, "MsGPUTime")
         gpu = max(0.0, min(100.0, 100.0 * busy / span)) if busy and span else None
         mode = 0
         if "PresentMode" in idx:
-            m = (row[idx["PresentMode"]] or "").strip().lower()
+            m = self._s(row, idx, "PresentMode", "").strip().lower()
             mode = 1 if m in _MODE_EXCLUSIVE else 0
         now = time.monotonic()
         with self._lock:
@@ -470,13 +564,24 @@ class FrameMonitor:
             self._last_t = max(self._last_t, t)
             self._pid_t[pid] = t
             if pid not in self._pids:
-                self._pids[pid] = (row[idx["Application"]] if "Application" in idx
-                                   else "?")
+                self._pids[pid] = self._s(row, idx, "Application", "?")
             key = (pid, swap)
             ring = self._rings.get(key)
             if ring is None:
                 ring = self._rings[key] = deque(maxlen=_MAX_SAMPLES)
             ring.append((t, between, display, now, gpu, mode))
+        return True
+
+    @staticmethod
+    def _s(row: list[str], idx: dict[str, int], col: str, default: str) -> str:
+        """One column as text, position-checked. The default covers columns
+        the schema does not declare at all (a 1.x-style header, a stripped
+        diagnostic run); a row truncated before a column the schema *does*
+        declare is rejected by _ingest before ever getting here."""
+        i = idx.get(col)
+        if i is None or i >= len(row):
+            return default
+        return row[i]
 
     @staticmethod
     def _f(row: list[str], idx: dict[str, int], col: str) -> float | None:
@@ -488,9 +593,11 @@ class FrameMonitor:
             return None
         try:
             f = float(v)
-            return f if f > 0 else None
         except ValueError:
             return None
+        # finite and positive only: +Inf parses, sails past `f > 0`, and then
+        # rides the median and the 1%/0.1% percentiles as a real frametime.
+        return f if f > 0 and math.isfinite(f) else None
 
     def _fail(self, msg: str) -> None:
         self.ok = False
@@ -522,9 +629,11 @@ class FrameMonitor:
             # Print every column: the first real capture put the time column at
             # index 15, so a truncated list hid exactly the name that was wrong.
             cols = ",".join(self.header)
+            bad = (f"; {self.bad_rows} rejected as malformed, e.g. {self._bad[0]!r}"
+                   if self.bad_rows else "")
             return (f"[frames] {self.rows} rows arrived, none parsed — this CSV has no "
                     f"{_TIME_COL} column, so there is no millisecond clock to bucket "
-                    f"by (we pass --qpc_time_ms to get it). Columns: {cols}")
+                    f"by (we pass --qpc_time_ms to get it). Columns: {cols}{bad}")
         if self.silent_busy_s > _STREAM_SILENT_S:
             # No live counter in here: main.py logs each *distinct* warning once,
             # and a number that ticks would rewrite the line every second. Quote
