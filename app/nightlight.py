@@ -15,7 +15,10 @@ its values as Microsoft Bond CompactBinary v1 payloads):
 Both are an outer CloudStore wrapper (metadata struct + a Unix timestamp + the
 payload as a list<int8>) whose payload is *itself* a marshaled CB struct:
 
-  state    field 0  int32   PRESENT ⇒ night light is force-enabled right now
+  state    field 0  int32   PRESENT ⇒ night light is being applied right now;
+           Windows rewrites it at every scheduled transition and on every
+           manual toggle, so a hand-turned-off reads OFF even inside an open
+           schedule window
            field 10 int32   initialized (always 1)
            field 20 uint64  FILETIME of the last on/off transition
   settings field 0  bool    a schedule is enabled
@@ -293,7 +296,21 @@ class NightLight:
         except OSError:
             return None       # absent value = the feature has never been touched
 
-    def _read_windows(self) -> tuple[bool | None, int | None, str]:
+    def _read_windows(self, now=None) -> tuple[bool | None, int | None, str, str]:
+        """(on, temp_k, source, detail) — state, override and schedule kept apart.
+
+        The state blob is the *effective* state: what Windows is applying to the
+        display right now, rewritten at every scheduled transition and at every
+        manual toggle. The settings blob is *configuration* — the schedule the
+        user set and the warmth they chose — and configuration is not state:
+        a manual "off for the rest of this window" is written into the state
+        blob and nowhere else, so the schedule must never be OR-ed onto a
+        decoded OFF. The schedule is consulted only when there is no state blob
+        at all, and only when its own endpoints are readable. The returned
+        source says which of these the answer came from. `now` is a
+        `time.struct_time` for deterministic tests; the live reader takes the
+        wall clock.
+        """
         state = settings = None
         try:
             raw = self._blob(_STATE_KEY)
@@ -308,34 +325,45 @@ class NightLight:
         except CBError:
             settings = None
         temp = settings.get("temp_k") if settings else None
-        if state is not None:
-            # `enabled` is what Windows has applied *right now*: it flips on a
-            # manual toggle and on each scheduled transition. The window computed
-            # from `settings` is OR-ed in rather than trusted or ignored: it is
-            # what the user's own schedule says, so it can only ever agree with
-            # an intent they set, and it covers a build where the state blob
-            # tracks only the manual toggle.
+        if now is None:
             now = time.localtime()
-            mins = now.tm_hour * 60 + now.tm_min
-            sched = bool(settings and settings["schedule"] and _in_window(mins, settings))
-            on = bool(state["enabled"]) or sched
-            det = f"state enabled={state['enabled']} schedule-now={sched}"
+        mins = now.tm_hour * 60 + now.tm_min
+        if state is not None:
+            # The decoded state is authoritative, override included: turning
+            # Night light off by hand inside a scheduled window writes field 0
+            # absent, and that OFF holds until the next scheduled transition.
+            # The old code OR-ed the open window onto it, so the panel stayed
+            # amber straight through the user's own "off" — and the comment
+            # here claimed the schedule could only ever agree with intent,
+            # which is exactly what an override does not do.
+            on = bool(state["enabled"])
+            det = f"effective state: enabled={on}"
+            if not on and settings and settings["schedule"] \
+                    and _in_window(mins, settings) is True:
+                det += ("; schedule window is open but Windows says OFF - "
+                        "honouring the manual override")
             if state.get("last_change"):
                 det += ", changed " + time.strftime("%H:%M:%S", state["last_change"])
             if settings:
-                det += (f"; schedule={settings['schedule']} "
+                det += (f"; config: schedule={settings['schedule']} "
                         f"{'set-hours' if settings['set_hours'] else 'sunset-sunrise'}"
                         f" {_hhmm(settings['start'])}-{_hhmm(settings['end'])} temp={temp}K")
             return on, temp, "windows", det
         if settings and settings["schedule"]:
-            # No state blob but a schedule we can evaluate ourselves: honest,
-            # and it keeps night mode working on a build that stores state
-            # somewhere we cannot read.
-            now = time.localtime()
-            mins = now.tm_hour * 60 + now.tm_min
+            # No state blob but a schedule we can evaluate ourselves: honest
+            # inference on a build that stores state somewhere we cannot read —
+            # and it says `windows-schedule` so nobody mistakes it for state.
+            # Without readable endpoints there is nothing to infer from:
+            # inventing 21:00→07:00 (or a sunset for the user's longitude)
+            # would go amber on a guess, so we degrade to unknown instead.
             win = _in_window(mins, settings)
-            det = (f"no state blob; schedule {_hhmm(settings['start'])}-"
-                   f"{_hhmm(settings['end'])} now={now.tm_hour:02d}:{now.tm_min:02d} "
+            if win is None:
+                return None, temp, "unknown", ("schedule is enabled but its endpoints "
+                                               "are unreadable; not guessing a window")
+            start, end = ((settings["start"], settings["end"]) if settings["set_hours"]
+                          else (settings["sunset"], settings["sunrise"]))
+            det = (f"no state blob; inferred from schedule {_hhmm(start)}-"
+                   f"{_hhmm(end)} now={now.tm_hour:02d}:{now.tm_min:02d} "
                    f"{'in' if win else 'outside'} window")
             return win, temp, "windows-schedule", det
         return None, temp, "unknown", "no readable night-light state in CloudStore"
@@ -412,23 +440,27 @@ class NightLight:
         return "[night] " + self.describe()
 
 
-def _mins(hm: tuple | None, default: int) -> int:
-    return default if hm is None else hm[0] * 60 + hm[1]
-
-
 def _hhmm(hm: tuple | None) -> str:
     """`(21, 30)` → `"21:30"`, `None` → `--:--`: log lines are read at arm's length,
     and a Python tuple full of commas does not scan as a time."""
     return "--:--" if hm is None else f"{hm[0]:02d}:{hm[1]:02d}"
 
 
-def _in_window(mins: int, s: dict) -> bool:
-    """True inside the schedule, including a window that wraps past midnight."""
-    start = _mins(s.get("start"), 21 * 60) if s.get("set_hours", True) \
-        else _mins(s.get("sunset"), 20 * 60)
-    end = _mins(s.get("end"), 7 * 60) if s.get("set_hours", True) \
-        else _mins(s.get("sunrise"), 7 * 60)
-    return (mins >= start or mins < end) if start > end else (start <= mins < end)
+def _in_window(mins: int, s: dict) -> bool | None:
+    """True inside the schedule, False outside, None when it cannot be told.
+
+    A window that wraps past midnight is normal (21:00→07:00). None means the
+    endpoints the schedule needs are not readable — and there is no honest
+    default for them: 21:00→07:00 is a guess about when the user wants warmth,
+    and a fixed 20:00 sunset is a guess about where they live. Callers must
+    treat None as "do not infer", never as a convenient False or True.
+    """
+    start, end = (s.get("start"), s.get("end")) if s.get("set_hours", True) \
+        else (s.get("sunset"), s.get("sunrise"))
+    if start is None or end is None:
+        return None
+    a, b = start[0] * 60 + start[1], end[0] * 60 + end[1]
+    return (mins >= a or mins < b) if a > b else (a <= mins < b)
 
 
 def _in_clock_range(spec: str, now) -> bool:
