@@ -10,7 +10,11 @@ auto-refreshing browser page:
 
 Then open http://localhost:5680. `app/layout.py`, `app/power.py` and
 `config.yaml` are hot-reloaded when they change on disk, so editing the layout
-shows up in the browser within a tick — no restart, no refresh needed.
+shows up in the browser within a tick — no restart, no refresh needed. The
+reload is transactional: a broken edit is refused and the previous working
+generation keeps rendering, with the error on screen until a complete valid
+one is running — and the config watched is the one actually requested
+(`--config`), not always the repo default.
 
 Per-state "push" stats (changed-pixel fraction + how many bands a partial
 update would need) are reported the same way app/output.py would do it, so the
@@ -25,6 +29,7 @@ width*height*2 is what a 115200-baud serial revision receives.
 from __future__ import annotations
 
 import argparse
+import copy
 import io
 import json
 import sys
@@ -51,13 +56,13 @@ from app.frames import FrameMonitor  # noqa: E402  (role="liveview": its own ETW
 from app.output import _runs  # noqa: E402  (same band-merge logic as the real pusher)
 from app.sensors import demo as demo_mod  # noqa: E402
 from app.sensors import make_hub  # noqa: E402
-from app.sensors.demo import DemoBackend  # noqa: E402
 from app.steamid import SteamIdentity  # noqa: E402
 
 STATES = ("idle", "game")
 # hot-reload order matters: each module keeps references to the ones before it
 HOT_MODULES = [power_mod, history_mod, demo_mod, layout_mod]
-WATCH_FILES = [Path(m.__file__) for m in HOT_MODULES] + [ROOT / "config.yaml"]
+# the watched file list is per-Engine, not a module constant: the config to
+# watch is the one --config actually requested
 
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>PC Monitor — live layouts</title>
@@ -263,7 +268,7 @@ class Engine:
     """Ticks telemetry, hot-reloads the layout code, keeps both frames."""
 
     def __init__(self, cfg, backend: str, hz: float, synth: bool,
-                 frames_source: str = "auto"):
+                 frames_source: str = "auto", cfg_path: str | None = None):
         self.cfg = cfg
         self.hz = hz
         self.backend = backend
@@ -292,10 +297,14 @@ class Engine:
         self.render_ms = 0.0
         self.error: str | None = None
         self.started = time.time()
-        self._stamps = {p: self._stamp(p) for p in WATCH_FILES}
+        # watch the config that was actually requested: cfg["_root"] is always
+        # the repo, so a custom --config file would otherwise load once and
+        # then never be seen again
+        self._cfg_path = Path(cfg_path).resolve() if cfg_path else ROOT / "config.yaml"
+        self.watch = [Path(m.__file__) for m in HOT_MODULES] + [self._cfg_path]
+        self._stamps = {p: self._stamp(p) for p in self.watch}
         self.layouts = {s: layout_mod.Layout(cfg, rate_hz=hz) for s in STATES}
         self.samples = self.layouts["idle"].samples
-        self._cfg_path = Path(cfg["_root"]) / "config.yaml"
 
         if self.demo:
             self._make_hubs()
@@ -317,14 +326,23 @@ class Engine:
             for state, snap in (("idle", si), ("game", sg)):
                 self.layouts[state].observe(snap, state)
 
+    def _new_demo_hubs(self):
+        """Two independent demo streams, built but not yet published: idle-shaped
+        data on the left screen, game-shaped data on the right, both animating
+        from the same clock. The class check is module-qualified on purpose:
+        after a hot reload the once-imported `DemoBackend` names the class of
+        whichever generation imported it, while `demo_mod.DemoBackend` is the
+        one `make_hub` just built against — comparing against the stale name
+        rejected every legitimate reload and left the game hub un-flagged."""
+        idle = make_hub(self.cfg, force="demo")
+        game = make_hub(self.cfg, force="demo")
+        assert isinstance(idle.backend, demo_mod.DemoBackend)
+        idle.backend.game = False
+        game.backend.game = True
+        return idle, game
+
     def _make_hubs(self) -> None:
-        """Two independent demo streams: idle-shaped data on the left screen,
-        game-shaped data on the right, both animating from the same clock."""
-        self.hub_idle = make_hub(self.cfg, force="demo")
-        self.hub_game = make_hub(self.cfg, force="demo")
-        assert isinstance(self.hub_idle.backend, DemoBackend)
-        self.hub_idle.backend.game = False
-        self.hub_game.backend.game = True
+        self.hub_idle, self.hub_game = self._new_demo_hubs()
 
     @staticmethod
     def _stamp(p: Path):
@@ -336,36 +354,73 @@ class Engine:
 
     # ---- hot reload ----------------------------------------------------------
     def _maybe_reload(self) -> None:
-        changed = [p for p in WATCH_FILES if self._stamp(p) != self._stamps.get(p)]
+        changed = [p for p in self.watch if self._stamp(p) != self._stamps.get(p)]
         if not changed:
             return
-        for p in changed:
-            self._stamps[p] = self._stamp(p)
         cfg_changed = self._cfg_path in changed
         demo_changed = Path(demo_mod.__file__) in changed
+
+        # stage the candidate config before anything is touched: invalid YAML
+        # must not churn the module chain, let alone half-apply itself
+        fresh = None
+        if cfg_changed:
+            try:
+                fresh = cfgmod.load(str(self._cfg_path))
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(
+                    f"config reload failed ({e.__class__.__name__}: {e}); "
+                    f"keeping the previous config") from None
+
         # reload the whole chain in dependency order whenever anything changed:
         # each module keeps direct references to the ones before it, so a partial
-        # reload would leave the new module wired to the old classes.
-        for mod in HOT_MODULES:
-            importlib_reload(mod)
-        if cfg_changed:
-            fresh = cfgmod.load(str(self._cfg_path))
+        # reload would leave the new module wired to the old classes. And
+        # importlib re-executes modules *in place*: the dict snapshots below are
+        # what make the reload transactional — if an edit dies mid-module, the
+        # preview keeps running the last complete generation instead of a
+        # half-new, half-old one.
+        saved = [(m, dict(m.__dict__)) for m in HOT_MODULES]
+        saved_cfg = copy.deepcopy(self.cfg)
+        try:
+            if fresh is not None:
+                # publish into the live dict, never replace it: the layouts and
+                # the /ctrl handler all hold this same reference
+                self.cfg.clear()
+                self.cfg.update(fresh)
+            for mod in HOT_MODULES:
+                importlib_reload(mod)
+            if demo_changed and self.demo:
+                # existing DemoBackend objects are bound to the old class, so
+                # the streams have to be rebuilt for edited data shapes to show
+                # up — built first, published only once the whole generation is
+                # valid, flags and all
+                hubs = self._new_demo_hubs()
+            # rebuild the layouts, carrying the trend history across the reload
+            # so an edit never blanks the graphs out from under us
+            old = {s: l.history for s, l in self.layouts.items()}
+            layouts = {s: layout_mod.Layout(self.cfg, rate_hz=self.hz)
+                       for s in STATES}
+            for s, hist in old.items():
+                # a History instance is just rings + a length, so it survives the
+                # reload even though the Layout class around it was replaced
+                if hist.samples == layouts[s].history.samples:
+                    layouts[s].history = hist
+        except Exception:
+            for mod, snap in saved:
+                mod.__dict__.clear()
+                mod.__dict__.update(snap)
             self.cfg.clear()
-            self.cfg.update(fresh)
+            self.cfg.update(saved_cfg)
+            raise
+        # commit: publish the candidate generation, and only then advance the
+        # stamps of the files that loaded — a failed reload stays pending, so
+        # its error is re-surfaced every tick until a complete valid generation
+        # is running (and the repair is picked up without a restart)
         if demo_changed and self.demo:
-            # existing DemoBackend objects are bound to the old class, so the
-            # streams have to be rebuilt for edited data shapes to show up
-            self._make_hubs()
-        # rebuild the layouts, carrying the trend history across the reload so an
-        # edit never blanks the graphs out from under us
-        old = {s: l.history for s, l in self.layouts.items()}
-        self.layouts = {s: layout_mod.Layout(self.cfg, rate_hz=self.hz) for s in STATES}
-        for s, hist in old.items():
-            # a History instance is just rings + a length, so it survives the
-            # reload even though the Layout class around it was replaced
-            if hist.samples == self.layouts[s].history.samples:
-                self.layouts[s].history = hist
-        self.samples = self.layouts["idle"].samples
+            self.hub_idle, self.hub_game = hubs
+        self.layouts = layouts
+        self.samples = layouts["idle"].samples
+        for p in changed:
+            self._stamps[p] = self._stamp(p)
         self.reloads += 1
         self.reloaded_at = time.time()
         names = ", ".join(p.name for p in changed)
@@ -476,7 +531,7 @@ class Engine:
                 "trends": bool(self.cfg["layout"].get("trend_bands", True)),
                 "frames": self.frames_info,
                 "error": self.error, "uptime_s": round(time.time() - self.started, 1),
-                "watched": len(WATCH_FILES),
+                "watched": len(self.watch),
             }
 
 
@@ -484,14 +539,14 @@ def importlib_reload(mod):
     import importlib
     try:
         return importlib.reload(mod)
-    except Exception:  # broken edit: keep the last good module object alive
+    except Exception:  # broken edit: _maybe_reload rolls the chain back
         tb = traceback.format_exc()
         print("[liveview] reload failed:\n" + tb)
         raise RuntimeError(tb) from None
 
 
-def run(cfg, backend, hz, port, synth, frames_source="auto") -> None:
-    engine = Engine(cfg, backend, hz, synth, frames_source)
+def run(cfg, backend, hz, port, synth, frames_source="auto", cfg_path=None) -> None:
+    engine = Engine(cfg, backend, hz, synth, frames_source, cfg_path)
 
     # first tick on the main thread so the page always has something to show
     try:
@@ -599,7 +654,7 @@ def main() -> None:
     cfg = cfgmod.load(args.config)
     backend = args.backend.lower()
     synth = args.synth_fps == "on" or (args.synth_fps == "auto" and backend != "demo")
-    run(cfg, backend, args.hz, args.port, synth, args.frames_source)
+    run(cfg, backend, args.hz, args.port, synth, args.frames_source, args.config)
 
 
 if __name__ == "__main__":
