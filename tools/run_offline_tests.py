@@ -55,6 +55,10 @@ CASES = [
      "Pinning that clock is issue #4, which should drop this advisory flag."),
     ("nightlight", ["tools/nightlight_probe.py", "--selftest"],
      "CloudStore night-mode decode, pinned to captured blobs", None, None),
+    # The pin is the dependency: an install that can rewrite its own lock cannot fail,
+    # and nothing about that needs the vendored tree, so it gates on CI too.
+    ("env_check", ["tools/env_check_selftest.py"],
+     "the vendor pin verifies instead of agreeing with whatever it finds", None, None),
     ("panel_link", ["tools/panel_link_selftest.py"],
      "link survives raise/hang, rebuilds, walks its device ladder", "vendor", None),
     ("lights", ["tools/lights_selftest.py"],

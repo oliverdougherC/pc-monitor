@@ -35,14 +35,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      # There is no application-level dependency manifest yet (tracked as an
-      # open issue); this list is the set the offline tests import, taken from
-      # the venv this repository is developed in. Install failures must stop
-      # the job, so no `|| continue` anywhere here.
-      - name: Install the offline test dependencies
+      # The same manifest a fresh clone installs (tools/bootstrap.ps1 runs the
+      # identical command), so CI exercises the reviewed dependency set instead of
+      # a list maintained somewhere else. tools/env_check_selftest.py fails if the
+      # two ever drift apart. Install failures must stop the job, so no
+      # `|| continue` anywhere here.
+      - name: Install the reviewed dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pillow psutil pyserial pyusb PyYAML numpy nvidia-ml-py
+          python -m pip install -r requirements.txt
 
       # Syntax across the whole tree, including the modules the selftests do
       # not import (the vendored-library ones) and the PowerShell-free tools.
