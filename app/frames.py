@@ -46,6 +46,10 @@ _STREAM_SILENT_S = 20.0         # header up but no rows for this long → say so
 _SESSION_SETTLE_S = 2.5         # grace after stopping a previous run's session, see _reclaim_session
 _RESTART_MAX_S = 60.0           # backoff ceiling for a capture that keeps dying
 _HEALTHY_S = 120.0              # alive this long with rows → the streak of failures resets
+_REAP_WAIT_S = 5.0              # each step of terminate → wait → kill → reap
+_CLOSE_LOCK_S = 10.0            # shutdown's patience with a spawn mid-flight; past this
+                                # the late child is still disposed by _spawn's own check
+_JOIN_WAIT_S = 10.0             # shutdown's patience with the supervisor thread
 # Present modes worth distinguishing, from the column of the same name. `Hardware:`
 # without "Composed" is a true exclusive-flip path; everything else goes through the
 # compositor like any other window. dwm.exe's own rows are the compositor presenting
@@ -76,12 +80,18 @@ def _abs(p: str, cfg: dict) -> str:
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-_SYNCHRONIZE = 0x00100000
-# AssignProcessToJobObject's documented requirement: PROCESS_SET_QUERIES, i.e.
-# SYNCHRONIZE | TERMINATE | QUERY_LIMITED_INFORMATION. TERMINATE is not optional —
-# the job has to be able to kill the member.
-_PROCESS_SET_QUERIES = _SYNCHRONIZE | _PROCESS_TERMINATE | _PROCESS_QUERY_LIMITED_INFORMATION
+# AssignProcessToJobObject's documented access requirement on the process
+# handle is PROCESS_SET_QUOTA *and* PROCESS_TERMINATE. The old mask asked for
+# SYNCHRONIZE | TERMINATE | QUERY_LIMITED_INFORMATION under a comment naming
+# "PROCESS_SET_QUERIES" - a right that does not exist - so on a machine with
+# nothing wrong with nesting at all, every adoption failed with
+# ERROR_ACCESS_DENIED (5, measured on this desk) and the kill-on-exit guard
+# silently never existed. QUERY_LIMITED_INFORMATION stays because verifying
+# the adoption (IsProcessInJob) asks the handle itself.
+_PROCESS_ADOPT_RIGHTS = (_PROCESS_SET_QUOTA | _PROCESS_TERMINATE
+                         | _PROCESS_QUERY_LIMITED_INFORMATION)
 _k32_configured = False
 
 
@@ -107,6 +117,8 @@ def _kernel32():
         k32.AssignProcessToJobObject.argtypes = [wt.HANDLE, wt.HANDLE]
         k32.OpenProcess.restype = wt.HANDLE
         k32.OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+        k32.IsProcessInJob.restype = wt.BOOL
+        k32.IsProcessInJob.argtypes = [wt.HANDLE, wt.HANDLE, ctypes.POINTER(wt.BOOL)]
         k32.CloseHandle.restype = wt.BOOL
         k32.CloseHandle.argtypes = [wt.HANDLE]
         _k32_configured = True
@@ -182,14 +194,21 @@ class _KillJob:
             self.handle = None
 
     def adopt(self, pid: int) -> bool:
-        """Put `pid` under the job. Nested jobs are fine since Windows 8, so this
-        still works when the app itself is already running inside a job (Task
-        Scheduler, a sandbox)."""
+        """Put `pid` under the job, and verify it is actually there.
+
+        Nested jobs are fine since Windows 8, so this still works when the
+        app itself is already running inside a job (Task Scheduler, a
+        sandbox). The verification is not paranoia: this class exists to
+        make exactly one claim - the OS will take the child when we die -
+        and a TRUE from AssignProcessToJobObject is the call answering, not
+        the fact being true. Ask IsProcessInJob, and report failure when it
+        disagrees.
+        """
         if not self.handle:
             return False
         k32 = _kernel32()
         try:
-            h = k32.OpenProcess(_PROCESS_SET_QUERIES, False, pid)
+            h = k32.OpenProcess(_PROCESS_ADOPT_RIGHTS, False, pid)
             if not h:
                 self.last_error = ctypes.GetLastError()
                 return False
@@ -197,12 +216,34 @@ class _KillJob:
                 ok = bool(k32.AssignProcessToJobObject(self.handle, h))
                 if not ok:
                     self.last_error = ctypes.GetLastError()
+                    return False
+                import ctypes.wintypes as wt
+                inside = wt.BOOL(0)
+                if not (k32.IsProcessInJob(h, self.handle, ctypes.byref(inside))
+                        and inside.value):
+                    ok = False      # last_error stays None: the call lied, it did not fail
                 return ok
             finally:
                 k32.CloseHandle(h)
         except Exception as e:  # noqa: BLE001
             self.last_error = getattr(e, "winerror", None)
             return False
+
+    def close(self) -> None:
+        """Release the job handle. With KILL_ON_JOB_CLOSE set, the last close
+        is the OS's kill switch: anything still in the job dies here, even a
+        child some bounded reap gave up on - which is the whole point of
+        holding the handle in the first place, made deterministic at shutdown
+        instead of only at process death."""
+        if not self.handle:
+            return
+        h, self.handle = self.handle, None
+        try:
+            k32 = _kernel32()
+            if k32 is not None:
+                k32.CloseHandle(h)
+        except Exception:  # noqa: BLE001 - shutdown must not raise
+            pass
 
 
 @dataclass
@@ -284,12 +325,21 @@ class FrameMonitor:
         self._stop = threading.Event()
         self._proc: subprocess.Popen | None = None
         self._out: list[str] = []                             # stray output lines (for error text)
+        # Lifecycle (issue #12): close() and _spawn must not interleave, or a
+        # supervisor parked in session reclamation births a child after the
+        # app has decided to stop. _life makes "decide to spawn, spawn,
+        # publish" one decision; _closed is what a spawn already holding the
+        # lock checks on both sides of the birth.
+        self._life = threading.Lock()
+        self._closed = False
+        self._thread: threading.Thread | None = None
 
         if not os.path.exists(self._exe):
             self.error = (f"presentmon not found: {self._exe} — "
                           f"run: powershell -File tools\\fetch_presentmon.ps1")
             return
-        threading.Thread(target=self._supervise, daemon=True).start()
+        self._thread = threading.Thread(target=self._supervise, daemon=True)
+        self._thread.start()
 
     # ---------------------------------------------------------------- lifecycle
     def _reclaim_session(self) -> None:
@@ -315,32 +365,94 @@ class FrameMonitor:
                            stdin=subprocess.DEVNULL, creationflags=flags, timeout=20)
         except (subprocess.TimeoutExpired, OSError):
             pass          # nothing to stop, or it refused: the capture below decides
-        time.sleep(_SESSION_SETTLE_S)
+        # stop-wait rather than sleep: close() holds the lifecycle lock while it
+        # reaps, and a plain sleep here would make shutdown queue behind a
+        # settle it no longer wants.
+        self._stop.wait(_SESSION_SETTLE_S)
 
-    def _spawn(self) -> subprocess.Popen:
-        # session name is per role (see __init__): a fresh run reclaims the ETW
-        # session from any earlier run of the same role instead of adding one
-        self._reclaim_session()
-        args = [self._exe, "--no_console_stats", "--qpc_time_ms",
-                "--session_name", self.session_name, "--stop_existing_session"]
-        if self.output_file:
-            args += ["--output_file", self.output_file]   # diagnostic: file, not pipe
-        else:
-            args.append("--output_stdout")
-        if self.exclude_dropped:
-            args.append("--exclude_dropped")
-        args += self.extra_args
-        self.last_args = args[1:]
-        flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
-        proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                stdin=subprocess.DEVNULL, startupinfo=None,
-                                creationflags=flags, bufsize=0)
-        self._spawned = time.monotonic()
-        # PresentMon owns a kernel trace session, so an orphan outlives every
-        # guard except the OS's: die with us or run forever.
-        if not self._job.adopt(proc.pid):
-            self.job_error = self._job.last_error
-        return proc
+    def _spawn(self) -> subprocess.Popen | None:
+        """Spawn one capture under the lifecycle lock, or return None if the
+        app stopped while we were getting there.
+
+        The lock spans reclaim → birth → publish so close() cannot interleave
+        and leave a child nobody owns. A child that is born after close() has
+        set the flag is still a child we made, so we dispose of it ourselves
+        rather than hand a late orphan to a supervisor that is about to exit.
+        """
+        with self._life:
+            if self._closed:
+                return None
+            # session name is per role (see __init__): a fresh run reclaims the
+            # ETW session from any earlier run of the same role, not adds one
+            self._reclaim_session()
+            args = [self._exe, "--no_console_stats", "--qpc_time_ms",
+                    "--session_name", self.session_name, "--stop_existing_session"]
+            if self.output_file:
+                args += ["--output_file", self.output_file]  # diagnostic: file, not pipe
+            else:
+                args.append("--output_stdout")
+            if self.exclude_dropped:
+                args.append("--exclude_dropped")
+            args += self.extra_args
+            self.last_args = args[1:]
+            flags = 0x08000000 if os.name == "nt" else 0  # CREATE_NO_WINDOW
+            proc = subprocess.Popen(args, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    startupinfo=None, creationflags=flags, bufsize=0)
+            self._spawned = time.monotonic()
+            # Re-check now that the child exists: reclaim's settle is where a
+            # close() most often lands, and this is the last point inside the
+            # lock at which we can still take the child back.
+            if self._closed:
+                self._dispose(proc)
+                return None
+            self._proc = proc
+            # PresentMon owns a kernel trace session, so an orphan outlives
+            # every guard except the OS's: die with us or run forever.
+            if not self._job.adopt(proc.pid):
+                self.job_error = self._job.last_error
+            return proc
+
+    def _dispose(self, proc: subprocess.Popen | None, streams: bool = True) -> None:
+        """Bounded terminate → wait → kill → reap. Used for a late child and
+        by close(); every wait is capped so one child that ignores
+        TerminateProcess cannot hold shutdown open.
+
+        `streams=False` defers the pipe close to `_close_streams`: closing a
+        pipe handle another thread is blocked reading is undefined, so the
+        shutdown path reaps first, joins the reader, and only then closes.
+        """
+        if proc is None:
+            return
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+            try:
+                proc.wait(_REAP_WAIT_S)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(_REAP_WAIT_S)
+                except subprocess.TimeoutExpired:
+                    pass        # the job handle close is the last backstop
+        if streams:
+            self._close_streams(proc)
+
+    @staticmethod
+    def _close_streams(proc: subprocess.Popen | None) -> None:
+        if proc is None:
+            return          # close before the first birth, or a second close: normal
+        for stream in (proc.stdout, proc.stderr, proc.stdin):
+            try:
+                if stream is not None:
+                    stream.close()
+            except (OSError, ValueError):
+                pass
 
     def _supervise(self) -> None:
         """Keep a capture running, forever, with a backoff that never gives up.
@@ -361,8 +473,9 @@ class FrameMonitor:
                 if self._stop.wait(_RESTART_MAX_S):
                     return
                 continue
+            if proc is None:
+                return            # close() won the race; this thread is done
             self.starts += 1
-            self._proc = proc
             try:
                 self._read_stream(proc)
             except Exception:  # noqa: BLE001 - never let a parse bug kill the stream silently
@@ -541,10 +654,45 @@ class FrameMonitor:
         return None
 
     def close(self) -> None:
+        """Stop monitoring and take everything with us, deterministically.
+
+        The old close() set a flag and terminated whatever child happened to
+        be published at that instant. A supervisor parked in `_reclaim_session`
+        - which sleeps for seconds inside a `subprocess.run` that close() never
+        waited on - would wake after close() returned and spawn a fresh child
+        that nobody owned, defeating the whole kill-on-exit promise while the
+        app still ran. The lifecycle lock makes spawn and close mutually
+        exclusive; _closed is checked on both sides of the birth inside that
+        lock, so a child can only exist if close() will see it. Every wait is
+        bounded, and the job handle is closed last so its kill-on-close fires
+        even for a child that shrugged off terminate.
+        """
         self._stop.set()
-        proc = self._proc
-        if proc and proc.poll() is None:
-            proc.terminate()
+        # Set before touching the lock, and set even if the lock is held past
+        # _CLOSE_LOCK_S: a spawn already holding the lock checks this flag on
+        # both sides of the birth, so a child published after this point
+        # disposes of itself, and one published before it is visible below.
+        self._closed = True
+        if self._life.acquire(timeout=_CLOSE_LOCK_S):
+            try:
+                proc, self._proc = self._proc, None
+            finally:
+                self._life.release()
+        else:
+            # A spawn is mid-flight and close() is done waiting for it.
+            # Whatever it publishes next sees _closed and self-disposes;
+            # whatever it already published is ours to reap here.
+            proc = self._proc
+        # Reap without the pipe handles yet: the reader may still be blocked
+        # on them, and they are not safe to close until that thread is back.
+        self._dispose(proc, streams=False)
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(_JOIN_WAIT_S)      # the child is dead, so the read returns
+        self._close_streams(proc)
+        # Last backstop: releasing the job handle is the OS's kill switch for
+        # any member our bounded terminate/kill failed to take down.
+        self._job.close()
 
     # ------------------------------------------------------------------ queries
     def _best(self, pid: int, span_s: float) -> list:
