@@ -12,6 +12,14 @@ Then open http://localhost:5680. `app/layout.py`, `app/power.py` and
 `config.yaml` are hot-reloaded when they change on disk, so editing the layout
 shows up in the browser within a tick — no restart, no refresh needed.
 
+The game pane's frame numbers come from the real present stream. When it is off,
+denied, quiet or has no usable target, the pane shows `--` — the same honest hole
+the panel shows. `--synth-fps on` is there for designing the layout without a game
+running, and it pays for that: the pane is painted SIMULATED, in the frame itself,
+so an exported PNG cannot outlive its context as a plausible measurement. The
+status line reports the provenance of the numbers on screen, not of the capture
+underneath them, so the two views of a tick always describe the same thing.
+
 Per-state "push" stats (changed-pixel fraction + how many bands a partial
 update would need) are reported the same way app/output.py would do it, so the
 design can be judged against what the panel actually has to redraw. A third
@@ -133,7 +141,14 @@ function tick(){
     const ago = j.reloaded ? Math.round((j.now - j.reloaded)) : null;
     const f = j.frames || {};
     let fseg;
-    if (f.source === 'demo') fseg = '';
+    if (f.simulated) {
+      // The same fact the image carries. The pane is showing invented numbers, so
+      // this line describes those instead of the capture sitting underneath them —
+      // before #31 they could disagree, which made the tool unreadable.
+      fseg = ` · frames <span style="color:#ff8a4c"><b>SIMULATED</b> ` +
+             `${Math.round(f.fps || 0)} fps — invented, not measured</span>`;
+    }
+    else if (f.source === 'demo') fseg = '';
     else if (f.source === 'off') fseg = ' · frames <b>off</b>';
     else if (f.name) fseg = ` · frames <b>${f.name}</b>` + (f.appid ? ` [${f.appid}]` : '') +
                             ` <b>${Math.round(f.fps || 0)} fps</b>`;
@@ -248,8 +263,15 @@ def diff_report(prev, new, merge_gap: int = 6, max_bands: int = 6,
 
 
 def synth_frames(snap, t: float) -> None:
-    """Placeholder frame stats until PresentMon lands, so the game layout has
-    something to show when driven by real sensors."""
+    """Invented frame stats — opt-in only (`--synth-fps on`).
+
+    They exist so the game layout can be designed with no game running. What they
+    invented used to be indistinguishable from a measurement: the values are now
+    marked `simulated` on the snapshot, which is what makes the pane draw its
+    SIMULATED badge. Before #31 this ran by default for every real backend, so a
+    preview whose capture was down showed a plausible ~118 fps and read as a
+    working present stream — the one thing this tool is supposed to let you check.
+    """
     f = snap.frames
     if f.fps is None:
         fps = 118 + 14 * np.sin(t * 0.31) + 5 * np.sin(t * 1.7)
@@ -257,6 +279,7 @@ def synth_frames(snap, t: float) -> None:
         f.low1_pct = fps * 0.74
         f.low01_pct = fps * 0.46
         f.latency_ms = 1000.0 / fps * 0.86
+        f.simulated = True
 
 
 class Engine:
@@ -274,9 +297,12 @@ class Engine:
         # Steam-identified one — that IS the point of running it with --backend auto
         self.frames_mon = None
         self.steam = SteamIdentity()
-        self.frames_info: dict = {"source": "demo" if self.demo else frames_source}
         if not self.demo and frames_source != "off":
             self.frames_mon = FrameMonitor(cfg, role="liveview")
+        # `displayed`/`simulated` are recomputed from the snapshot on every tick
+        # (`_publish_frames`); these are the values for the tick before the first one.
+        self.frames_info: dict = {"source": "demo" if self.demo else frames_source,
+                                  "displayed": "none", "simulated": False}
         self.lock = threading.Lock()
         self.base: dict[tuple[str, int], Image.Image] = {}
         self.prev: dict[str, np.ndarray | None] = {s: None for s in STATES}
@@ -383,14 +409,24 @@ class Engine:
             sg = self.hub_game.tick()
             si = sg
             self._fill_frames(sg, t)
+        # whatever ended up in the game pane — measured, invented, or nothing — is
+        # reported from here, after both paths, so the page cannot describe a
+        # different tick than the one it is about to show
+        self._publish_frames(sg)
         for s in {id(si): si, id(sg): sg}.values():
             s.power_total_w, _ = power_mod.estimate(s, self.cfg)
         return si, sg
 
     def _fill_frames(self, sg, t: float) -> None:
-        """Game pane frame stats: the live ETW present stream when it's up —
-        following the busiest presenting process, preferring a Steam-identified
-        one — else the old synthetic placeholder (dev only), else honest --."""
+        """Game pane frame stats: the live ETW present stream when it is up —
+        following the busiest presenting process, preferring a Steam-identified one
+        — else nothing at all, which the pane renders as `--`; the invented
+        placeholder only with `--synth-fps on`, and then it is marked as invented.
+
+        What is left on `sg.frames` is the whole truth of the game pane. The status
+        line is read back off that snapshot afterwards (`_publish_frames`) instead of
+        being decided here, so the two views of one tick cannot drift apart.
+        """
         info: dict = {"source": "off"}
         mon = self.frames_mon
         if mon is not None:
@@ -412,6 +448,25 @@ class Engine:
         self.frames_info = info
         if self.synth:
             synth_frames(sg, t)
+
+    def _publish_frames(self, sg) -> None:
+        """Say what the game pane is showing, derived from the snapshot being drawn.
+
+        This used to be implicit: `frames_info` described the *capture* ("auto" /
+        "off") while the pane below it could be showing invented numbers, so the
+        status line and the image were two separate claims and only one of them was
+        ever looked at (issue #31). Deriving the answer from the snapshot means a
+        new source of frame numbers cannot be added here without being accounted for
+        there, and the honest `--` of a dead capture now has a name in the status too.
+        """
+        sim = bool(getattr(sg.frames, "simulated", False))
+        shown = "simulated" if sim else ("real" if sg.frames.fps is not None else "none")
+        info = {**self.frames_info, "simulated": sim, "displayed": shown}
+        if sim and sg.frames.fps is not None:
+            info["fps"] = round(float(sg.frames.fps), 1)
+        # Rebind rather than mutate: `status()` hands this dict straight to the
+        # browser, and a reader should see the old provenance or the new one.
+        self.frames_info = info
 
     def step(self) -> None:
         self._maybe_reload()
@@ -577,7 +632,8 @@ def run(cfg, backend, hz, port, synth, frames_source="auto") -> None:
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     srv.daemon_threads = True
-    print(f"[liveview] http://localhost:{port}  backend={backend}  hz={hz}")
+    print(f"[liveview] http://localhost:{port}  backend={backend}  hz={hz}  "
+          f"synth_fps={'on (game pane marked SIMULATED)' if synth else 'off'}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -590,15 +646,26 @@ def main() -> None:
     ap.add_argument("--backend", default="demo", help="demo|auto|lhm|fallback")
     ap.add_argument("--port", type=int, default=5680)
     ap.add_argument("--hz", type=float, default=1.0, help="render ticks/second")
-    ap.add_argument("--synth-fps", default="auto", choices=["auto", "on", "off"],
-                    help="fake frame stats when the real stream has none (dev only)")
+    ap.add_argument("--synth-fps", default="off", choices=["off", "on", "auto"],
+                    help="invented frame stats when the real stream has none: off "
+                         "(default) leaves them unavailable, on shows them and marks "
+                         "the pane SIMULATED. 'auto' is accepted as 'off' — it used "
+                         "to mean 'invent them for any real backend'")
     ap.add_argument("--frames-source", default="auto", choices=["auto", "off"],
                     help="auto = PresentMon ETW for real per-process frame stats (needs admin)")
     args = ap.parse_args()
 
     cfg = cfgmod.load(args.config)
     backend = args.backend.lower()
-    synth = args.synth_fps == "on" or (args.synth_fps == "auto" and backend != "demo")
+    # `auto` is kept so an old command line still runs, but it no longer means what
+    # it meant: inventing fps whenever the backend was real is how a preview came to
+    # show a steady ~118 fps while the capture was dead (issue #31). Say it out loud
+    # rather than letting the flag quietly change meaning under someone's fingers.
+    if args.synth_fps == "auto":
+        print("[liveview] --synth-fps=auto is off now: missing frame stats stay "
+              "unavailable. Pass --synth-fps on for a simulation, which the game "
+              "pane marks SIMULATED on the image.")
+    synth = args.synth_fps == "on"
     run(cfg, backend, args.hz, args.port, synth, args.frames_source)
 
 

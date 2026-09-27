@@ -33,6 +33,11 @@ class FrameStats:
     # inventing a live rate, and `age_s` says how stale they are.
     stale: bool = False
     age_s: float = 0.0
+    # True when these numbers were invented for a preview rather than measured. It
+    # rides with the values themselves so the renderer cannot draw them as live:
+    # `app/layout.py` marks such a pane SIMULATED, and a preview's status line reads
+    # the same flag off the same snapshot. A measurement never sets it.
+    simulated: bool = False
     gpu_pct: float | None = None         # this process's own GPU busyness, %
 
 

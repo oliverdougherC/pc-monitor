@@ -46,6 +46,12 @@ TAN = (224, 208, 178)      # fps/frametime panel, distinct from disk white
 # game has stopped presenting. Still readable at the dim brightness level, which is
 # where a held value usually lives.
 TAN_HELD = (140, 130, 112)
+# Values that were invented for a preview rather than measured. Deliberately not a
+# muted version of TAN: the point is that the pane cannot be mistaken for a
+# measurement in a screenshot, a crop, or a saved PNG, by someone who never saw the
+# status line that produced it.
+SIM = (255, 138, 76)
+SIM_INK = (14, 11, 8)        # text on the filled SIMULATED badge
 PINK = (255, 106, 182)
 
 W, H = 800, 480
@@ -133,8 +139,23 @@ class Layout:
             self._txt(d, (x, y), label, (self.fsmall, lab_size), lab_col, "ls")
             self._txt(d, (x + lw + gap, y), value, (vfont, val_size), val_col, "ls")
 
-    def _panel(self, d, box):
-        d.rectangle(box, fill=PANEL, outline=BORDER, width=1)
+    def _panel(self, d, box, outline=BORDER):
+        d.rectangle(box, fill=PANEL, outline=outline, width=1)
+
+    def _badge(self, d, right: int, baseline: int, text: str, size: int,
+               fill, ink) -> None:
+        """Filled tag sitting on a text baseline, right-aligned at `right`.
+
+        Filled rather than outlined because it has to survive the whole journey a
+        preview frame takes: downscaled in a browser, cropped, and PNG-saved. A
+        hairline outline is the first thing to vanish on that trip; a solid block of
+        warning colour with dark text on it is the last.
+        """
+        fnt = self._font(self.flabel, size)
+        ink_box = d.textbbox((right, baseline), text, font=fnt, anchor="rs")
+        d.rectangle((ink_box[0] - 6, ink_box[1] - 4, ink_box[2] + 6, ink_box[3] + 4),
+                    fill=fill)
+        self._txt(d, (right, baseline), text, (self.flabel, size), ink, "rs")
 
     # ---------- the shared trend element ----------------------------------------
     @property
@@ -374,9 +395,15 @@ class Layout:
         # loading screen). Say so on the panel instead of letting a frozen number
         # pass for a live one — same value, honest colour, honest label.
         held = bool(getattr(f, "stale", False))
-        col = TAN_HELD if held else TAN
-        self._panel(d, box)
+        # Invented, not measured: a preview running with --synth-fps on. The whole
+        # pane goes to the warning hue and carries the word, because the alternative
+        # is a screenshot of plausible fps that no viewer can date or discount.
+        sim = bool(getattr(f, "simulated", False))
+        col = SIM if sim else (TAN_HELD if held else TAN)
+        self._panel(d, box, outline=SIM if sim else BORDER)
         self._txt(d, (cx0, y0 + 22), "FRAMES", (self.flabel, 15), col, "ls")
+        if sim:
+            self._badge(d, cx1, y0 + 22, "SIMULATED", 14, SIM, SIM_INK)
         self._big(d, cx0, y0 + 76, self.num(f.fps, "{:.0f}"), 56, col, "ls",
                   f.fps is not None)
         unit = "FPS" if not held else f"FPS  HELD {f.age_s:.0f}s"
@@ -388,7 +415,8 @@ class Layout:
                   right=self._value(ms, "{:.1f} ms", col, 20))
         target = float(self.cfg["game"].get("frametime_target_ms", 16.7))
         self._graph(d, cx0, y0 + 112, cx1, y0 + 142, self._series("frames.ms"),
-                    TAN, span_min=2.0, target=target, plain=not self.trends)
+                    SIM if sim else TAN, span_min=2.0, target=target,
+                    plain=not self.trends)
 
         self._pair(d, cx0, y0 + 168, "1% LOW", self.num(f.low1_pct), DIMMER, col, 13, 22,
                    present=f.low1_pct is not None)
