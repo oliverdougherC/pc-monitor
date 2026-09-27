@@ -78,6 +78,12 @@ DEFAULTS = {
         "strength": 1.0,
         "color_temp_k": 0,            # 0 = use whatever Windows has set
         "schedule": "",               # e.g. "21:00-07:00"; fallback only, see mode
+        # How long a failed or unreadable read may pass as transient: the panel
+        # keeps the last confirmed night appearance for this long (and, past it,
+        # keeps holding instead of brightening - a read failure is not the user
+        # turning night off). The log says when it starts holding and when the
+        # grace ran out; see app/nightlight.py.
+        "hold_grace_s": 900,
         # Night mode also dims: min(level, level × scale), never below the floor, so
         # the panel cannot be the brightest thing in a dark room.
         "brightness_scale": 0.55,
