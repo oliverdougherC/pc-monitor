@@ -1,17 +1,17 @@
-"""One command for the whole offline gate: every selftest, one exit code.
+r"""One command for the whole offline gate: every selftest, one exit code.
 
     .venv\Scripts\python tools\run_offline_tests.py
     .venv\Scripts\python tools\run_offline_tests.py --list
     .venv\Scripts\python tools\run_offline_tests.py --only panel_link
 
 The selftests are the contract — "everything behavioural has an offline proof
-that needs neither admin nor hardware" — but eight separate commands are eight
+that needs neither admin nor hardware" — but nine separate commands are nine
 chances to forget one, and a change cannot be judged by whoever remembers to
 run them. This runner is what CI calls and what a contributor runs before
 pushing: each selftest stays a separate process (its own `sys.path`, its own
 fault guard), and this only aggregates their exit codes.
 
-Two facts decide the shape:
+Three facts decide the shape:
 
 * Some selftests reach into the vendored panel library (`library.lcd.*`) or the
   theme's fonts. A fresh clone has neither — `vendor/` is a pin plus a
@@ -22,6 +22,11 @@ Two facts decide the shape:
   and CI prints the same numbers in the job summary.
 * Nothing here needs admin, hardware, or a network. A selftest that starts to
   need one is a bug in the selftest, not a reason to mark it manual.
+* A wedged case must not wedge the gate. Each case runs under a wall-clock
+  cap; blowing it is a FAIL that names the case and the timeout, and its
+  child is killed and reaped. Without the cap a hung selftest strands the
+  whole run — locally forever, in CI on a 20-minute job timeout that names
+  nothing — which is not a repeatable gate.
 
 Exit status: 0 if no case FAILED, 1 otherwise. A SKIP alone cannot make this
 fail, and must never be described as a pass; neither does an ADVISORY-FAIL,
@@ -36,6 +41,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 VENDOR = ROOT / "vendor" / "turing-smart-screen-python"
 
+# Wall-clock cap per case, in seconds (override: PCMON_GATE_CASE_TIMEOUT).
+# Generous on purpose — the slowest real case is seconds, so blowing this cap
+# means wedged, not slow. `gate_selftest` keeps its own tiny cap to stay fast.
+CASE_TIMEOUT = float(os.environ.get("PCMON_GATE_CASE_TIMEOUT", "600"))
+
 # (selector, argv, what it proves, what it needs beyond this repo, advisory reason)
 #
 # `advisory` is for a case that cannot yet be trusted as a gate, and it is never
@@ -44,6 +54,9 @@ VENDOR = ROOT / "vendor" / "turing-smart-screen-python"
 # green bar that means "no case we trust has failed" — not a green bar that
 # quietly ignored one. Every advisory entry names the issue that removes it.
 CASES = [
+    ("gate", ["tools/gate_selftest.py"],
+     "the gate judges honestly: verdict contract, SKIP/advisory, hung-case kill",
+     None, None),
     ("frames", ["tools/frames_selftest.py"],
      "present-stream parsing: fps, GPU-busy, held values, stream guards", None, None),
     ("gamewatch", ["tools/gamewatch_selftest.py"],
@@ -85,8 +98,20 @@ def run(case, only):
         return "skip"
     print(f"----           {selector}: {' '.join(argv)}")
     sys.stdout.flush()
-    proc = subprocess.run([sys.executable, *argv], cwd=str(ROOT),
-                          capture_output=True, text=True, errors="replace")
+    try:
+        proc = subprocess.run([sys.executable, *argv], cwd=str(ROOT),
+                              capture_output=True, text=True, errors="replace",
+                              timeout=CASE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        # subprocess.run has already killed the child and waited on it; what
+        # it cannot do is say *which* case died. This line is that, and it is
+        # a FAIL — a hung case is a broken case, not a skipped one. (Only the
+        # direct child is ours to kill; process-tree cleanup is #12's job
+        # object, not this runner's.)
+        print(f"FAIL           {selector:<11} {proves}  "
+              f"(TIMEOUT after {CASE_TIMEOUT:g}s; child killed)")
+        sys.stdout.flush()
+        return "fail"
     out = (proc.stdout or "") + (proc.stderr or "")
     sys.stdout.write(out if out.endswith("\n") or not out else out + "\n")
     sys.stdout.flush()
