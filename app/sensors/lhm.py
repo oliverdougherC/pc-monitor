@@ -39,14 +39,23 @@ class LhmBackend:
         # GPU unless LHM overrides; LHM only fills/overrides what it reports
         from app.sensors.fallback import FallbackBackend
         self._host = FallbackBackend(cfg)
+        self._dll = os.path.join(cfg["_vendor"], "external", "LibreHardwareMonitor",
+                                 "LibreHardwareMonitorLib.dll")
+        self._reopen_after = max(1, int(cfg.get("sensors", {}).get("reopen_after", 3)))
+        self._lhm_fails = 0
+        self._open()
 
-        dll = os.path.join(cfg["_vendor"], "external", "LibreHardwareMonitor",
-                           "LibreHardwareMonitorLib.dll")
-        if not os.path.exists(dll):
-            raise RuntimeError(f"LHM dll not found: {dll}")
+    def _open(self) -> None:
+        """Open the LHM Computer (the ring0-backed object) and walk it once.
 
-        sys.path.insert(0, os.path.dirname(dll))
-        clr.AddReference(dll)  # type: ignore[no-redef]
+        This is the resource the hub's rebuild and the resume hook re-acquire:
+        a Computer() opened against a wedged driver keeps wedging, and only a
+        fresh Open() sees a device that came back."""
+        if not os.path.exists(self._dll):
+            raise RuntimeError(f"LHM dll not found: {self._dll}")
+
+        sys.path.insert(0, os.path.dirname(self._dll))
+        clr.AddReference(self._dll)  # type: ignore[no-redef]
         from LibreHardwareMonitor.Hardware import Computer
 
         c = Computer()
@@ -120,7 +129,41 @@ class LhmBackend:
 
     # ---------------------------------------------------------------- sample
     def sample(self, snap: Snapshot) -> None:
+        # The host (psutil/NVML) answers first and stands on its own: if the
+        # LHM override dies mid-pass - a sensor throwing while the driver is
+        # resetting - the healthy host values survive and only "lhm" is
+        # reported failed. Persistent LHM failure re-opens the Computer: a
+        # wedged one never starts answering again on its own.
         self._host.sample(snap)
+        try:
+            self._lhm_sample(snap)
+        except Exception:  # noqa: BLE001 - LHM dying must not cost the host data
+            snap.failed = tuple(sorted({*snap.failed, "lhm"}))
+            self._lhm_fails += 1
+            if self._lhm_fails >= self._reopen_after:
+                self._reopen_lhm()
+        else:
+            self._lhm_fails = 0
+
+    def _reopen_lhm(self) -> None:
+        try:
+            self._c.Close()
+        except Exception:  # noqa: BLE001 - a half-dead Computer may not close clean
+            pass
+        try:
+            self._open()
+            self._lhm_fails = 0
+        except Exception:  # noqa: BLE001 - host values keep standing; try again next failure
+            pass
+
+    def close(self) -> None:
+        try:
+            self._c.Close()
+        except Exception:  # noqa: BLE001 - closing must never raise
+            pass
+        self._host.close()
+
+    def _lhm_sample(self, snap: Snapshot) -> None:
         self._rescan()
         c, g = snap.cpu, snap.gpu
 

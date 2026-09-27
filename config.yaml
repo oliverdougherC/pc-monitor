@@ -51,6 +51,18 @@ sensors:
   # auto: LHM if pythonnet+dll available, else psutil+NVML. Or force: lhm | fallback | demo
   backend: auto
   interval_s: 1.0
+  # Supervisor numbers - see the comments in app/config.py for the full story.
+  # A blind tick re-presents the last good sample for stale_grace_s (marked
+  # held: rendered, never pushed into history), then every metric shows "--"
+  # and the bands draw gaps. reopen_after failed samples trigger a backend
+  # close+rebuild (this is what heals a GPU driver reset without a restart);
+  # a failing rebuild backs off 5 s, doubling to 60 s.
+  tick_timeout_s: 2.0
+  stale_grace_s: 30.0
+  reopen_after: 3
+  reopen_backoff_s: 5.0
+  reopen_backoff_max_s: 60.0
+  nvml_retry_s: 60.0
 
 power:
   # total = base + (cpu + gpu) * (1 + rail_overhead_pct/100)
