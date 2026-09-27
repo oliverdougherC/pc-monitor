@@ -1,5 +1,9 @@
-# PC Monitor - desk display config
+﻿# PC Monitor - desk display config
 # NOTE: keys are consumed by app/config.py; missing keys fall back to defaults there.
+# Values are checked against that file's schema when the app starts: a wrong type,
+# range or enum stops the app with every bad key named, instead of failing later
+# inside the render loop. A live reload that does not validate is refused and the
+# last-known-good config keeps running.
 
 display:
   # Once hardware arrives set revision to the right protocol:
@@ -23,9 +27,12 @@ display:
   reset_on_start: false
   # Last resort that does not need a hand on the cable. After 2 minutes of silence the
   # app steps through three rungs, one per attempt: restart the CDC interface, restart
-  # the composite device above it, then disable+re-enable that device (as close to
-  # pulling the plug as Windows allows; the intent is journaled in .panel_reset_pending
-  # so a crash between the two words is finished by the next start). Measured on this
+  # the composite device above it, then disable+re-enable that device. The strongest
+  # rung writes its intent to a recovery journal (%LOCALAPPDATA%\PCMonitor\
+  # usb_recovery.json) before touching the device and refuses to start if that write
+  # fails; the record is cleared only when the device node says it is no longer
+  # disabled, so a crash between the two words is finished by the next start. Note this
+  # is a driver cycle, not an electrical power cycle - VBUS stays on. Measured on this
   # desk - when the endpoint has stopped draining, the COM port still opens but the
   # first write blocks, so no command (including the vendor's RESTART) can ever be
   # delivered. Needs Administrator; without it the refusal is logged and retried.
@@ -51,6 +58,18 @@ sensors:
   # auto: LHM if pythonnet+dll available, else psutil+NVML. Or force: lhm | fallback | demo
   backend: auto
   interval_s: 1.0
+  # Supervisor numbers - see the comments in app/config.py for the full story.
+  # A blind tick re-presents the last good sample for stale_grace_s (marked
+  # held: rendered, never pushed into history), then every metric shows "--"
+  # and the bands draw gaps. reopen_after failed samples trigger a backend
+  # close+rebuild (this is what heals a GPU driver reset without a restart);
+  # a failing rebuild backs off 5 s, doubling to 60 s.
+  tick_timeout_s: 2.0
+  stale_grace_s: 30.0
+  reopen_after: 3
+  reopen_backoff_s: 5.0
+  reopen_backoff_max_s: 60.0
+  nvml_retry_s: 60.0
 
 power:
   # total = base + (cpu + gpu) * (1 + rail_overhead_pct/100)
@@ -74,6 +93,16 @@ power:
   gradient_min_w: 50   # color: green at/below this
   gradient_max_w: 1000 # color: red at/above this
   gradient_gamma: 0.75
+  # A total is only as whole as its inputs. With a CPU or GPU reading
+  # completely missing the strip shows "-- W partial" instead of a number that
+  # silently excludes a real load (that is how a dead sensor read as 34 W idle).
+  # Set false to accept a known-components-only figure as a floor - it is still
+  # labelled "partial".
+  require_complete: true
+  # Older than this, the number on the strip is labelled "stale": a failed
+  # sensor tick leaves the loop reusing the last snapshot, and its watts are
+  # from whenever that was.
+  max_age_s: 8.0
   # --- what the panel does when the machine itself changes state -------------
   # Read from Windows power/broadcast notifications (app/hoststate.py), not guessed:
   # a hidden top-level window receives WM_POWERBROADCAST (suspend/resume), the
@@ -90,7 +119,10 @@ power:
   # value `(seed)` until a real notification replaces it.
   seed_monitor: true
   # A tick gap bigger than this means the process was frozen: the panel link is
-  # rebuilt, the ETW capture is restarted, and the game lock is dropped.
+  # rebuilt, the ETW capture is restarted, and the game lock is dropped. Time the loop
+  # accounts for as its own work is not a gap — a half-minute panel rebuild is this
+  # process being busy, not the machine having been asleep — and the rule is measured
+  # against `sensors.interval_s`, not against the elapsed time it is judging.
   wake_gap_s: 5.0
 
 # Night mode: the panel follows YOUR night mode instead of owning a schedule.
@@ -104,6 +136,11 @@ night:
   strength: 1.0         # 1.0 = the colour temperature you set; lower blends to neutral
   color_temp_k: 0       # 0 = whatever Windows has set; a number overrides it
   schedule: ""          # e.g. "21:00-07:00" — only used when the state can't be read
+  # A failed or unreadable read is a transient failure, not you turning night
+  # off: the panel keeps the last confirmed night appearance while it lasts,
+  # holding it (never brightening) even past this grace, with one log line on
+  # entering the hold and one when the grace runs out. See app/nightlight.py.
+  hold_grace_s: 900
   # Night mode also dims, or a 45%-brightness panel in a dark room is the light you
   # just turned off at the lamp: level = max(floor, level x scale).
   brightness_scale: 0.55
@@ -185,6 +222,12 @@ frames:
 
 burnin:
   shift_every_min: 5       # global pixel-shift of the layout
+  # The full-screen color sweep is opt-in: it is the one part of burn-in mitigation
+  # anybody can see, and "unobtrusive" is the product goal. Set true to get it back.
+  # It now advances one frame per control-loop tick, so a monitor-off, a lock, a
+  # suspend query or a game start arriving mid-sweep ends it on the next tick rather
+  # than after the animation.
+  exercise_enabled: false
   exercise_every_h: 8      # full-screen color sweep "refresh" animation
   exercise_s: 12
 

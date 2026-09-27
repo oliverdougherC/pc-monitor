@@ -10,7 +10,19 @@ auto-refreshing browser page:
 
 Then open http://localhost:5680. `app/layout.py`, `app/power.py` and
 `config.yaml` are hot-reloaded when they change on disk, so editing the layout
-shows up in the browser within a tick — no restart, no refresh needed.
+shows up in the browser within a tick — no restart, no refresh needed. The
+reload is transactional: a broken edit is refused and the previous working
+generation keeps rendering, with the error on screen until a complete valid
+one is running — and the config watched is the one actually requested
+(`--config`), not always the repo default.
+
+The game pane's frame numbers come from the real present stream. When it is off,
+denied, quiet or has no usable target, the pane shows `--` — the same honest hole
+the panel shows. `--synth-fps on` is there for designing the layout without a game
+running, and it pays for that: the pane is painted SIMULATED, in the frame itself,
+so an exported PNG cannot outlive its context as a plausible measurement. The
+status line reports the provenance of the numbers on screen, not of the capture
+underneath them, so the two views of a tick always describe the same thing.
 
 Per-state "push" stats (changed-pixel fraction + how many bands a partial
 update would need) are reported the same way app/output.py would do it, so the
@@ -25,6 +37,7 @@ width*height*2 is what a 115200-baud serial revision receives.
 from __future__ import annotations
 
 import argparse
+import copy
 import io
 import json
 import sys
@@ -51,13 +64,13 @@ from app.frames import FrameMonitor  # noqa: E402  (role="liveview": its own ETW
 from app.output import _runs  # noqa: E402  (same band-merge logic as the real pusher)
 from app.sensors import demo as demo_mod  # noqa: E402
 from app.sensors import make_hub  # noqa: E402
-from app.sensors.demo import DemoBackend  # noqa: E402
 from app.steamid import SteamIdentity  # noqa: E402
 
 STATES = ("idle", "game")
 # hot-reload order matters: each module keeps references to the ones before it
 HOT_MODULES = [power_mod, history_mod, demo_mod, layout_mod]
-WATCH_FILES = [Path(m.__file__) for m in HOT_MODULES] + [ROOT / "config.yaml"]
+# the watched file list is per-Engine, not a module constant: the config to
+# watch is the one --config actually requested
 
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>PC Monitor — live layouts</title>
@@ -133,7 +146,14 @@ function tick(){
     const ago = j.reloaded ? Math.round((j.now - j.reloaded)) : null;
     const f = j.frames || {};
     let fseg;
-    if (f.source === 'demo') fseg = '';
+    if (f.simulated) {
+      // The same fact the image carries. The pane is showing invented numbers, so
+      // this line describes those instead of the capture sitting underneath them —
+      // before #31 they could disagree, which made the tool unreadable.
+      fseg = ` · frames <span style="color:#ff8a4c"><b>SIMULATED</b> ` +
+             `${Math.round(f.fps || 0)} fps — invented, not measured</span>`;
+    }
+    else if (f.source === 'demo') fseg = '';
     else if (f.source === 'off') fseg = ' · frames <b>off</b>';
     else if (f.name) fseg = ` · frames <b>${f.name}</b>` + (f.appid ? ` [${f.appid}]` : '') +
                             ` <b>${Math.round(f.fps || 0)} fps</b>`;
@@ -248,8 +268,15 @@ def diff_report(prev, new, merge_gap: int = 6, max_bands: int = 6,
 
 
 def synth_frames(snap, t: float) -> None:
-    """Placeholder frame stats until PresentMon lands, so the game layout has
-    something to show when driven by real sensors."""
+    """Invented frame stats — opt-in only (`--synth-fps on`).
+
+    They exist so the game layout can be designed with no game running. What they
+    invented used to be indistinguishable from a measurement: the values are now
+    marked `simulated` on the snapshot, which is what makes the pane draw its
+    SIMULATED badge. Before #31 this ran by default for every real backend, so a
+    preview whose capture was down showed a plausible ~118 fps and read as a
+    working present stream — the one thing this tool is supposed to let you check.
+    """
     f = snap.frames
     if f.fps is None:
         fps = 118 + 14 * np.sin(t * 0.31) + 5 * np.sin(t * 1.7)
@@ -257,13 +284,14 @@ def synth_frames(snap, t: float) -> None:
         f.low1_pct = fps * 0.74
         f.low01_pct = fps * 0.46
         f.latency_ms = 1000.0 / fps * 0.86
+        f.simulated = True
 
 
 class Engine:
     """Ticks telemetry, hot-reloads the layout code, keeps both frames."""
 
     def __init__(self, cfg, backend: str, hz: float, synth: bool,
-                 frames_source: str = "auto"):
+                 frames_source: str = "auto", cfg_path: str | None = None):
         self.cfg = cfg
         self.hz = hz
         self.backend = backend
@@ -274,9 +302,12 @@ class Engine:
         # Steam-identified one — that IS the point of running it with --backend auto
         self.frames_mon = None
         self.steam = SteamIdentity()
-        self.frames_info: dict = {"source": "demo" if self.demo else frames_source}
         if not self.demo and frames_source != "off":
             self.frames_mon = FrameMonitor(cfg, role="liveview")
+        # `displayed`/`simulated` are recomputed from the snapshot on every tick
+        # (`_publish_frames`); these are the values for the tick before the first one.
+        self.frames_info: dict = {"source": "demo" if self.demo else frames_source,
+                                  "displayed": "none", "simulated": False}
         self.lock = threading.Lock()
         self.base: dict[tuple[str, int], Image.Image] = {}
         self.prev: dict[str, np.ndarray | None] = {s: None for s in STATES}
@@ -292,10 +323,14 @@ class Engine:
         self.render_ms = 0.0
         self.error: str | None = None
         self.started = time.time()
-        self._stamps = {p: self._stamp(p) for p in WATCH_FILES}
+        # watch the config that was actually requested: cfg["_root"] is always
+        # the repo, so a custom --config file would otherwise load once and
+        # then never be seen again
+        self._cfg_path = Path(cfg_path).resolve() if cfg_path else ROOT / "config.yaml"
+        self.watch = [Path(m.__file__) for m in HOT_MODULES] + [self._cfg_path]
+        self._stamps = {p: self._stamp(p) for p in self.watch}
         self.layouts = {s: layout_mod.Layout(cfg, rate_hz=hz) for s in STATES}
         self.samples = self.layouts["idle"].samples
-        self._cfg_path = Path(cfg["_root"]) / "config.yaml"
 
         if self.demo:
             self._make_hubs()
@@ -317,14 +352,23 @@ class Engine:
             for state, snap in (("idle", si), ("game", sg)):
                 self.layouts[state].observe(snap, state)
 
+    def _new_demo_hubs(self):
+        """Two independent demo streams, built but not yet published: idle-shaped
+        data on the left screen, game-shaped data on the right, both animating
+        from the same clock. The class check is module-qualified on purpose:
+        after a hot reload the once-imported `DemoBackend` names the class of
+        whichever generation imported it, while `demo_mod.DemoBackend` is the
+        one `make_hub` just built against — comparing against the stale name
+        rejected every legitimate reload and left the game hub un-flagged."""
+        idle = make_hub(self.cfg, force="demo")
+        game = make_hub(self.cfg, force="demo")
+        assert isinstance(idle.backend, demo_mod.DemoBackend)
+        idle.backend.game = False
+        game.backend.game = True
+        return idle, game
+
     def _make_hubs(self) -> None:
-        """Two independent demo streams: idle-shaped data on the left screen,
-        game-shaped data on the right, both animating from the same clock."""
-        self.hub_idle = make_hub(self.cfg, force="demo")
-        self.hub_game = make_hub(self.cfg, force="demo")
-        assert isinstance(self.hub_idle.backend, DemoBackend)
-        self.hub_idle.backend.game = False
-        self.hub_game.backend.game = True
+        self.hub_idle, self.hub_game = self._new_demo_hubs()
 
     @staticmethod
     def _stamp(p: Path):
@@ -336,36 +380,73 @@ class Engine:
 
     # ---- hot reload ----------------------------------------------------------
     def _maybe_reload(self) -> None:
-        changed = [p for p in WATCH_FILES if self._stamp(p) != self._stamps.get(p)]
+        changed = [p for p in self.watch if self._stamp(p) != self._stamps.get(p)]
         if not changed:
             return
-        for p in changed:
-            self._stamps[p] = self._stamp(p)
         cfg_changed = self._cfg_path in changed
         demo_changed = Path(demo_mod.__file__) in changed
+
+        # stage the candidate config before anything is touched: invalid YAML
+        # must not churn the module chain, let alone half-apply itself
+        fresh = None
+        if cfg_changed:
+            try:
+                fresh = cfgmod.load(str(self._cfg_path))
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(
+                    f"config reload failed ({e.__class__.__name__}: {e}); "
+                    f"keeping the previous config") from None
+
         # reload the whole chain in dependency order whenever anything changed:
         # each module keeps direct references to the ones before it, so a partial
-        # reload would leave the new module wired to the old classes.
-        for mod in HOT_MODULES:
-            importlib_reload(mod)
-        if cfg_changed:
-            fresh = cfgmod.load(str(self._cfg_path))
+        # reload would leave the new module wired to the old classes. And
+        # importlib re-executes modules *in place*: the dict snapshots below are
+        # what make the reload transactional — if an edit dies mid-module, the
+        # preview keeps running the last complete generation instead of a
+        # half-new, half-old one.
+        saved = [(m, dict(m.__dict__)) for m in HOT_MODULES]
+        saved_cfg = copy.deepcopy(self.cfg)
+        try:
+            if fresh is not None:
+                # publish into the live dict, never replace it: the layouts and
+                # the /ctrl handler all hold this same reference
+                self.cfg.clear()
+                self.cfg.update(fresh)
+            for mod in HOT_MODULES:
+                importlib_reload(mod)
+            if demo_changed and self.demo:
+                # existing DemoBackend objects are bound to the old class, so
+                # the streams have to be rebuilt for edited data shapes to show
+                # up — built first, published only once the whole generation is
+                # valid, flags and all
+                hubs = self._new_demo_hubs()
+            # rebuild the layouts, carrying the trend history across the reload
+            # so an edit never blanks the graphs out from under us
+            old = {s: l.history for s, l in self.layouts.items()}
+            layouts = {s: layout_mod.Layout(self.cfg, rate_hz=self.hz)
+                       for s in STATES}
+            for s, hist in old.items():
+                # a History instance is just rings + a length, so it survives the
+                # reload even though the Layout class around it was replaced
+                if hist.samples == layouts[s].history.samples:
+                    layouts[s].history = hist
+        except Exception:
+            for mod, snap in saved:
+                mod.__dict__.clear()
+                mod.__dict__.update(snap)
             self.cfg.clear()
-            self.cfg.update(fresh)
+            self.cfg.update(saved_cfg)
+            raise
+        # commit: publish the candidate generation, and only then advance the
+        # stamps of the files that loaded — a failed reload stays pending, so
+        # its error is re-surfaced every tick until a complete valid generation
+        # is running (and the repair is picked up without a restart)
         if demo_changed and self.demo:
-            # existing DemoBackend objects are bound to the old class, so the
-            # streams have to be rebuilt for edited data shapes to show up
-            self._make_hubs()
-        # rebuild the layouts, carrying the trend history across the reload so an
-        # edit never blanks the graphs out from under us
-        old = {s: l.history for s, l in self.layouts.items()}
-        self.layouts = {s: layout_mod.Layout(self.cfg, rate_hz=self.hz) for s in STATES}
-        for s, hist in old.items():
-            # a History instance is just rings + a length, so it survives the
-            # reload even though the Layout class around it was replaced
-            if hist.samples == self.layouts[s].history.samples:
-                self.layouts[s].history = hist
-        self.samples = self.layouts["idle"].samples
+            self.hub_idle, self.hub_game = hubs
+        self.layouts = layouts
+        self.samples = layouts["idle"].samples
+        for p in changed:
+            self._stamps[p] = self._stamp(p)
         self.reloads += 1
         self.reloaded_at = time.time()
         names = ", ".join(p.name for p in changed)
@@ -383,14 +464,24 @@ class Engine:
             sg = self.hub_game.tick()
             si = sg
             self._fill_frames(sg, t)
+        # whatever ended up in the game pane — measured, invented, or nothing — is
+        # reported from here, after both paths, so the page cannot describe a
+        # different tick than the one it is about to show
+        self._publish_frames(sg)
         for s in {id(si): si, id(sg): sg}.values():
-            s.power_total_w, _ = power_mod.estimate(s, self.cfg)
+            s.power_total_w = power_mod.estimate(s, self.cfg).total_w
         return si, sg
 
     def _fill_frames(self, sg, t: float) -> None:
-        """Game pane frame stats: the live ETW present stream when it's up —
-        following the busiest presenting process, preferring a Steam-identified
-        one — else the old synthetic placeholder (dev only), else honest --."""
+        """Game pane frame stats: the live ETW present stream when it is up —
+        following the busiest presenting process, preferring a Steam-identified one
+        — else nothing at all, which the pane renders as `--`; the invented
+        placeholder only with `--synth-fps on`, and then it is marked as invented.
+
+        What is left on `sg.frames` is the whole truth of the game pane. The status
+        line is read back off that snapshot afterwards (`_publish_frames`) instead of
+        being decided here, so the two views of one tick cannot drift apart.
+        """
         info: dict = {"source": "off"}
         mon = self.frames_mon
         if mon is not None:
@@ -412,6 +503,25 @@ class Engine:
         self.frames_info = info
         if self.synth:
             synth_frames(sg, t)
+
+    def _publish_frames(self, sg) -> None:
+        """Say what the game pane is showing, derived from the snapshot being drawn.
+
+        This used to be implicit: `frames_info` described the *capture* ("auto" /
+        "off") while the pane below it could be showing invented numbers, so the
+        status line and the image were two separate claims and only one of them was
+        ever looked at (issue #31). Deriving the answer from the snapshot means a
+        new source of frame numbers cannot be added here without being accounted for
+        there, and the honest `--` of a dead capture now has a name in the status too.
+        """
+        sim = bool(getattr(sg.frames, "simulated", False))
+        shown = "simulated" if sim else ("real" if sg.frames.fps is not None else "none")
+        info = {**self.frames_info, "simulated": sim, "displayed": shown}
+        if sim and sg.frames.fps is not None:
+            info["fps"] = round(float(sg.frames.fps), 1)
+        # Rebind rather than mutate: `status()` hands this dict straight to the
+        # browser, and a reader should see the old provenance or the new one.
+        self.frames_info = info
 
     def step(self) -> None:
         self._maybe_reload()
@@ -476,7 +586,7 @@ class Engine:
                 "trends": bool(self.cfg["layout"].get("trend_bands", True)),
                 "frames": self.frames_info,
                 "error": self.error, "uptime_s": round(time.time() - self.started, 1),
-                "watched": len(WATCH_FILES),
+                "watched": len(self.watch),
             }
 
 
@@ -484,14 +594,14 @@ def importlib_reload(mod):
     import importlib
     try:
         return importlib.reload(mod)
-    except Exception:  # broken edit: keep the last good module object alive
+    except Exception:  # broken edit: _maybe_reload rolls the chain back
         tb = traceback.format_exc()
         print("[liveview] reload failed:\n" + tb)
         raise RuntimeError(tb) from None
 
 
-def run(cfg, backend, hz, port, synth, frames_source="auto") -> None:
-    engine = Engine(cfg, backend, hz, synth, frames_source)
+def run(cfg, backend, hz, port, synth, frames_source="auto", cfg_path=None) -> None:
+    engine = Engine(cfg, backend, hz, synth, frames_source, cfg_path)
 
     # first tick on the main thread so the page always has something to show
     try:
@@ -577,7 +687,8 @@ def run(cfg, backend, hz, port, synth, frames_source="auto") -> None:
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     srv.daemon_threads = True
-    print(f"[liveview] http://localhost:{port}  backend={backend}  hz={hz}")
+    print(f"[liveview] http://localhost:{port}  backend={backend}  hz={hz}  "
+          f"synth_fps={'on (game pane marked SIMULATED)' if synth else 'off'}")
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -590,16 +701,27 @@ def main() -> None:
     ap.add_argument("--backend", default="demo", help="demo|auto|lhm|fallback")
     ap.add_argument("--port", type=int, default=5680)
     ap.add_argument("--hz", type=float, default=1.0, help="render ticks/second")
-    ap.add_argument("--synth-fps", default="auto", choices=["auto", "on", "off"],
-                    help="fake frame stats when the real stream has none (dev only)")
+    ap.add_argument("--synth-fps", default="off", choices=["off", "on", "auto"],
+                    help="invented frame stats when the real stream has none: off "
+                         "(default) leaves them unavailable, on shows them and marks "
+                         "the pane SIMULATED. 'auto' is accepted as 'off' — it used "
+                         "to mean 'invent them for any real backend'")
     ap.add_argument("--frames-source", default="auto", choices=["auto", "off"],
                     help="auto = PresentMon ETW for real per-process frame stats (needs admin)")
     args = ap.parse_args()
 
     cfg = cfgmod.load(args.config)
     backend = args.backend.lower()
-    synth = args.synth_fps == "on" or (args.synth_fps == "auto" and backend != "demo")
-    run(cfg, backend, args.hz, args.port, synth, args.frames_source)
+    # `auto` is kept so an old command line still runs, but it no longer means what
+    # it meant: inventing fps whenever the backend was real is how a preview came to
+    # show a steady ~118 fps while the capture was dead (issue #31). Say it out loud
+    # rather than letting the flag quietly change meaning under someone's fingers.
+    if args.synth_fps == "auto":
+        print("[liveview] --synth-fps=auto is off now: missing frame stats stay "
+              "unavailable. Pass --synth-fps on for a simulation, which the game "
+              "pane marks SIMULATED on the image.")
+    synth = args.synth_fps == "on"
+    run(cfg, backend, args.hz, args.port, synth, args.frames_source, args.config)
 
 
 if __name__ == "__main__":

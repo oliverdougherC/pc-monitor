@@ -1,6 +1,26 @@
-"""Config loading with sensible defaults."""
+"""Config loading: sensible defaults, one explicit schema, and a last-known-good.
+
+Config used to be merge-only: any YAML deep-merged happily, so `shift_every_min: 0`
+reached the render loop and divided by zero minutes into the night, `exercise_s: 0`
+did the same inside a sweep, and equal gradient endpoints broke the color ramp.
+The schema below is the one place that says what every documented key means -
+type, range, enum - so a bad value stops the app at load with the key named,
+before any thread, port or ETW child exists to be poisoned by it.
+
+Two entry points, because the two moments are different. `load()` is start-up:
+it raises rather than starting a broken run. `load_or_keep()` is live reload:
+an edited file that does not validate leaves the last-known-good config running
+and hands the problems back for the log - a typo mid-edit should not stop the
+panel or put it into a permanent error loop.
+
+Keys the schema does not mention pass through untouched on purpose: sibling
+work lands keys before this file catches up, and a validator that rejects the
+future conflicts with every PR that adds a setting. What it does reject is a
+documented key holding an undocumentable value.
+"""
 import copy
-import os
+import math
+import re
 from pathlib import Path
 
 import yaml
@@ -45,10 +65,40 @@ DEFAULTS = {
         # set false to let the timers win even during play.
         "stay_lit_in_game": True,
     },
-    "sensors": {"backend": "auto", "interval_s": 1.0},
+    "sensors": {
+        "backend": "auto", "interval_s": 1.0,
+        # The supervisor's numbers (app/sensors/__init__.py). Drivers hang and
+        # reset; these are how long the panel waits and how long it lies to
+        # itself before it stops.
+        # tick_timeout_s: how long one backend call may take before the hub
+        #   abandons it (the sample thread is leaked; nothing else dies).
+        # stale_grace_s: how long a blind tick may re-present the last good
+        #   sample (marked held, never pushed into history) before every
+        #   metric shows "--" and the trend bands draw gaps.
+        # reopen_after / reopen_backoff_s / reopen_backoff_max_s: after this
+        #   many consecutive failed samples the hub closes and re-makes the
+        #   backend (NVML handles, the LHM Computer); a reopen that itself
+        #   fails waits reopen_backoff_s, doubling to the cap, so a dead
+        #   driver is asked politely, not hammered.
+        # nvml_retry_s: how soon the fallback backend asks NVML again after a
+        #   failed open - a driver that was still loading at boot.
+        "tick_timeout_s": 2.0, "stale_grace_s": 30.0,
+        "reopen_after": 3, "reopen_backoff_s": 5.0, "reopen_backoff_max_s": 60.0,
+        "nvml_retry_s": 60.0,
+    },
     "power": {
         "base_w": 34, "rail_overhead_pct": 9, "cpu_tdp": 170, "gpu_tdp": 575,
         "gradient_min_w": 50, "gradient_max_w": 1000, "gradient_gamma": 0.75,
+        # A whole-system number is only as whole as its inputs: with a CPU or
+        # GPU reading completely missing, the strip shows "-- W partial" (or
+        # unavailable) instead of a total that silently excludes it. Set false
+        # to accept a known-components-only figure as a floor - the panel will
+        # still label it "partial".
+        "require_complete": True,
+        # Older than this and the snapshot behind the number is labelled
+        # "stale": a sensor tick that failed leaves the loop reusing the last
+        # snapshot, and yesterday's watts must not pose as this second's.
+        "max_age_s": 8.0,
         # Follow the machine, not just the idle timer: dark while it is asleep, while
         # the session is locked, and (by default) whenever Windows has turned the
         # displays off. Turn these off if you want the panel to stay lit through
@@ -78,6 +128,12 @@ DEFAULTS = {
         "strength": 1.0,
         "color_temp_k": 0,            # 0 = use whatever Windows has set
         "schedule": "",               # e.g. "21:00-07:00"; fallback only, see mode
+        # How long a failed or unreadable read may pass as transient: the panel
+        # keeps the last confirmed night appearance for this long (and, past it,
+        # keeps holding instead of brightening - a read failure is not the user
+        # turning night off). The log says when it starts holding and when the
+        # grace ran out; see app/nightlight.py.
+        "hold_grace_s": 900,
         # Night mode also dims: min(level, level × scale), never below the floor, so
         # the panel cannot be the brightest thing in a dark room.
         "brightness_scale": 0.55,
@@ -120,7 +176,16 @@ DEFAULTS = {
         # last measurement on the panel, dimmed and marked held. Past this: `--`.
         "hold_s": 12,
     },
-    "burnin": {"shift_every_min": 5, "exercise_every_h": 8, "exercise_s": 12},
+    "burnin": {
+        "shift_every_min": 5,          # 3-px layout offset: invisible, always on
+        # The full-screen colour sweep is the part of burn-in mitigation you can
+        # see, so it is off until asked for: the product goal is a panel that stays
+        # out of the way, and an unattended screen that decides to rainbow across
+        # the desk every 8 h is the one way this feature becomes a disturbance.
+        "exercise_enabled": False,
+        "exercise_every_h": 8,
+        "exercise_s": 12,
+    },
     "layout": {
         "font_value": "jetbrains-mono/JetBrainsMono-ExtraBold.ttf",
         "font_label": "roboto/Roboto-Bold.ttf",
@@ -145,13 +210,268 @@ def _merge(base: dict, over: dict) -> dict:
     return out
 
 
+class ConfigError(ValueError):
+    """The config says something the app cannot act on.
+
+    `problems` is one line per offending key - the whole list, not just the
+    first - because someone editing config.yaml over SSH should see every
+    mistake in one go, not reload-fail-reload once per typo.
+    """
+
+    def __init__(self, problems: list[str]):
+        super().__init__("; ".join(problems) or "invalid configuration")
+        self.problems = list(problems)
+
+
+# The schema. One spec per documented key, mirroring DEFAULTS' shape; a nested
+# dict means a section and recurses. Specs are tuples (kind, *args):
+#   ("bool",)                 true/false only (a YAML "yes" string is not a bool)
+#   ("str",)                  a non-empty string
+#   ("str_or_none",)          a string (possibly "") or null
+#   ("strlist",)              a list of strings (possibly empty)
+#   ("strlist_or_none",)      a list of strings or null
+#   ("enum", {..})            one of these, matched case-insensitively
+#   ("int", lo, hi)           a whole number in [lo, hi] (None = open end)
+#   ("num", lo, hi)           a finite number in [lo, hi] (None = open end)
+#   ("pos",)                  a finite number strictly > 0 (every interval that
+#                             something divides by or sleeps for; 0 is the value
+#                             that once divided by zero inside the render loop)
+#   ("nonneg",)               a finite number >= 0 (0 means "off": heartbeat,
+#                             screen-off; still rejects negative and non-finite)
+# A key absent from SCHEMA is not validated (see the module docstring).
+SCHEMA = {
+    "display": {
+        "revision": ("enum", {"simu", "tur_usb", "a", "b", "c", "d", "weact_a", "weact_b"}),
+        "com_port": ("str",),
+        "portrait_width": ("int", 1, 8192),
+        "portrait_height": ("int", 1, 8192),
+        "orientation": ("enum", {"landscape", "portrait"}),
+        "reset_on_start": ("bool",),
+        "usb_restart_on_fail": ("bool",),
+        "heartbeat_s": ("nonneg",),
+        "brightness_idle": ("int", 0, 100),
+        "brightness_game": ("int", 0, 100),
+        "brightness_dim": ("int", 0, 100),
+        "screen_off_after_min": ("nonneg",),
+        "dim_after_s": ("nonneg",),
+        "stay_lit_in_game": ("bool",),
+    },
+    "sensors": {
+        "backend": ("enum", {"auto", "lhm", "fallback", "demo"}),
+        "interval_s": ("pos",),
+    },
+    "power": {
+        "base_w": ("nonneg",),
+        "rail_overhead_pct": ("num", 0, 100),
+        "cpu_tdp": ("pos",),
+        "gpu_tdp": ("pos",),
+        "gradient_min_w": ("num", None, None),
+        "gradient_max_w": ("num", None, None),
+        "gradient_gamma": ("pos",),
+        "follow_sleep": ("bool",),
+        "follow_lock": ("bool",),
+        "follow_display": ("bool",),
+        "seed_monitor": ("bool",),
+        "wake_gap_s": ("pos",),
+    },
+    "night": {
+        "mode": ("enum", {"auto", "on", "off"}),
+        "refresh_s": ("pos",),
+        "strength": ("num", 0, 1),
+        "color_temp_k": ("nonneg",),
+        "schedule": ("str_or_none",),
+        "brightness_scale": ("num", 0, 1),
+        "brightness_floor": ("int", 0, 100),
+        "check_gamma_ramp": ("bool",),
+        "ramp_warm_margin": ("num", 0, 1),
+    },
+    "game": {
+        "processes": ("strlist",),
+        "ignore": ("strlist",),
+        "fullscreen_heuristic": ("bool",),
+        "min_gpu_load": ("num", 0, 100),
+        "enter_after_s": ("pos",),
+        "exit_after_s": ("pos",),
+        "frametime_target_ms": ("pos",),
+        "present_detection": ("bool",),
+        "detection": {
+            "enter_strong_s": ("pos",),
+            "dead_exit_s": ("pos",),
+            "switch_silence_s": ("pos",),
+            "min_gpu_score": ("num", 0, 100),
+            "non_game": ("strlist_or_none",),
+        },
+    },
+    "frames": {
+        "source": ("enum", {"auto", "off"}),
+        "path": ("str",),
+        "min_present_fps": ("pos",),
+        "window_s": ("pos",),
+        "exclude_dropped": ("bool",),
+        "role": ("str_or_none",),
+        "extra_args": ("strlist",),
+        "output_file": ("str_or_none",),
+        "hold_s": ("pos",),
+    },
+    "burnin": {
+        "shift_every_min": ("pos",),
+        "exercise_every_h": ("pos",),
+        "exercise_s": ("pos",),
+    },
+    "layout": {
+        "font_value": ("str",),
+        "font_label": ("str",),
+        "font_small": ("str",),
+        "trend_window_s": ("pos",),
+        "trend_bands": ("bool",),
+        "transition": ("enum", {"wipe", "none"}),
+        "transition_hold_s": ("nonneg",),
+    },
+}
+
+# The frame the fixed 800x480 layout draws is what gets pushed to the panel, so
+# that is the only geometry the app can render. Kept as a literal rather than
+# imported from app/layout.py (which pulls in PIL) so config stays import-light;
+# the comment names the owner so the two cannot drift unnoticed.
+RENDERABLE_WH = (800, 480)   # app/layout.py: W, H
+
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _check_leaf(path: str, spec: tuple, v) -> str | None:
+    kind = spec[0]
+    if kind == "bool":
+        return None if isinstance(v, bool) else f"{path}: must be true or false, got {v!r}"
+    if kind == "str":
+        return None if isinstance(v, str) and v else f"{path}: must be a non-empty string, got {v!r}"
+    if kind == "str_or_none":
+        return None if v is None or isinstance(v, str) else f"{path}: must be a string, got {v!r}"
+    if kind == "strlist":
+        if isinstance(v, list) and all(isinstance(x, str) for x in v):
+            return None
+        return f"{path}: must be a list of strings, got {v!r}"
+    if kind == "strlist_or_none":
+        if v is None or (isinstance(v, list) and all(isinstance(x, str) for x in v)):
+            return None
+        return f"{path}: must be a list of strings (or empty), got {v!r}"
+    if kind == "enum":
+        allowed = spec[1]
+        if isinstance(v, str) and v.lower() in allowed:
+            return None
+        return f"{path}: must be one of {{{', '.join(sorted(allowed))}}}, got {v!r}"
+    if kind == "int":
+        if not _is_num(v) or int(v) != v:
+            return f"{path}: must be a whole number, got {v!r}"
+        lo, hi = spec[1], spec[2]
+        if (lo is not None and v < lo) or (hi is not None and v > hi):
+            return f"{path}: must be a whole number in [{lo}, {hi}], got {v!r}"
+        return None
+    if kind == "num":
+        if not _is_num(v) or not math.isfinite(v):
+            return f"{path}: must be a finite number, got {v!r}"
+        lo, hi = spec[1], spec[2]
+        if (lo is not None and v < lo) or (hi is not None and v > hi):
+            return f"{path}: must be between {lo} and {hi}, got {v!r}"
+        return None
+    if kind == "pos":
+        if not _is_num(v) or not math.isfinite(v) or v <= 0:
+            return f"{path}: must be a positive number (zero and negative are not allowed), got {v!r}"
+        return None
+    if kind == "nonneg":
+        if not _is_num(v) or not math.isfinite(v) or v < 0:
+            return f"{path}: must be a number 0 or greater, got {v!r}"
+        return None
+    raise AssertionError(f"unhandled schema kind {kind!r}")   # a schema bug, not user error
+
+
+def _walk(schema: dict, node, path: str, problems: list[str]) -> None:
+    if not isinstance(node, dict):
+        problems.append(f"{path or 'config'}: must be a mapping of options, got {type(node).__name__}")
+        return
+    for key, spec in schema.items():
+        sub = f"{path}.{key}" if path else key
+        if key not in node:
+            continue    # DEFAULTS filled every documented key before we got here
+        v = node[key]
+        if isinstance(spec, dict):
+            _walk(spec, v, sub, problems)
+        else:
+            err = _check_leaf(sub, spec, v)
+            if err:
+                problems.append(err)
+
+
+def _cross_field(cfg: dict, problems: list[str]) -> None:
+    """Rules that are about two keys together, checked only once each is a
+    usable number on its own (so a bad type does not also trigger these)."""
+    p = cfg.get("power", {})
+    lo, hi = p.get("gradient_min_w"), p.get("gradient_max_w")
+    if _is_num(lo) and math.isfinite(lo) and _is_num(hi) and math.isfinite(hi) and hi <= lo:
+        problems.append(
+            f"power.gradient_max_w: must be greater than gradient_min_w ({lo}), got {hi!r} "
+            f"- the green->red ramp divides by their difference")
+
+    d = cfg.get("display", {})
+    pw, ph, ori = d.get("portrait_width"), d.get("portrait_height"), d.get("orientation")
+    if (_is_num(pw) and _is_num(ph) and isinstance(ori, str)
+            and ori.lower() in ("landscape", "portrait")):
+        # Resolve exactly as PanelLink.get_width/get_height does, then compare
+        # to the single frame the hand-placed layout can draw.
+        land = ori.lower() == "landscape"
+        w, h = (ph, pw) if land else (pw, ph)
+        if (int(w), int(h)) != RENDERABLE_WH:
+            problems.append(
+                f"display: a {ori} panel resolves to {int(w)}x{int(h)}, but the fixed layout "
+                f"only renders {RENDERABLE_WH[0]}x{RENDERABLE_WH[1]} (portrait_width/"
+                f"portrait_height/orientation)")
+
+
+def validate(cfg: dict) -> list[str]:
+    """Every problem with this config, [] when it is good. Leaves the caller
+    deciding whether that means raise (start-up) or keep-last-good (reload)."""
+    problems: list[str] = []
+    _walk(SCHEMA, cfg, "", problems)
+    _cross_field(cfg, problems)
+    return problems
+
+
+_last_good: dict | None = None
+
+
 def load(path: str | None = None) -> dict:
+    """Read, merge over defaults, and validate. Raises ConfigError naming every
+    bad key before anything can start on a config that cannot run."""
+    global _last_good
     p = Path(path) if path else ROOT / "config.yaml"
     user = {}
     if p.exists():
         user = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
     cfg = _merge(DEFAULTS, user)
+    problems = validate(cfg)
+    if problems:
+        raise ConfigError(problems)
     cfg["_root"] = str(ROOT)
     cfg["_vendor"] = str(VENDOR)
     cfg["_fonts"] = str(VENDOR / "res" / "fonts")
+    _last_good = copy.deepcopy(cfg)
     return cfg
+
+
+def load_or_keep(path: str | None = None) -> tuple[dict, list[str]]:
+    """Live reload entry point: the new config if it validates, otherwise the
+    last-known-good one still worth running, with the problems to log.
+
+    A reload is a human editing a file while the app runs; a mistake there must
+    not stop the panel or spin the loop on a value that divides by zero. We keep
+    what was working and say exactly why the edit was refused. Raises
+    ConfigError only if there is no last-known-good to fall back to (nothing has
+    loaded successfully yet), which is a start-up path, not a reload.
+    """
+    try:
+        return load(path), []
+    except ConfigError as e:
+        if _last_good is None:
+            raise
+        return copy.deepcopy(_last_good), list(e.problems)
