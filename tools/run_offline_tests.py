@@ -63,6 +63,8 @@ CASES = [
      "geometry at the value extremes: collisions and panel overflow", "fonts", None),
     ("fault", ["tools/fault_selftest.py"],
      "per-tick guard contains faults; AST pass over the loop", None, None),
+    ("sweep", ["tools/sweep_selftest.py"],
+     "burn-in sweep: one frame per tick, outranked by light/game/link", None, None),
 ]
 
 

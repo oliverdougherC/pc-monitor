@@ -120,7 +120,16 @@ DEFAULTS = {
         # last measurement on the panel, dimmed and marked held. Past this: `--`.
         "hold_s": 12,
     },
-    "burnin": {"shift_every_min": 5, "exercise_every_h": 8, "exercise_s": 12},
+    "burnin": {
+        "shift_every_min": 5,          # 3-px layout offset: invisible, always on
+        # The full-screen colour sweep is the part of burn-in mitigation you can
+        # see, so it is off until asked for: the product goal is a panel that stays
+        # out of the way, and an unattended screen that decides to rainbow across
+        # the desk every 8 h is the one way this feature becomes a disturbance.
+        "exercise_enabled": False,
+        "exercise_every_h": 8,
+        "exercise_s": 12,
+    },
     "layout": {
         "font_value": "jetbrains-mono/JetBrainsMono-ExtraBold.ttf",
         "font_label": "roboto/Roboto-Bold.ttf",

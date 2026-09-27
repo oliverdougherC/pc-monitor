@@ -185,6 +185,12 @@ frames:
 
 burnin:
   shift_every_min: 5       # global pixel-shift of the layout
+  # The full-screen color sweep is opt-in: it is the one part of burn-in mitigation
+  # anybody can see, and "unobtrusive" is the product goal. Set true to get it back.
+  # It now advances one frame per control-loop tick, so a monitor-off, a lock, a
+  # suspend query or a game start arriving mid-sweep ends it on the next tick rather
+  # than after the animation.
+  exercise_enabled: false
   exercise_every_h: 8      # full-screen color sweep "refresh" animation
   exercise_s: 12
 

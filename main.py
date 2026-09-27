@@ -155,6 +155,52 @@ def _thread_safety_net() -> None:
         pass
 
 
+def sweep_step(burn, layout, pusher, plan, state: str, panel_ok: bool,
+               g: "Guard", now: float | None = None) -> bool:
+    """Advance the burn-in exercise by at most one frame. True if one was pushed.
+
+    The sweep used to run to completion *inside* a single tick, in a nested `while`
+    with its own `time.sleep(0.12)`. Twelve shipped seconds, then, in which the loop
+    read no host state, made no light decision and asked the game detector nothing:
+    a monitor turning off, a lock, a suspend query or a game starting mid-animation
+    was ignored until the animation ended. And because every one of its ~100 pushes
+    could additionally wait on the transport deadline, twelve seconds was a floor and
+    not a ceiling — the worst case was a sweep that outlived the fault it was
+    oblivious to.
+
+    One frame per iteration makes every sweep frame carry this tick's decisions, and
+    it costs a coarser animation on a screen whose exercise nobody watches. Whether
+    the sweep owned the tick is the caller's cue to skip the normal frame, so a sweep
+    tick pays exactly what a normal tick pays — one frame on the bus either way.
+
+    Anything meaning "nobody can see this" abandons the exercise instead of pausing
+    it with the screen half-rainbow'd: `BurnIn.defer` restarts the interval, which is
+    the same treatment the dark branch of the light policy already gives it. A link
+    that is down is in that list too — pushing into it would pay the write deadline
+    for pixels that cannot arrive, which is how a sweep becomes a recovery loop.
+    """
+    now = time.monotonic() if now is None else now
+    if not (burn.exercise_due(now) or burn.exercise_progress(now) is not None):
+        return False
+    if plan.dark or state == "game" or not panel_ok:
+        burn.defer(now)
+        g.run("invalidate", pusher.invalidate)      # next lit frame must be whole
+        return False
+    p = burn.exercise_progress(now)
+    if p is None:                                   # the exercise just finished
+        g.run("invalidate", pusher.invalidate)
+        return False
+    img = g.run("sweep-frame", lambda: layout.sweep(p), None)
+    if img is None:
+        # The sweep cannot draw: abandon it rather than spend the rest of the
+        # exercise discovering that again, one guarded fault per tick.
+        burn.defer(now)
+        g.run("invalidate", pusher.invalidate)
+        return False
+    g.run("sweep-push", lambda: pusher.push(img))
+    return True
+
+
 def light_text(plan) -> str:
     """The beat's `light=` field: `dark(idle)`, `lit 45`, or `lit 70+play`.
 
@@ -432,21 +478,13 @@ def main() -> None:
                     g.run("invalidate", pusher.invalidate)
 
         # ---- burn-in: exercise sweep (idle, and only on a lit panel) ----------
-        if not dump_mode and not plan.dark and (burn.exercise_due(t0)
-                                                or burn.exercise_progress(t0) is not None):
-            while True:
-                now = time.monotonic()
-                p = burn.exercise_progress(now)
-                if p is None or state == "game":
-                    break
-                sweep = g.run("sweep-frame", lambda: layout.sweep(p), None)
-                if sweep is not None:
-                    g.run("sweep-push", lambda: pusher.push(sweep))
-                time.sleep(0.12)
-                if sweep is None:
-                    break       # the sweep cannot draw; do not spin on it for 8 s
-            if pusher is not None:
-                g.run("invalidate", pusher.invalidate)   # restore full frame after sweep
+        # A call, not a loop: `sweep_step` advances one frame and lets this tick's
+        # light plan, game state and link health veto it. `panel.ok` is a plain
+        # attribute, so asking it costs the tick nothing and cannot be a second way
+        # for the device to fail.
+        sweep_owned = g.run("sweep", lambda: sweep_step(
+            burn, layout, pusher, plan, state, panel is not None and panel.ok, g),
+            False)
 
         # shift changed → next push is automatically full via diff (large change)
         shift = burn.shift()
@@ -468,7 +506,9 @@ def main() -> None:
                     return
         else:
             assert pusher is not None
-            if frame is not None and not plan.dark:
+            # `sweep_owned` is the one frame this tick already paid for: pushing the
+            # telemetry frame underneath it would double the bus and undo the sweep.
+            if frame is not None and not plan.dark and not sweep_owned:
                 if state_changed and can_wipe:
                     g.run("wipe", lambda: wipe(pusher, layout.blank(), frame, hold_s))
                 else:
