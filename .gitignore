@@ -11,6 +11,21 @@ lhm_dump.txt
 # specific, and its presence means "a device needs re-enabling" - never a source file.
 .panel_reset_pending
 
+# The observer's three files (app/liveness.py): the beat the watchdog reads, the marker
+# saying a shutdown was on purpose, and the restart budget. All per-machine runtime
+# state - and committing the stop marker would let one developer's Ctrl-C silently
+# disable recovery on every machine that later checks out this branch.
+.heartbeat
+.stopped
+.restarts
+
+# boot.log is the diagnostic path that still works with no vendored logger
+# (app/bootlog.py), so it is written on every start; watchdog.log is the observer's
+# incident record. Both are logs, not sources.
+boot.log
+watchdog.log
+watchdog.log.old
+
 # theme/render scratch
 preview/
 shots/

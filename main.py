@@ -37,6 +37,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
+from app import bootlog                                # noqa: E402
 from app import config as cfgmod                       # noqa: E402
 from app.burnin import BurnIn                          # noqa: E402
 from app.display import app_log                        # noqa: E402
@@ -45,6 +46,8 @@ from app.gamewatch import GameWatch                    # noqa: E402
 from app.hoststate import HostState                    # noqa: E402
 from app.layout import Layout                          # noqa: E402
 from app.lights import LightPlanner                    # noqa: E402
+from app.liveness import beat as beat_liveness         # noqa: E402
+from app.liveness import mark_stopped                  # noqa: E402
 from app.nightlight import NightLight                  # noqa: E402
 from app.output import DiffPusher, wipe, wipe_supported   # noqa: E402
 from app.panel import PanelLink                        # noqa: E402
@@ -52,13 +55,58 @@ from app.power import estimate                         # noqa: E402
 from app.sensors import make_hub                       # noqa: E402
 from app.steamid import SteamIdentity                  # noqa: E402
 
+# How long to leave a sensor backend that failed to start alone before asking it again.
+# Longer than a tick, shorter than a logon: the COM port and LibreHardwareMonitor's
+# ring0 handle are both usually ready within a few seconds of this app giving up.
+SENSOR_RETRY_S = 20.0
+PRIME_TRIES = 5
+PRIME_WAIT_S = 2.0
+
+# The start-up story is mirrored into boot.log until the loop is running. After that
+# only when log.log cannot be written, so the mirror is a fallback and not a second log.
+_boot_phase = True
+_log_path_ok: bool | None = None
+
+
+def vendor_logger_ok() -> bool:
+    """Can `log.log` actually be written? Asked once, then remembered.
+
+    `app_log` swallows every failure of the vendored logger, which is exactly right in
+    the middle of a tick and useless as an answer to "can I rely on log.log on this
+    machine". A clean clone has no vendored checkout at all — `vendor/` is a pin plus a
+    provenance note — and the answer there is no, which is how a start-up that died
+    before the library loaded used to leave no trace anywhere.
+    """
+    global _log_path_ok
+    if _log_path_ok is None:
+        try:
+            from app.display import ensure_vendor_path
+            ensure_vendor_path()
+            import library.log                          # noqa: F401
+            _log_path_ok = True
+        except BaseException:   # noqa: BLE001 - absence is a real answer, not a fault
+            _log_path_ok = False
+    return _log_path_ok
+
 
 def status(msg: str) -> None:
     """Report something worth reading: print() for a console run, and log.log,
     because the scheduled task runs pythonw.exe, where sys.stdout is None and
-    every print() silently vanishes."""
-    print(msg)
+    every print() silently vanishes.
+
+    And when `log.log` is not there to be written to — no vendored logger, a clean
+    install, a permissions problem — the line goes to boot.log instead, which needs
+    nothing but the standard library. The start-up lines are mirrored into both while
+    the app is still starting up, because that is the window where the app is most
+    likely to die and least likely to have a working logger yet.
+    """
+    try:
+        print(msg)
+    except (UnicodeEncodeError, ValueError):    # pragma: no cover - pythonw: no stdout
+        pass
     app_log(msg)
+    if _boot_phase or not vendor_logger_ok():
+        bootlog.note(msg)
 
 
 def _console_safe() -> None:
@@ -168,7 +216,33 @@ def light_text(plan) -> str:
     return f"lit {plan.brightness}{'+play' if plan.idle_held else ''}"
 
 
+def _prime(hub, tries: int = PRIME_TRIES, wait_s: float = PRIME_WAIT_S,
+           log=status, sleep=time.sleep):
+    """Take the first sensor sample, with a short bounded retry. None if it never came.
+
+    Two samples are needed before an interval counter can say anything, so the loop's
+    first tick is blank either way — what matters is that a *failure* here is not fatal.
+    A machine that is still coming up usually needs seconds, so this waits a little;
+    past that it gives up and lets the loop carry on, because the loop already keeps the
+    last snapshot when a read fails and reports the fault once per quiet window.
+    """
+    if hub is None:
+        return None
+    last: Exception | None = None
+    for n in range(tries):
+        try:
+            return hub.tick()
+        except Exception as e:  # noqa: BLE001 - refusing to die is the whole point
+            last = e
+            if n + 1 < tries:
+                sleep(wait_s)
+    log(f"[sensors] first sample failed ({type(last).__name__}: {last}) — starting "
+        f"without a snapshot; the loop keeps retrying every tick")
+    return None
+
+
 def main() -> None:
+    global _boot_phase        # set False once the loop is running; see `status()`
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default=None)
     ap.add_argument("--backend", default=None, help="auto|lhm|fallback|demo")
@@ -178,8 +252,20 @@ def main() -> None:
     args = ap.parse_args()
     _console_safe()
 
+    # Containment and a diagnostic path come first, before anything that can fail.
+    # Both of these used to be installed further down, after the config read, the
+    # sensor hub, the ETW child, the panel link and the first sensor sample. A
+    # transient failure in any of those ended the process before the machinery meant to
+    # contain it existed, and (with no vendored logger to write to) ended it without
+    # leaving a sentence anywhere.
+    _thread_safety_net()
+    g = Guard()
+    bootlog.note(f"[boot] start argv={' '.join(sys.argv[1:]) or '-'}")
+
+    # The config is read outside the guard on purpose. A bad config is not a transient
+    # hardware fault: retrying it is how a permanent mistake turns into a restart loop,
+    # so it is reported once, loudly, and the process stops (see `__main__`).
     cfg = cfgmod.load(args.config)
-    hub = make_hub(cfg, force=args.backend)
     interval = float(cfg["sensors"]["interval_s"])
     layout = Layout(cfg, rate_hz=1.0 / interval)
     watch = GameWatch(cfg)
@@ -188,9 +274,22 @@ def main() -> None:
     night = NightLight(cfg, refresh_s=float(cfg["night"].get("refresh_s", 3.0)))
     lights = LightPlanner(cfg, night=night, host=host)
 
+    # Everything below here reaches outside the process, which is where "not yet" is a
+    # normal answer at logon. Each one is allowed to fail into a degraded run that the
+    # loop retries, rather than into a dead process that waits for the next logon.
+    hub = g.run("sensors-init", lambda: make_hub(cfg, force=args.backend), None)
+    if hub is None:
+        status("[sensors] backend did not start — running degraded: the panel link, the "
+               "sleep/lock rules and the light policy all keep working, and the backend "
+               f"is retried every {SENSOR_RETRY_S:.0f} s")
+
     # real per-process present telemetry (ETW, needs admin); degrades to None/{}
-    frames_mon = FrameMonitor(cfg) if str(cfg["frames"].get("source", "auto")) != "off" else None
-    steam = SteamIdentity()
+    frames_mon = (g.run("frames-init", lambda: FrameMonitor(cfg), None)
+                  if str(cfg["frames"].get("source", "auto")) != "off" else None)
+    steam = g.run("steam-init", SteamIdentity, None)
+    if frames_mon is None and str(cfg["frames"].get("source", "auto")) != "off":
+        status("[frames] the present capture could not start — frame stats off, legacy "
+               "detection only; needs a restart to try the ETW session again")
     if frames_mon is not None:
         import atexit
         atexit.register(frames_mon.close)  # don't leave an orphaned ETW session behind
@@ -218,13 +317,21 @@ def main() -> None:
 
     if not dump_mode:
         # The link owns the device: it survives a vanished COM port, a wedged
-        # endpoint, and the panel rebooting into its own default orientation.
-        panel = PanelLink(cfg, log=status)
-        pusher = DiffPusher(panel)
-        if not panel.open(on_relink=pusher.invalidate):
-            status(f"[panel] no screen on start ({panel.down_reason}) — continuing anyway, "
-                   f"the loop keeps retrying every 10 s; plug it in and it will come up")
-        panel_desc = f"{panel.get_width()}x{panel.get_height()}"
+        # endpoint, and the panel rebooting into its own default orientation. Building
+        # it is the part that can fail on a machine still enumerating USB, and a screen
+        # that is not there yet is not a reason to stop the sensor loop.
+        panel = g.run("panel-init", lambda: PanelLink(cfg, log=status), None)
+        if panel is None:
+            pusher = None
+            panel_desc = "link not built"
+            status("[panel] the link could not be built — the loop retries it on its "
+                   "own clock; everything except the pixels keeps working")
+        else:
+            pusher = DiffPusher(panel)
+            if not panel.open(on_relink=pusher.invalidate):
+                status(f"[panel] no screen on start ({panel.down_reason}) — continuing anyway, "
+                       f"the loop keeps retrying every 10 s; plug it in and it will come up")
+            panel_desc = f"{panel.get_width()}x{panel.get_height()}"
     else:
         panel_desc = "headless dump"
     if frames_mon is None:
@@ -246,17 +353,19 @@ def main() -> None:
     prev_state = None
 
     from app.sensors.demo import DemoBackend
-    demo = hub.backend if isinstance(hub.backend, DemoBackend) else None
+    demo = (None if hub is None else
+            hub.backend if isinstance(hub.backend, DemoBackend) else None)
 
-    # prime interval-based counters
-    prev_snap = hub.tick()
+    # Prime the interval-based counters. The first sample is where a machine that is
+    # still coming up says so — LibreHardwareMonitor's ring0 handle, NVML, a COM port
+    # that has not enumerated yet — and this was the one unguarded call standing between
+    # "the app started" and "the loop is running": a transient failure here ended the
+    # process while the guard was still two lines further down.
+    prev_snap = g.run("sensors-prime", lambda: _prime(hub), None)
     time.sleep(0.2)
 
-    # Containment for everything the loop cannot control, and a first light decision
-    # so a fault in the planner later on has something to fall back to instead of
-    # leaving `plan` unbound in front of the panel.
-    _thread_safety_net()
-    g = Guard()
+    # A first light decision so a fault in the planner later on has something to fall
+    # back to instead of leaving `plan` unbound in front of the panel.
     # A process that starts while the displays are already asleep is never told so:
     # `GUID_CONSOLE_DISPLAY_STATE` reports changes. Seed the answer from the power
     # scheme, or a reboot into a dark room leaves the desk panel lit until the idle
@@ -284,19 +393,38 @@ def main() -> None:
     beat_every_s = float(cfg["display"].get("heartbeat_s", 900))
     next_beat = time.monotonic() + 60.0
     started = time.monotonic()
+    ticks = 0
+    hub_retry_at = 0.0
+    # The start-up story is over: from the first tick on, boot.log only mirrors what
+    # log.log could not hold, so it stays a bootstrap record instead of a second copy.
+    _boot_phase = False
     while True:
         t0 = time.monotonic()
-        try:
-            snap = hub.tick()
-        except Exception as e:  # noqa: BLE001 - a sensor that throws once must not stop the panel
-            errors += 1
-            if f"{type(e).__name__}" != last_err or t0 - last_err_at > 300.0:
-                last_err, last_err_at = f"{type(e).__name__}", t0
-                status(f"[sensors] tick failed ({type(e).__name__}: {e}) — using the last "
-                       f"snapshot; {errors} total")
-            snap = prev_snap
+        ticks += 1
+        if hub is None:
+            # No backend yet. Ask again on the loop's clock: a COM port that had not
+            # enumerated at logon is usually there a minute later, and the app that
+            # gave up during start-up is the one that never finds that out.
+            if t0 - hub_retry_at >= SENSOR_RETRY_S:
+                hub_retry_at = t0
+                hub = g.run("sensors-init",
+                            lambda: make_hub(cfg, force=args.backend), None)
+                if hub is not None:
+                    status("[sensors] backend is back — resuming telemetry")
+        if hub is not None:
+            try:
+                snap = hub.tick()
+            except Exception as e:  # noqa: BLE001 - a sensor that throws once must not stop the panel
+                errors += 1
+                if f"{type(e).__name__}" != last_err or t0 - last_err_at > 300.0:
+                    last_err, last_err_at = f"{type(e).__name__}", t0
+                    status(f"[sensors] tick failed ({type(e).__name__}: {e}) — using the last "
+                           f"snapshot; {errors} total")
+                snap = prev_snap
+            else:
+                prev_snap = snap
         else:
-            prev_snap = snap
+            snap = None
 
         dt = min(max(t0 - tick_dt, 0.0), 60.0)   # a frozen loop must not fake a long dt
         tick_dt = t0
@@ -306,7 +434,7 @@ def main() -> None:
         # COM port came back (or has not yet), the panel rebooted into portrait, the
         # ETW session is a husk, and the game we locked onto was frozen mid-frame.
         reason = g.run("take-resume", host.take_resume, None)
-        if reason and not dump_mode:
+        if reason and not dump_mode and panel is not None:
             status(f"[resume] {reason} — {g.text('host.summary', host.summary)}")
             # Each recovery on its own: a relink that raises must not also leave the
             # capture dead, or one fault becomes two.
@@ -320,8 +448,41 @@ def main() -> None:
         # Background link maintenance: when the screen is down this retries the port
         # on its own clock (and, past a couple of minutes, asks Windows to restart the
         # USB device). Cheap and immediate when it is up.
-        if not dump_mode:
+        if not dump_mode and panel is not None:
             g.run("panel", lambda: panel.tick())
+        elif not dump_mode:
+            # The link itself could not be built at start-up. Rebuild it here rather
+            # than give up on the screen for the rest of the run: by now the device may
+            # well exist, and this is the only other place that knows to ask.
+            panel = g.run("panel-init", lambda: PanelLink(cfg, log=status), None)
+            if panel is not None:
+                pusher = DiffPusher(panel)
+                g.run("panel-open", lambda: panel.open(on_relink=pusher.invalidate))
+                status("[panel] link built on the retry — the screen is back in play")
+
+        if snap is None:
+            # Degraded: there are no numbers, so there is nothing to draw and nothing
+            # to detect. This is deliberately not a frozen tick. The two things that
+            # need no telemetry still happen — the link retry above, and the one light
+            # decision below — so a machine that sleeps, locks or idles while the
+            # sensors are down still gets the dark panel it asked for. Losing that is
+            # the one output mistake a degraded start-up must not be allowed to make.
+            plan = g.run("lights", lambda: lights.tick("idle", host.idle_s, dt), plan)
+            if not dump_mode and panel is not None and pusher is not None:
+                if plan.dark:
+                    g.run("screen-off", lambda: panel.screen(False))
+                    burn.defer(t0)
+                else:
+                    g.run("warm-lut", lambda: layout.set_warm(plan.lut))
+                    g.run("brightness", lambda: panel.set_brightness(plan.brightness))
+                    g.run("screen-on", lambda: panel.screen(True))
+            # Say it to the outside world too: an observer that cannot see this tick
+            # will restart an app that is degraded but perfectly alive.
+            beat_liveness(tick=ticks, state="degraded")
+            sleep_left = interval - (time.monotonic() - t0)
+            if sleep_left > 0:
+                g.run("wait", lambda: host.wait(sleep_left))
+            continue
 
         if dump_mode:
             presenters = g.run("presents", lambda: frames_mon.presenters()
@@ -407,7 +568,7 @@ def main() -> None:
             last_light = plan.reason
             if plan.reason != "lit":
                 status(f"[light] {plan.describe()}")
-        if not dump_mode:
+        if not dump_mode and panel is not None and pusher is not None:
             if plan.dark:
                 if dark_logged != plan.reason:
                     dark_logged = plan.reason
@@ -467,8 +628,12 @@ def main() -> None:
                     print(f"saved {out}")
                     return
         else:
-            assert pusher is not None
-            if frame is not None and not plan.dark:
+            # `pusher` is None only when the link could not be built at all. The frame
+            # is still rendered and the history still fed, so the moment the retry lands
+            # there is something current to show; an `assert` here used to be a way for
+            # a screen that is not plugged in to end the process two lines after the
+            # guard promised it never could.
+            if pusher is not None and frame is not None and not plan.dark:
                 if state_changed and can_wipe:
                     g.run("wipe", lambda: wipe(pusher, layout.blank(), frame, hold_s))
                 else:
@@ -480,6 +645,13 @@ def main() -> None:
 
         # Park on the event flag, not on the clock: a suspend query or a display-off
         # has seconds, not a whole tick, to be acted on.
+        # Progress, written for the one reader that is not this loop. The `[beat]` line
+        # proves the loop is alive to whoever reads log.log; this proves it to something
+        # that is neither in this process nor able to read that file, which is the only
+        # way a *hung* loop is observable at all — its own log cannot say anything,
+        # because the line that would say it is the line that never gets written.
+        # Cheap by construction: one small file, replaced atomically, never raises.
+        beat_liveness(tick=ticks, state=state)
         if t0 >= next_beat:
             next_beat = t0 + beat_every_s
             up = int(t0 - started)
@@ -526,10 +698,25 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        pass
+        # Stopped on purpose, so say so where the outside observer looks: recovery
+        # that relaunches the app the user just stopped is not recovery. Not written
+        # from `atexit`, because an unhandled exception unwinds through `atexit` too,
+        # and that is precisely the case the observer must still act on.
+        mark_stopped("keyboard-interrupt")
+        bootlog.note("[boot] stopped on request (Ctrl-C)")
     except BaseException:  # noqa: BLE001 - start-up is the one place a death is final
         # Setup failures (config unreadable, sensors library missing, port denied)
         # still end the process — but under pythonw.exe nothing else would ever say
-        # so. A crash must leave a sentence in the log, never silence.
-        app_log("[fatal] " + traceback.format_exc(limit=6).strip().replace("\n", " | "))
+        # so. A crash must leave a sentence in the log, never silence. It has to reach
+        # boot.log as well, because on the machine where the vendored logger is the
+        # thing that went wrong, log.log is exactly the file that will not be written.
+        # Exiting non-zero is the point: that is what the task's bounded
+        # restart-on-failure policy reacts to, and `app/liveness.py` is what keeps it
+        # from becoming a relaunch loop.
+        detail = traceback.format_exc(limit=6).strip().replace("\n", " | ")
+        app_log("[fatal] " + detail)
+        bootlog.note("[fatal] " + detail
+                     + " — exiting non-zero: the task retries a bounded number of times "
+                     "and then leaves it alone. If the cause is the config or the "
+                     "install, restarting will not help.")
         raise

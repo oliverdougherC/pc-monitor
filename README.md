@@ -39,6 +39,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\nightlight_probe.py --selftest   # the CloudStore decode, pinned to real blobs
 .venv\Scripts\python tools\panel_link_selftest.py     # link survives raise/hang, rebuilds, walks its device ladder
 .venv\Scripts\python tools\fault_selftest.py          # nothing outside the per-tick guard (AST-checked)
+.venv\Scripts\python tools\recovery_selftest.py       # bad morning: start-up, death, hang, budget
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
 ```
 
@@ -67,6 +68,8 @@ state, how many bands a partial panel update would need (same math as
 | `app/history.py` | bounded ring buffers feeding the trend bands |
 | `app/output.py` | numpy diff → only changed bands are sent to the panel |
 | `app/burnin.py` | 3-px layout shift and the periodic color sweep (brightness/screen-off moved out to `app/lights.py`) |
+| `app/bootlog.py` | the start-up story without the vendored logger: stdlib-only, bounded, never raises — `log.log` is written by `library.log`, which a clean install does not have |
+| `app/liveness.py` | the heartbeat file, the deliberate-shutdown marker, and the restart decision (ok / hold / backoff / permanent / restart / start) with a bounded budget and doubling backoff |
 | `tools/liveview.py` | dev server: live idle+game two-up, hot-reload, push-cost stats, real present-stream fps |
 | `tools/layout_check.py` | geometry guard: value extremes → collisions / panel overflow |
 | `tools/frames_probe.py` | what the PresentMon stream sees right now: presenters, AppIDs, fps/frametime |
@@ -77,6 +80,8 @@ state, how many bands a partial panel update would need (same math as
 | `tools/nightlight_probe.py` | prints what Windows actually stores; `--selftest` replays the captured blobs, `--watch 30` follows a manual toggle |
 | `tools/panel_link_selftest.py` | the link against the simulated panel and against deliberately bad devices: raise, hang, rebuild — plus the three-rung device ladder, its order and cadence, and the disable/enable journaling (including "a refused disable is never followed by an enable") |
 | `tools/lights_selftest.py` | the light decision end to end: sleep, displays-off, idle, dim, precedence, the night cap and LUT, and a rendered frame measured before/after the warmth |
+| `tools/recovery_selftest.py` | the bad morning: the bootstrap log with no vendored logger, the heartbeat file, every branch of the restart decision (including the one that refuses), guard-installed-before-the-risky-calls (AST), the degraded no-sensor tick, and what the installer registers |
+| `tools/watchdog_autostart.ps1` | the outside observer: reads `.heartbeat`, asks `python -m app.liveness decide`, and stops/starts **the task** (never a process) on the answer |
 | `tools/fault_selftest.py` | the per-tick guard: fallback + one log line per fault, `SystemExit` contained, Ctrl-C not — plus an AST pass that fails if any subsystem call in the loop has escaped the guard |
 | `tools/hoststate_probe.py` | live watcher at 2 Hz: what each power/session event did to the state (`--trace` for raw window messages) |
 | `tools/screen_wake_probe.py` | raw serial HELLO / TURNON / RESTART: is the panel deaf, and does anything bring it back |
@@ -563,7 +568,26 @@ problem; the awake gadget only exists once the panel has enumerated properly.
 
    Remove it again with `tools\install_autostart.ps1 -Remove` (elevated). To watch
    what it did: `schtasks /query /tn PCMonitor /v /fo LIST`, and the app's own
-   start-up trace lands in `log.log` next to `main.py`.
+   start-up trace lands in `log.log` next to `main.py` — plus `boot.log`, which is
+   the same story written without the vendored logger, for the case where the
+   vendored logger is part of what went wrong.
+
+   **When it stops.** Three failures, three mechanisms, because they look identical
+   from the outside (a frozen panel) and nothing else:
+
+   * *a fatal start-up* exits non-zero, and the task restarts it — a bounded 3 times
+     per 5 minutes. A bad config is reported once and stays dead: retrying a
+     permanent mistake is how an outage becomes a relaunch loop.
+   * *a crash* is the same path, and `app/liveness.py` keeps the attempts honest.
+   * *a hung loop* cannot report itself — the `[beat]` line is written by the loop
+     that hung, and `ExecutionTimeLimit` is unlimited because this task runs for
+     weeks. So `.heartbeat` is written once per tick and `PCMonitorWatchdog` checks it
+     every 5 minutes; six hundred seconds of silence is a restart, and the whole
+     policy (stall threshold, budget, backoff, `permanent`) is
+     `python -m app.liveness decide`, which is what makes it testable without waiting
+     for a hang. It stops and starts **the task**, never a process, and a deliberate
+     Ctrl-C writes `.stopped` so recovery does not undo it. Incidents go to
+     `watchdog.log`.
 
    A healthy start looks like this (the app logs its own banner, because
    `pythonw.exe` has no stdout and every `print()` would otherwise vanish):
