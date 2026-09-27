@@ -104,6 +104,11 @@ night:
   strength: 1.0         # 1.0 = the colour temperature you set; lower blends to neutral
   color_temp_k: 0       # 0 = whatever Windows has set; a number overrides it
   schedule: ""          # e.g. "21:00-07:00" — only used when the state can't be read
+  # A failed or unreadable read is a transient failure, not you turning night
+  # off: the panel keeps the last confirmed night appearance while it lasts,
+  # holding it (never brightening) even past this grace, with one log line on
+  # entering the hold and one when the grace runs out. See app/nightlight.py.
+  hold_grace_s: 900
   # Night mode also dims, or a 45%-brightness panel in a dark room is the light you
   # just turned off at the lamp: level = max(floor, level x scale).
   brightness_scale: 0.55

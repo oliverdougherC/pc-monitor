@@ -28,8 +28,11 @@ Verified on this desk 2026-10-09 against the live values: the state payload is
 `4342010010 00 D00A02 C614<filetime>` — field 0 present, i.e. ON — with settings
 temperature 2525 K and a disabled schedule, which is exactly what Quick Settings
 showed. Nothing here guesses: `parse_state`/`parse_settings` either decode the
-fields or return `None`, and an undecodable blob degrades to "unknown", which the
-caller treats as "fall back to the configured schedule" and says so in the log.
+fields or return `None`, and an undecodable blob degrades to "unknown". Unknown
+is a third answer, never a quiet "off": CloudStore is rewritten by another
+process, so a failed read holds the last *confirmed* appearance (see
+`NightLight`) instead of flashing the panel back to day brightness, and the log
+says where every answer came from.
 
 The panel has no colour-temperature hardware, so the warmth is applied to the
 pixels: `warm_lut()` builds a 768-entry per-channel LUT from the Kelvin value
@@ -42,6 +45,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from dataclasses import dataclass
 
 # Bond CompactBinary v1 type ids (only the ones the night-light schemas use).
 _STOP, _STOP_BASE, _BOOL, _UINT8, _UINT16, _UINT32, _UINT64 = 0, 1, 2, 3, 4, 5, 6
@@ -259,6 +263,28 @@ def parse_settings(blob: bytes) -> dict | None:
     }
 
 
+# ------------------------------------------------------------------ appearances
+@dataclass(frozen=True)
+class NightAppearance:
+    """One coherent night look, published from a single read.
+
+    Bundled so the panel can never act on a mixture - a fresh ON beside the
+    old warmth, or an old ON beside a fresh warmth. `source` and `detail` say
+    where the answer came from; `state_mtime` is the CloudStore wrapper's own
+    write time (0.0 when the answer was inferred rather than read), and
+    `since` is the monotonic clock when it was confirmed - what the hold
+    grace period is measured against.
+    """
+
+    on: bool
+    temp_k: int | None
+    gains: tuple[float, float, float] | None
+    source: str
+    detail: str
+    state_mtime: float = 0.0
+    since: float = 0.0
+
+
 # ------------------------------------------------------------------- the reader
 class NightLight:
     """Answers "is the user's night mode on, and how warm did they set it?".
@@ -267,17 +293,30 @@ class NightLight:
     doing one every second) and *self-describing*: the first read logs the whole
     decode, because a wrong read here is invisible on the panel — it just never
     goes amber, or never stops being amber.
+
+    The answer is published as a whole `NightAppearance`, and the last confirmed
+    one survives a blind poll: CloudStore is rewritten by another process, so a
+    torn read or a missing key is a transient failure, not the user turning the
+    light off. While holding, `stale` is True and the detail says so; past
+    `hold_grace_s` the policy is explicitly to keep holding, because the
+    alternative — guessing "day" from a store we cannot read — is the one
+    outcome that brightens a dark room on a read error. A *confirmed* read
+    replaces the appearance at once, OFF included.
     """
 
     def __init__(self, cfg: dict, refresh_s: float = 3.0):
         self.cfg = cfg.get("night", {})
         self.refresh_s = refresh_s
         self._next = 0.0
-        self.on: bool | None = None       # None = unknown (no signal at all)
+        self.on: bool | None = None   # None = unknown (nothing ever confirmed)
         self.temp_k: int | None = None
         self.gains: tuple[float, float, float] | None = None   # measured warm ramp
         self.source = "unknown"           # windows | windows-schedule | ramp | config | unknown
         self.detail = "not read yet"
+        self.stale = False                # True while holding the last appearance
+        self.appearance: NightAppearance | None = None
+        self.hold_grace_s = float(self.cfg.get("hold_grace_s", 900))
+        self._held_since = 0.0
         self._said: tuple = ()
         self._reads = 0
 
@@ -293,12 +332,23 @@ class NightLight:
         except OSError:
             return None       # absent value = the feature has never been touched
 
-    def _read_windows(self) -> tuple[bool | None, int | None, str]:
+    def _read_windows(self) -> tuple[bool | None, int | None, str, str, float]:
+        """(on, temp_k, source, detail, state_mtime) from the two CloudStore blobs.
+
+        `state_mtime` is the wrapper timestamp of the blob the on/off answer
+        came from - Windows' own write time for it, kept so a published
+        appearance can say how fresh it is instead of re-guessing. The two
+        blobs are read apart because they are written apart; the caller turns
+        their answer into one appearance, so a half-failure never swaps in a
+        new state beside an old warmth.
+        """
         state = settings = None
+        state_mtime = 0.0
         try:
             raw = self._blob(_STATE_KEY)
             if raw:
-                state = parse_state(unwrap(raw)[1])
+                state_mtime, inner = unwrap(raw)
+                state = parse_state(inner)
         except CBError:
             state = None
         try:
@@ -322,11 +372,14 @@ class NightLight:
             det = f"state enabled={state['enabled']} schedule-now={sched}"
             if state.get("last_change"):
                 det += ", changed " + time.strftime("%H:%M:%S", state["last_change"])
+            if state_mtime:
+                det += ", written " + time.strftime("%H:%M:%S",
+                                                    time.localtime(state_mtime))
             if settings:
                 det += (f"; schedule={settings['schedule']} "
                         f"{'set-hours' if settings['set_hours'] else 'sunset-sunrise'}"
                         f" {_hhmm(settings['start'])}-{_hhmm(settings['end'])} temp={temp}K")
-            return on, temp, "windows", det
+            return on, temp, "windows", det, state_mtime
         if settings and settings["schedule"]:
             # No state blob but a schedule we can evaluate ourselves: honest,
             # and it keeps night mode working on a build that stores state
@@ -337,20 +390,22 @@ class NightLight:
             det = (f"no state blob; schedule {_hhmm(settings['start'])}-"
                    f"{_hhmm(settings['end'])} now={now.tm_hour:02d}:{now.tm_min:02d} "
                    f"{'in' if win else 'outside'} window")
-            return win, temp, "windows-schedule", det
-        return None, temp, "unknown", "no readable night-light state in CloudStore"
+            return win, temp, "windows-schedule", det, 0.0
+        return (None, temp, "unknown", "no readable night-light state in CloudStore", 0.0)
 
-    def _read(self) -> None:
+    def _read(self, now: float) -> None:
         mode = str(self.cfg.get("mode", "auto")).lower()
         if mode == "on":
-            self.on, self.source, self.detail = True, "config", "night.mode: on"
-            self.temp_k = int(self.cfg.get("color_temp_k") or 0) or self.temp_k
+            temp = int(self.cfg.get("color_temp_k") or 0) or self.temp_k
+            self._publish(NightAppearance(True, temp, None, "config",
+                                          "night.mode: on", 0.0, now), now)
             return
         if mode == "off":
-            self.on, self.source, self.detail = False, "config", "night.mode: off"
+            self._publish(NightAppearance(False, self.temp_k, None, "config",
+                                          "night.mode: off", 0.0, now), now)
             return
-        on, temp, src, det = self._read_windows()
-        self.temp_k = int(self.cfg.get("color_temp_k") or 0) or temp
+        on, temp, src, det, state_mtime = self._read_windows()
+        temp = int(self.cfg.get("color_temp_k") or 0) or temp
         if on is None:
             sched = str(self.cfg.get("schedule") or "").strip()
             if sched:
@@ -364,18 +419,71 @@ class NightLight:
         # to follow the user's night mode however they run it. Only ever *adds* an
         # on — a neutral ramp never overrides a registry that says warm, because that
         # is the normal Windows case and the registry is the better source there.
-        self.gains = None
+        gains = None
         if mode == "auto" and bool(self.cfg.get("check_gamma_ramp", True)):
             ramp = gamma_gains()
             if ramp is not None:
                 r, _g, b = ramp
                 warm = (r - b) >= float(self.cfg.get("ramp_warm_margin", 0.12))
-                self.gains = ramp if warm else None
+                gains = ramp if warm else None
                 det += f"; ramp r/b={r:.2f}/{b:.2f}{' warm' if warm else ''}"
                 if warm and not on:
                     on, src = True, "ramp"
-        self.on, self.source = on, src
-        self.detail = det
+        if on is None:
+            # Nothing this poll can say for certain: keep the last confirmed
+            # appearance instead of dropping the panel to "unknown", which the
+            # planner would read as night off - a white flash through a warm
+            # evening, from a store that was merely mid-rewrite.
+            self._hold(now, det)
+            return
+        if temp is None and self.appearance is not None and self.appearance.temp_k:
+            # A settings-only failure: the state is fresh, the warmth is not.
+            # Carry the warmth from the last appearance that had one, and say
+            # where it came from - the alternative is the panel dimming with
+            # no warm LUT at all, which is neither look the user asked for.
+            temp = self.appearance.temp_k
+            det += "; warmth held from the last settings read"
+        self._publish(NightAppearance(bool(on), temp, gains, src, det,
+                                      state_mtime, now), now)
+
+    def _publish(self, app: NightAppearance, now: float) -> None:
+        """Put a whole confirmed appearance on the object in one swap."""
+        self.appearance = app
+        self.on, self.temp_k, self.gains = app.on, app.temp_k, app.gains
+        self.source, self.detail = app.source, app.detail
+        self.stale = False
+        self._held_since = 0.0
+
+    def _hold(self, now: float, why: str) -> None:
+        """A blind poll: keep showing the last confirmed appearance.
+
+        Unknown and stale are answers in their own right, never a quiet off:
+        the panel must not brighten just because a read failed, so the whole
+        appearance is re-published unchanged and only `stale`/`detail` move.
+        Within `hold_grace_s` this is a transient failure; past it the policy
+        is explicit and non-disruptive - keep holding, because inventing a
+        day state from an unreadable store is the one guess that can hurt.
+        """
+        if self.appearance is None:
+            # Startup with nothing ever confirmed: there is no look to keep,
+            # and the honest answer is unknown (the planner keeps the panel
+            # in its day look until the first real answer arrives).
+            self.on, self.source = None, "unknown"
+            self.detail = f"{why}; nothing confirmed to hold yet"
+            self.stale = False
+            return
+        if not self.stale:
+            self._held_since = now
+        app = self.appearance
+        self.on, self.temp_k, self.gains = app.on, app.temp_k, app.gains
+        self.source = app.source
+        self.stale = True
+        if now - self._held_since > self.hold_grace_s:
+            self.detail = (f"holding last confirmed appearance past "
+                           f"hold_grace_s={self.hold_grace_s:.0f}s; keeping it - "
+                           f"a read failure is not the user turning night off ({why})")
+        else:
+            self.detail = f"holding last confirmed appearance ({why})"
 
     def lut(self, strength: float = 1.0) -> list[int] | None:
         """The panel's warmth: from the measured ramp if that is the evidence, else
@@ -384,23 +492,29 @@ class NightLight:
             return gains_lut(self.gains, strength)
         return warm_lut(self.temp_k, strength)
 
-    def refresh(self) -> bool:
-        """Re-read at most every `refresh_s`; True when the answer changed."""
-        now = time.monotonic()
+    def refresh(self, now: float | None = None) -> bool:
+        """Re-read at most every `refresh_s`; True when the answer changed.
+
+        `now` is a pinned monotonic clock for the deterministic tests; the
+        live loop lets the module take it. A raising read is the same story
+        as an undecodable one: hold the last confirmed appearance, because
+        the failure mode of replacing it is a white flash at 3 a.m.
+        """
+        now = time.monotonic() if now is None else now
         if now < self._next:
             return False
         self._next = now + self.refresh_s
         was = (self.on, self.temp_k, self.source)
         try:
-            self._read()
+            self._read(now)
         except Exception as e:  # noqa: BLE001 - a settings store we cannot read is not fatal
-            self.on, self.source = None, "unknown"
-            self.detail = f"read failed: {type(e).__name__}: {e}"
+            self._hold(now, f"read failed: {type(e).__name__}: {e}")
         self._reads += 1
         return (self.on, self.temp_k, self.source) != was
 
     def describe(self) -> str:
-        return (f"night={'on' if self.on else ('off' if self.on is False else 'unknown')} "
+        return (f"night={'on' if self.on else ('off' if self.on is False else 'unknown')}"
+                f"{'(stale)' if self.stale else ''} "
                 f"src={self.source} temp={self.temp_k}K ({self.detail})")
 
     def changed_to_log(self) -> str | None:

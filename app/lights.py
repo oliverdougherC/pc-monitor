@@ -79,7 +79,11 @@ class LightPlanner:
         self.scale = float(self.n.get("brightness_scale", 0.55))
         self.floor = int(self.n.get("brightness_floor", 8))
         self.strength = float(self.n.get("strength", 1.0))
-        self.temp_default = int(self.n.get("color_temp_k", 2700))
+        # `color_temp_k: 0` is the shipped default and means "whatever Windows
+        # says"; when Windows' warmth cannot be read either, the plan still
+        # needs a number - the fallback is a documented safe warmth, because
+        # ON with no temperature must not dim the panel with no LUT at all.
+        self.temp_default = int(self.n.get("color_temp_k") or 2700)
         self.follow_display = bool(self.cfg.get("power", {}).get("follow_display", True))
         self.follow_sleep = bool(self.cfg.get("power", {}).get("follow_sleep", True))
         self.follow_lock = bool(self.cfg.get("power", {}).get("follow_lock", True))

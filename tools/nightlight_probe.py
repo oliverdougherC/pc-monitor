@@ -73,6 +73,19 @@ def _drop_field0(inner: bytes) -> bytes:
     return inner[:4] + inner[6:]
 
 
+def blind_refresh(n, now: float):       # noqa: ANN001
+    """`refresh` with a pinned monotonic clock.
+
+    Before the fix `refresh` took no clock, so the TypeError *is* the result:
+    "how long have we been holding" could not even be expressed, let alone
+    tested.
+    """
+    try:
+        return n.refresh(now=now)
+    except TypeError:
+        return None
+
+
 def selftest() -> int:
     fails: list[str] = []
 
@@ -134,6 +147,101 @@ def selftest() -> int:
                                                       time.strptime("23:00", "%H:%M")), True)
     check("config fallback outside", nl._in_clock_range("21:00-07:00",
                                                         time.strptime("09:00", "%H:%M")), False)
+
+    print("case: a transient read failure keeps the last confirmed appearance (issue #15)")
+    # `getattr(n, "stale", ...)`-style reads: before the fix these attributes
+    # do not exist, and the selftest should report FAIL lines, not crash.
+    inner_on = nl.unwrap(LIVE_STATE_ON)[1]
+    inner_off = _drop_field0(inner_on)
+    blobs = {nl._STATE_KEY: LIVE_STATE_ON, nl._SETTINGS_KEY: LIVE_SETTINGS}
+    # check_gamma_ramp off: these cases pin the state-store behaviour, and the
+    # gamma ramp is this desk's second opinion, not a fixture.
+    n = nl.NightLight({"night": {"hold_grace_s": 300, "check_gamma_ramp": False}},
+                      refresh_s=0.0)
+    n._blob = lambda key: blobs.get(key)
+    blind_refresh(n, 100.0)
+    check("established from the live blob", (n.on, n.temp_k, n.source),
+          (True, 2525, "windows"))
+    check("the appearance records when Windows wrote the state",
+          bool(getattr(n, "appearance", None))
+          and 1760000000 < n.appearance.state_mtime < 1900000000, True)
+
+    # The acceptance injections: a missing key, a torn/truncated blob, a read
+    # exception, a settings-only failure. For every shape the panel must not
+    # even briefly see day brightness: the held appearance keeps on/temp/gains
+    # identical until a *confirmed* read replaces them.
+    blobs.clear()
+    blind_refresh(n, 103.0)
+    check("missing keys hold the appearance",
+          (n.on, n.temp_k, getattr(n, "stale", None)), (True, 2525, True))
+    check("the detail explains the hold", "holding last confirmed" in n.detail, True)
+    blobs[nl._STATE_KEY] = LIVE_STATE_ON[:20]        # torn / truncated wrapper
+    blind_refresh(n, 106.0)
+    check("a torn blob holds too",
+          (n.on, n.temp_k, getattr(n, "stale", None)), (True, 2525, True))
+
+    def boom(key):                                   # noqa: ANN001
+        raise OSError("CloudStore key vanished mid-read")
+
+    n._blob = boom
+    blind_refresh(n, 109.0)
+    check("a raising read holds too",
+          (n.on, n.temp_k, getattr(n, "stale", None)), (True, 2525, True))
+    check("and names the failure", "read failed" in n.detail, True)
+
+    # Settings-only failure: the state is readable, the warmth is not. The
+    # appearance must stay coherent - the new state never mixes with the old
+    # temperature silently, and says where the warmth came from.
+    n._blob = lambda key: blobs.get(key)
+    blobs.clear()
+    blobs[nl._STATE_KEY] = LIVE_STATE_ON
+    blind_refresh(n, 112.0)
+    check("new state, warmth held from the last good read",
+          (n.on, n.temp_k, getattr(n, "stale", None)), (True, 2525, False))
+    check("and the detail says so", "warmth held" in n.detail, True)
+
+    # A confirmed OFF must still apply promptly, whatever came before it.
+    blobs.clear()
+    blobs[nl._STATE_KEY] = wrap(inner_off)
+    blobs[nl._SETTINGS_KEY] = LIVE_SETTINGS
+    blind_refresh(n, 115.0)
+    check("a later confirmed OFF applies promptly",
+          (n.on, n.temp_k, getattr(n, "stale", None)), (False, 2525, False))
+
+    # Blind again after that, and the hold is the OFF: unknown must never
+    # resurrect an old warmth.
+    n._blob = lambda key: None
+    check("the OFF is logged", n.changed_to_log() is not None, True)
+    blind_refresh(n, 118.0)
+    check("holding an OFF: still off, marked stale",
+          (n.on, getattr(n, "stale", None)), (False, True))
+    line = n.changed_to_log()
+    check("entering the hold logs exactly one line",
+          line is not None and "holding" in line, True)
+    blind_refresh(n, 150.0)
+    check("a steady failure logs nothing more", n.changed_to_log(), None)
+    blind_refresh(n, 600.0)          # 482 s blind: past hold_grace_s
+    check("grace expiry never brightens the panel", (n.on, n.temp_k), (False, 2525))
+    line = n.changed_to_log()
+    check("the expiry policy is stated once",
+          line is not None and "hold_grace_s" in line, True)
+    blind_refresh(n, 603.0)
+    check("and then it stays quiet", n.changed_to_log(), None)
+
+    print("case: startup with no prior valid state (nothing to hold)")
+    m = nl.NightLight({"night": {"check_gamma_ramp": False}}, refresh_s=0.0)
+    m._blob = lambda key: None
+    blind_refresh(m, 10.0)
+    check("startup with nothing known is unknown, not off",
+          (m.on, m.source, getattr(m, "stale", None)), (None, "unknown", False))
+    check("and says there was nothing to hold", "nothing confirmed to hold" in m.detail,
+          True)
+    check("no appearance was invented", getattr(m, "appearance", "x"), None)
+    q = nl.NightLight({"night": {"mode": "on", "color_temp_k": 2700}}, refresh_s=0.0)
+    q._blob = lambda key: None
+    blind_refresh(q, 10.0)
+    check("config mode on establishes an appearance",
+          (q.on, q.temp_k, q.source), (True, 2700, "config"))
 
     print("case: the warm LUT is a colour temperature, not a hue tint")
     g65 = nl.temp_gains(6500)
