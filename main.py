@@ -17,6 +17,7 @@ here in an ad-hoc way now belongs to a module that can be tested without a panel
   app/gamewatch  which process is the game            (locked target)
   app/frames     its frame rate, or its last one      (held, marked stale)
   app/panel      the USB link, including its failures
+  app/instance   one main role per machine            (OS-held claim, at start)
 
 Sleep is the reason for that shape. The loop freezes when the machine sleeps, so
 "turn the panel off when the PC sleeps" cannot be a rule evaluated after the fact —
@@ -43,6 +44,7 @@ from app.display import app_log                        # noqa: E402
 from app.frames import FrameMonitor                    # noqa: E402
 from app.gamewatch import GameWatch                    # noqa: E402
 from app.hoststate import HostState                    # noqa: E402
+from app.instance import acquire_main_role             # noqa: E402
 from app.layout import Layout                          # noqa: E402
 from app.lights import LightPlanner                    # noqa: E402
 from app.nightlight import NightLight                  # noqa: E402
@@ -178,6 +180,24 @@ def main() -> None:
     args = ap.parse_args()
     _console_safe()
 
+    # Ownership before hardware. A second main-role start must leave without
+    # opening the COM port and without letting the capture child reclaim the
+    # running owner's ETW session — both of which happen inside the objects
+    # below — so the claim is taken here, before any of them exist. It is an
+    # OS-held lock released by process death (app/instance.py), so a killed or
+    # crashed owner cannot leave a stale lock behind, and the machine-wide name
+    # means two checkouts in two working directories still compete for one
+    # lock. `--dump` is the headless preview role: like liveview and the diag
+    # tools it runs alongside the app on purpose, so it takes no lock — and it
+    # captures under its own session role below, so rendering a preview never
+    # reclaims the live app's capture either.
+    dump_mode = bool(args.dump)
+    if not dump_mode:
+        owned, why = acquire_main_role()
+        if not owned:
+            status(f"[start] {why}")
+            return
+
     cfg = cfgmod.load(args.config)
     hub = make_hub(cfg, force=args.backend)
     interval = float(cfg["sensors"]["interval_s"])
@@ -188,8 +208,12 @@ def main() -> None:
     night = NightLight(cfg, refresh_s=float(cfg["night"].get("refresh_s", 3.0)))
     lights = LightPlanner(cfg, night=night, host=host)
 
-    # real per-process present telemetry (ETW, needs admin); degrades to None/{}
-    frames_mon = FrameMonitor(cfg) if str(cfg["frames"].get("source", "auto")) != "off" else None
+    # real per-process present telemetry (ETW, needs admin); degrades to None/{}.
+    # The headless preview runs alongside the app on purpose, so it captures under
+    # its own session role instead of reclaiming the main role's (config's
+    # `frames.role` still pins, and pins every role the same way it always did).
+    frames_mon = (FrameMonitor(cfg, role="dump" if dump_mode else "main")
+                  if str(cfg["frames"].get("source", "auto")) != "off" else None)
     steam = SteamIdentity()
     if frames_mon is not None:
         import atexit
@@ -199,7 +223,6 @@ def main() -> None:
 
     panel = None
     pusher = None
-    dump_mode = bool(args.dump)
 
     def _shutdown() -> None:
         """Give the port back and stop the event window on any exit path."""
