@@ -107,8 +107,19 @@ function Invoke-Owned([string]$Verb) {
         Write-Output 'no interpreter at .venv\Scripts\python.exe - not touching any process'
         return @()
     }
-    $out = @(& $Py -m app.owned $Verb --session $Session --collector $Collector 2>&1 |
-        ForEach-Object { "$_" })
+    # `-m app.owned` resolves the package from the working directory, and an
+    # elevated relaunch does not reliably carry ours (ShellExecute may hand the
+    # child the profile directory instead) - which used to surface as
+    # "No module named 'app'" and a dead installer. Say where the package is
+    # instead of hoping the cwd agrees.
+    $prevPyPath = $env:PYTHONPATH
+    $env:PYTHONPATH = if ($prevPyPath) { "$Root;$prevPyPath" } else { $Root }
+    try {
+        $out = @(& $Py -m app.owned $Verb --session $Session --collector $Collector 2>&1 |
+            ForEach-Object { "$_" })
+    } finally {
+        $env:PYTHONPATH = $prevPyPath
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "app.owned $Verb failed (exit $LASTEXITCODE): $($out -join '; ')"
     }
