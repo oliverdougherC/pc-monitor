@@ -5,10 +5,13 @@ that is power-cycled by the PC's USB bus. Three failure shapes have actually
 been seen in log.log:
 
   * the port vanishes across a sleep/resume, and the vendor driver's own recovery
-    (`WriteLine` → close → `openSerial`) gives up after 10 tries by calling
-    `sys.exit(0)` — and `os._exit(0)` if that raises. A missing screen has
-    therefore been able to terminate the whole app, which is the "it never came
-    back" the panel gets blamed for;
+    (`WriteLine` → close → `openSerial`) used to give up after 10 tries by calling
+    `sys.exit(0)` — and `os._exit(0)` if that raises: a missing screen could
+    terminate the whole app, which is the "it never came back" the panel gets
+    blamed for. `app.display.harden_vendor` replaces that give-up with a bounded,
+    catchable, retirement-checked raise, so ending the process is the app's call
+    (and the monitor sleep / fast wake that triggered it is covered end to end in
+    `tools/e2e_control_loop_selftest.py`);
   * the endpoint stops draining and a write blocks in `WriteFile` forever: the
     panel is frozen, the loop is frozen, and the log just stops;
   * the panel reboots (its own watchdog, a replug, a resume) and comes back in
@@ -55,7 +58,7 @@ import time
 from pathlib import Path
 
 from app.display import (SERIAL_REVISIONS, _HELLO_WAIT_S, _RESET_WAIT_S,
-                         _abandon, ensure_vendor_path)
+                         _abandon, ensure_vendor_path, harden_vendor)
 
 # The recovery journal: one small file that says "this device was stopped in order to
 # be reset, and it still has to be brought back". It is written *before* the
@@ -615,6 +618,7 @@ class PanelLink:
             self.log("[panel] the previous connection still has not released its port "
                      f"after {_RELEASE_WAIT_S:.0f}s — trying anyway")
         ensure_vendor_path()
+        harden_vendor()
         # Before anything asks why the panel is silent: a device an earlier attempt
         # left disabled *is* an answer, and finishing that job is not something to do
         # later - the alternative is spending the recovery ladder fighting a device we

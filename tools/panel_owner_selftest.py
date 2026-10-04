@@ -112,6 +112,10 @@ class FakePort:
         self.hello = 0               # handshakes in flight right now
         self.peak_hello = 0
         self.next_behaviour: dict = {}   # applied to the next driver built
+        # The panel's USB face is gone: it was told to sleep (display off -> the
+        # real panel's TURNOFF), so the awake port has no node. Nothing can open
+        # it until the panel re-enumerates; the bench's cases say when that is.
+        self.asleep = False
 
     def reset(self) -> None:
         """Forget everything: each case judges one link, not the sum of the run."""
@@ -161,6 +165,12 @@ class FakeLcd:
     """
 
     def __init__(self, com_port, display_width, display_height) -> None:
+        if PORT.asleep:
+            # The real constructor ends in `openSerial()`, and with the panel's USB
+            # face gone that raises (the hardened wrapper: bounded, no process exit).
+            # No driver, no owner — exactly what a failed bring-up leaves behind.
+            PORT.next_behaviour = {}
+            raise RuntimeError("openSerial: no usable panel port (the panel is asleep)")
         self.port = PORT                     # the one pretend port this module drives
         self.com_port = com_port
         self.display_width = display_width
@@ -224,10 +234,12 @@ class FakeLcd:
         if self.write_gate is not None:
             self.write_gate.wait(30)
         self.woke += 1
-        if self.write_fails or self.closed:
+        if self.write_fails or self.closed or PORT.asleep:
             # `lcd_comm.WriteLine` does not simply give up on a failed write: it calls
             # `openSerial()` and tries again. So a driver that was closed under it can
             # take the port back a moment later, while the *next* driver is opening it.
+            # While the panel is asleep there is no port to reopen into, and the
+            # hardened real `openSerial` ends that with a raise, never a process exit.
             self.openSerial()
             raise RuntimeError("endpoint gone; the driver tried to reopen the port")
         self.writes += 1

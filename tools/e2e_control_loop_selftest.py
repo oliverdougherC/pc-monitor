@@ -10,6 +10,8 @@ and drives the loop through the failures the product contract is made of:
   * a panel that goes deaf, hangs forever, and comes back renumbered (replug);
   * suspend / resume / lock / display-off arriving at any moment, including
     *while a rebuild is in flight* (barrier-synchronised, not probabilistic);
+  * the monitor sleeping and being woken fast, with the panel's USB face dying in
+    between: the app must survive the dead port and come back on the re-enumeration;
   * the capture child dying and stalling; the sensor backend raising;
   * a low-fps game whose held number must expire, never linger as a lie;
   * >=100 full fault cycles, each ending with the same settled state;
@@ -28,6 +30,7 @@ refuses to run.
 """
 from __future__ import annotations
 
+import ctypes
 import sys
 import tempfile
 import threading
@@ -606,6 +609,77 @@ def case_dark_intent_prompt(b: Bench) -> None:
     check("lit again after the unlock", CMDS[-1], "on")
 
 
+def _display_setting(guid: bytes, value: int):
+    """A POWERBROADCAST_SETTING blob for a display GUID (hoststate_selftest's shape):
+    GUID(16) + DWORD DataLength + DWORD data. 0 = displays off, 1 = on."""
+    from ctypes import c_ubyte
+    return (c_ubyte * 24)(*guid, *bytes([4, 0, 0, 0]),
+                          *value.to_bytes(4, "little"))
+
+
+def case_monitor_sleep_wedge(b: Bench) -> None:
+    section("the monitor sleeps, is woken fast, and the panel's USB face dies with it")
+    # The incident the wedge is named after: display off puts the panel to USB sleep
+    # (its awake port loses its node); the monitor is woken two seconds later; the
+    # whole-frame push lands in a port that no longer exists. Before the fix, the
+    # vendor's openSerial gave that up with os._exit(0) and the app died with the
+    # panel. The bench drives the same sequence: the fake panel's face goes with the
+    # off command, and the wake must find the app alive and the link back.
+    b.idle.typing(0.4)
+    b.settle(want_ok=True)
+    live = po.PORT.all[-1]
+    for _ in range(5):
+        b.tick()
+    check("frames were landing before the desk darkened", live.writes > 0, True)
+
+    # The blob must stay referenced while `_on_setting` reads it: a temporary array
+    # dies with the statement, and the read then sees whatever memory reused the
+    # bytes (the event arrives with a mangled GUID and is dropped as unrecognised).
+    off = _display_setting(bytes(b.hs.GUID_CONSOLE_DISPLAY_STATE), 0)
+    b.event(b.hs.WM_POWERBROADCAST, b.hs.PBT_POWERSETTINGCHANGE,
+            ctypes.addressof(off))
+    for _ in range(3):
+        b.tick()
+    check("the light plan is dark on the monitor-off", b.plan.dark, True)
+    check("the panel was commanded off", "off" in CMDS[-3:], True)
+    po.PORT.asleep = True          # the panel's TURNOFF did what TURNOFF does
+    b.ports = []                   # the awake face is off the bus
+
+    on = _display_setting(bytes(b.hs.GUID_CONSOLE_DISPLAY_STATE), 1)
+    b.event(b.hs.WM_POWERBROADCAST, b.hs.PBT_POWERSETTINGCHANGE,
+            ctypes.addressof(on))
+    b.idle.typing(0.2)
+    deadline = time.monotonic() + 5.0
+    while b.panel.ok and time.monotonic() < deadline:
+        b.tick()
+        time.sleep(0.005)
+    # The link is down, and querying the panel object at all is the proof the
+    # process survived the dead port: before the fix it did not get to answer.
+    check("the push into the dead port marked the link down", b.panel.ok, False)
+    check("no second owner appeared while the port was gone",
+          po.PORT.peak_open, 1)
+
+    # The panel's firmware re-enumerates a moment later (the bench's stand-in for
+    # the rebuild's poke of the panel's sleeping face): the coordinator drives the
+    # rebuild that brings the link home, and the desk lights again. The rebuild is
+    # also what retires the driver of the dead port - retirement happens on the way
+    # to the next connection, not on the failed push itself.
+    po.PORT.asleep = False
+    b.ports = ["COM99"]
+    b.recovery.request(WAKE, "wedge: the panel's face is back on the bus")
+    check("the link recovers through the rebuild",
+          b.settle(want_ok=True, timeout=15.0), True)
+    check("the rebuild retired the driver of the dead port", live.closed, True)
+    check("the panel was commanded on again", "on" in CMDS[-3:], True)
+    check("exactly one driver holds the port", po.PORT.open_count(), 1)
+    check("never more than one at any moment (high-water)", po.PORT.peak_open, 1)
+    fresh = po.PORT.all[-1]
+    for _ in range(3):
+        b.tick()
+    check("frames land on the recovered link", fresh.writes > 0, True)
+    print(f"    {po.PORT}")
+
+
 def case_final_shutdown(b: Bench) -> None:
     section("shutdown releases everything")
     b.tick()
@@ -628,6 +702,7 @@ def main_run() -> int:
         case_capture_and_sensors(b)
         case_low_fps_and_stale(b)
         case_dark_intent_prompt(b)
+        case_monitor_sleep_wedge(b)
     finally:
         case_final_shutdown(b)
         b.close()

@@ -240,6 +240,95 @@ def _bring_up(lcd, force_reset: bool, remake=None) -> tuple[str, object | None]:
     return "deaf", lcd
 
 
+# The vendor's openSerial gives up by killing the process:
+# `try: sys.exit(0) except: os._exit(0)` — the bare `except` catches the SystemExit
+# itself, so the exit is always `os._exit(0)`: uncatchable, from whatever thread
+# happened to be inside the fault path. The vendor's `WriteLine`/`ReadData` call
+# `openSerial` on a *live* driver the moment a write fails, and `_abandon` only
+# disarms drivers the app has already retired — so between "the write failed" and
+# "the link marked itself down", the fault path can take the whole app down with a
+# dying panel. The trigger measured on this desk is the commonest event on it: a
+# monitor that sleeps and is woken quickly. The display-off command puts the panel
+# to USB sleep (its awake port disappears), the wake pushes a whole frame into the
+# port that just stopped existing, and the exit lands inside the vendor's retry
+# loop — the "it never came back" the panel gets blamed for.
+_SAFE_OPEN_ATTEMPTS = 3
+_SAFE_OPEN_RETRY_S = 1.0
+_vendor_hardened = False
+
+
+def harden_vendor() -> None:
+    """Wrap `LcdComm.openSerial` so no driver can ever exit the process.
+
+    Idempotent; call it from every path that builds a vendor driver. The
+    replacement keeps the vendor's contract — open the port, or give up — and
+    changes only the two things the app must own:
+
+      * giving up means a catchable `RuntimeError`, not `os._exit(0)`: the retry
+        policy belongs to the app's rebuild loop, which is the only one that has
+        the wake flow (an awake-port search that pokes the panel's sleeping face);
+      * every attempt re-checks the retirement flag, so a driver the link has
+        already retired cannot take the port back when it re-enumerates mid-loop —
+        the vendor's fault path calls `openSerial` from inside a failed write,
+        which is exactly the moment the app is rebuilding.
+
+    The class, not the instance: the constructor itself calls `openSerial()`, so an
+    instance-level patch would leave that call armed. Where the self-tests install a
+    fake vendor in sys.modules there is no `LcdComm` to wrap — nothing to harden.
+    """
+    global _vendor_hardened
+    if _vendor_hardened:
+        return
+    ensure_vendor_path()
+    try:
+        from library.lcd import lcd_comm
+    except ImportError:
+        _vendor_hardened = True
+        return
+    base = getattr(lcd_comm, "LcdComm", None)
+    if base is None or getattr(base, "_pcmonitor_hardened", False):
+        _vendor_hardened = True
+        return
+
+    import serial
+
+    def open_serial(self):
+        for attempt in range(1, _SAFE_OPEN_ATTEMPTS + 1):
+            if getattr(self, "_pcmonitor_abandoned", False):
+                raise RuntimeError("this driver was retired by PC Monitor; the port "
+                                   "belongs to a newer connection")
+            com_port = self.com_port
+            if com_port == "AUTO":
+                com_port = self.auto_detect_com_port()
+                if not com_port:
+                    app_log(f"[display] Cannot find COM port automatically, retrying "
+                            f"({attempt}/{_SAFE_OPEN_ATTEMPTS})")
+                    time.sleep(_SAFE_OPEN_RETRY_S)
+                    continue
+                app_log(f"[display] Auto detected COM port: {com_port}")
+            else:
+                app_log(f"[display] Static COM port: {com_port}")
+            try:
+                self.lcd_serial = serial.Serial(com_port, 115200, timeout=1,
+                                                rtscts=True)
+                return
+            except Exception as e:  # noqa: BLE001
+                app_log(f"[display] Cannot open COM port {com_port}: {e} - retrying "
+                        f"({attempt}/{_SAFE_OPEN_ATTEMPTS})")
+                time.sleep(_SAFE_OPEN_RETRY_S)
+        raise RuntimeError(f"openSerial: no usable panel port after "
+                           f"{_SAFE_OPEN_ATTEMPTS} attempts; the app's rebuild "
+                           "owns the retry")
+
+    open_serial._pcmonitor = True
+    base.openSerial = open_serial
+    base._pcmonitor_hardened = True
+    _vendor_hardened = True
+    app_log("[display] vendor openSerial hardened: bounded, raise-not-exit, "
+            "retirement-checked — ending the process is the app's call, not the "
+            "driver's")
+
+
 def make_lcd(cfg: dict):
     """Create the panel, bring it up, and set the configured orientation.
 
@@ -254,6 +343,7 @@ def make_lcd(cfg: dict):
     port = cfg["display"]["com_port"]
     force_reset = bool(cfg["display"].get("reset_on_start", False))
     ensure_vendor_path()
+    harden_vendor()
 
     from library.lcd.lcd_comm import Orientation
 

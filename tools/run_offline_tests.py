@@ -110,6 +110,9 @@ CASES = [
      "link survives raise/hang, rebuilds, walks its device ladder", "vendor", None),
     ("panel_owner", ["tools/panel_owner_selftest.py"],
      "one owner for the port: late writes, competing rebuilds, close mid-build", None, None),
+    ("open_serial", ["tools/open_serial_hardening_selftest.py"],
+     "the vendor's openSerial gives up by raising, never os._exit: ending the "
+     "process is the app's call, not the driver's", "vendor", None),
     ("panel_recovery", ["tools/panel_recovery_selftest.py"],
      "USB disable journal: written first, kept through crashes, cleared by device state",
      None, None),
@@ -181,7 +184,8 @@ CASES = [
     # -------- the combined control loop: every contract at once --------
     ("e2e_loop", ["tools/e2e_control_loop_selftest.py"],
      "the wired loop: 120 fault cycles, late completions, dark intent, staleness, "
-     "and a clean shutdown - the combined contracts, not one module's", None, None),
+     "the monitor-sleep wedge, and a clean shutdown - the combined contracts, "
+     "not one module's", None, None),
 ]
 
 
