@@ -355,7 +355,8 @@ def enumerate_processes(timeout: float = 45.0) -> tuple[list[Proc], str]:
     """
     try:
         out = subprocess.run(["powershell.exe", *_QUERY], capture_output=True,
-                             text=True, timeout=timeout, check=False)
+                             text=True, timeout=timeout, check=False,
+                             creationflags=0x08000000 if os.name == "nt" else 0)  # CREATE_NO_WINDOW: pythonw has no console, so an un-flagged query flashes one
     except (OSError, subprocess.SubprocessError) as e:
         return [], f"could not ask Windows for its process list: {type(e).__name__}: {e}"
     if out.returncode != 0:

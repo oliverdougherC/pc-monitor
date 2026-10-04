@@ -991,7 +991,8 @@ class HostState:
         try:
             r = subprocess.run(["powercfg", "/query", "SCHEME_CURRENT", "SUB_VIDEO",
                                 "VIDEOIDLE"], capture_output=True, text=True,
-                               timeout=5.0)
+                               timeout=5.0,
+                               creationflags=0x08000000 if os.name == "nt" else 0)  # CREATE_NO_WINDOW: pythonw has no console, so an un-flagged query flashes one
         except Exception as e:  # noqa: BLE001 — a missing powercfg is not an error
             self.monitor_seed = f"powercfg: {type(e).__name__}"
             return None

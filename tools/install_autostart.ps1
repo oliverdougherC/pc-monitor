@@ -23,7 +23,7 @@ dependencies can actually do what this task is for; -SkipChecks registers anyway
 Recovery, because a panel that stopped at 3 a.m. should not wait for the next logon:
 
   * the task restarts on a non-zero exit, a bounded 3 times per 5-minute interval;
-  * tools/watchdog_autostart.ps1 runs every 5 minutes as PCMonitorWatchdog and
+  * tools/watchdog_autostart.py runs every 5 minutes as PCMonitorWatchdog and
     restarts the task when the app's own heartbeat file stops advancing - the one
     failure the app cannot report, because the loop that would log it is the loop
     that hung;
@@ -207,12 +207,15 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Principal $principal
 # it stopped making progress while still running, because the heartbeat and the loop
 # that would report it are the same thread. So: a second task, its own schedule, whose
 # whole policy lives in `python -m app.liveness decide`.
-$Wd = Join-Path $PSScriptRoot 'watchdog_autostart.ps1'
+$Wd = Join-Path $PSScriptRoot 'watchdog_autostart.py'
 if (-not (Test-Path $Wd)) { throw "no watchdog script at $Wd" }
-$Shell = (Get-Command pwsh.exe -ErrorAction SilentlyContinue).Source
-if (-not $Shell) { $Shell = (Get-Command powershell.exe).Source }
-$wdAction = New-ScheduledTaskAction -Execute $Shell `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$Wd`"" -WorkingDirectory $Root
+# pythonw, not powershell: a console-program action in the user session gets a
+# visible console for its whole run, and this fires every five minutes - the fast
+# path only shortened the flash, it could not hide it. pythonw carries no console
+# at all, and the policy was always Python, so the observer now answers in its own
+# interpreter: no child process, no window.
+$wdAction = New-ScheduledTaskAction -Execute $Pyw `
+    -Argument "`"$Wd`"" -WorkingDirectory $Root
 $wdTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
     -RepetitionInterval (New-TimeSpan -Minutes $WatchdogEveryMin) `
     -RepetitionDuration (New-TimeSpan -Days 3650)

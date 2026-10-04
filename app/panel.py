@@ -1190,7 +1190,8 @@ class PanelLink:
         try:
             r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
                                 "-Command", script], capture_output=True, text=True,
-                               timeout=_QUERY_TIMEOUT_S)
+                               timeout=_QUERY_TIMEOUT_S,
+                               creationflags=0x08000000 if os.name == "nt" else 0)  # CREATE_NO_WINDOW: pythonw has no console, so an un-flagged query flashes one per retry
         except Exception as e:  # noqa: BLE001 - a bus we cannot read is a state, not a crash
             self.usb_restart_error = f"query: {type(e).__name__}: {e}"
             return ""
@@ -1516,7 +1517,8 @@ class PanelLink:
         """
         try:
             r = subprocess.run(["pnputil", verb, dev], capture_output=True, text=True,
-                               timeout=60)
+                               timeout=60,
+                               creationflags=0x08000000 if os.name == "nt" else 0)  # CREATE_NO_WINDOW: pythonw has no console, so an un-flagged verb flashes one
         except Exception as e:  # noqa: BLE001
             return False, f"{type(e).__name__}: {e}"
         out = ((r.stdout or "") + (r.stderr or "")).strip()

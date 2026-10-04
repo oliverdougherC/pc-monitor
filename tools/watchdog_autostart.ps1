@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
 Restart the panel app when its own heartbeat stops: the observer it cannot be for itself.
 
@@ -54,6 +54,67 @@ function Write-Watchdog([string]$line) {
         # Nowhere left to report a logging failure to. Deliberately silent, and the
         # reason is on the line above: this is not allowed to be the thing that fails.
     }
+}
+
+# Fast path: the two branches of the app/liveness.decide() policy that are pure
+# functions of the on-disk epochs, evaluated without starting Python. The task's
+# action is a console program running in the user session, so Task Scheduler gives it
+# a visible console, and the venv interpreter (about two seconds to start and answer)
+# is what makes the flash last long enough to see. Both branches are mirrored exactly:
+#   * a readable .stopped at least as new as the last readable .heartbeat (or no
+#     readable beat at all) is `hold` - liveness._policy's first branch, which both
+#     the stale-beat and no-beat paths face before the budget, the backoff and the
+#     pid are even consulted;
+#   * a beat at most STALL_S (600 s in app/liveness.py) old outranks a stop marker:
+#     with no marker, or with a marker older than the beat, the verdict is `ok` -
+#     the common case, which the observer serves with no line and no action.
+# Everything else - a stale beat with no stop marker at least as new as it, the
+# restart budget, the backoff, the pid liveness check - falls through to the full
+# policy below rather than trusting itself. Any missing or unparseable file the same
+# way liveness would: an unreadable beat counts as no beat, an unreadable marker as
+# no marker, and the branch that needs the other side's exact value is simply not
+# taken.
+try {
+    $stopEpoch = $null
+    $stopPath = Join-Path $Root '.stopped'
+    if (Test-Path $stopPath) {
+        $stopTok = (Get-Content -Path $stopPath -First 1).Trim().Split(' ')[0]
+        $stopCand = 0.0
+        if ([double]::TryParse($stopTok, [ref]$stopCand)) { $stopEpoch = $stopCand }
+    }
+    $beatEpoch = $null
+    $beatPath = Join-Path $Root '.heartbeat'
+    if (Test-Path $beatPath) {
+        $beatTok = (Get-Content -Path $beatPath -First 1).Trim().Split(' ')[0]
+        $beatCand = 0.0
+        if ([double]::TryParse($beatTok, [ref]$beatCand)) { $beatEpoch = $beatCand }
+    }
+    if ($beatEpoch -ne $null) {
+        # liveness clamps the beat age to zero; a negative age (future timestamp)
+        # still satisfies the same comparison, so the raw difference is used.
+        # UtcNow is load-bearing: the epochs are time.time() values, and a
+        # local-time subtraction is silently wrong by 2x the zone offset
+        # (a hung app would keep looking "fresh" on a non-UTC machine).
+        if ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $beatEpoch -le 600) {
+            if ($stopEpoch -eq $null -or $stopEpoch -lt $beatEpoch) {
+                return    # `ok` - the common case: no line, no action
+            }
+            Write-Watchdog "hold: fast path - .stopped is at least as new as the last beat; recovery must not undo that"
+            return
+        }
+        if ($stopEpoch -ne $null -and $stopEpoch -ge $beatEpoch) {
+            Write-Watchdog "hold: fast path - .stopped is at least as new as the last beat; recovery must not undo that"
+            return
+        }
+        # A stale beat with no stop marker at least as new: the budget, the backoff
+        # and the pid are Python's to judge.
+    }
+    elseif ($stopEpoch -ne $null) {
+        Write-Watchdog "hold: fast path - .stopped with no readable heartbeat; recovery must not undo that"
+        return
+    }
+} catch {
+    # Unreadable state is no reason to trust the fast path; the full policy decides.
 }
 
 if (-not (Test-Path $Py)) {
