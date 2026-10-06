@@ -29,6 +29,7 @@ reached a tick.
 import ast
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -298,6 +299,167 @@ def case_main_gates_every_shared_write() -> None:
           "owns_installation" in handler_names, False)
 
 
+def case_abbreviated_dump_options(tmp: Path) -> None:
+    """Every spelling of the preview option resolves to one role, and one role only (#67).
+
+    `main()` built its parser with argparse's default `allow_abbrev=True`, so `--du
+    preview.png` and `--d=preview.png` parsed as `--dump` — while the hand-written
+    argv scanner in `dump_role_requested()` recognised neither and returned False.
+    Measured: `args.dump == 'preview.png'` with `dump_role_requested(...) == False`. A
+    preview started that way therefore took the *production* branch: it acquired the
+    main-role lock, used the production control files and ETW session, opened the
+    physical panel, and never reached the dump-save/exit branch. Two readers of one
+    argv is the defect; both halves of this case exist to keep them one reader.
+
+    Chosen resolution, asserted here rather than described: `allow_abbrev=False`
+    **cleanly rejects** `--du`, `--d=` and `--dum` — argparse exits 2 with "unrecognized
+    arguments" before any control-plane or hardware work — and both readers agree on
+    that. The other option, treating every prefix as a preview, was rejected because it
+    would make `--d` mean the diagnostic role and turn an unrecognised option into a
+    silently headless run instead of an error a person can read.
+
+    Two halves, because "the readers agree" and "the role is isolated" are different
+    claims:
+
+      * a child process imports `main`, parses each spelling with the module's own parser
+        (`build_parser`, the same one `main()` uses) and prints what it parsed beside what
+        `dump_role_requested()` says. The two must match for every spelling, rejections
+        included: a command line that cannot be parsed is not a role, and neither reader
+        may call it one;
+      * the real entry point is then run for each spelling against a seeded production
+        control plane, and whatever it decided, the production files must be
+        byte-identical afterwards. For the accepted spellings that means full isolation:
+        the preview's own beat file exists, the app's beat was not refreshed, the stop
+        request was not consumed, and no owner record was written.
+    """
+    print("case: abbreviated --dump spellings agree with the role classifier, and stay isolated")
+    control = tmp / "abbrev"
+    before = seed_production(control)
+
+    # `(label, the whole option as argv words, is this the preview?, what `--dump` the
+    # parser reports for it)`. `--dump=` is one word that carries its value; the others
+    # pass the value as the next word. The three abbreviations are what the old default
+    # accepted as `--dump`; the bare `--dump` is the malformed control, which argparse
+    # refuses outright (`rejected(2)`), while the abbreviations parse cleanly and simply
+    # leave `--dump` unset — both "not a role", by two different routes.
+    spellings = [
+        ("--dump", lambda value: ["--dump", value], True, "'x.png'"),
+        ("--dump=", lambda value: [f"--dump={value}"], True, "'x.png'"),
+        ("--du", lambda value: ["--du", value], False, "None"),
+        ("--d=", lambda value: [f"--d={value}"], False, "None"),
+        ("--dum", lambda value: ["--dum", value], False, "None"),
+    ]
+    malformed = ("bare --dump", lambda value: ["--dump"], False, "rejected(2)")
+
+    # The parser, the classifier and the shutdown decision, seen through the real module in
+    # a child process, with the same argv shape a start gets:
+    #
+    #   * one parser — `build_parser()`, the module's only factory — so a spelling cannot
+    #     be a preview for `main()` and something else for the shutdown handler;
+    #   * `note_deliberate_stop` is the `__main__` Ctrl-C path, called here instead of
+    #     delivered as a signal (a console-less child on this platform does not receive one
+    #     reliably — see `case_interrupted`);
+    #   * every spelling gets its **own** scratch control plane, because the decision under
+    #     test writes a marker file and a shared directory would let one spelling's marker
+    #     be read as the next spelling's.
+    #
+    # The probe is a file, not `python -c` one-liner text: a `try:` cannot follow a `;` on
+    # one logical line, so the inline form was a `SyntaxError` that printed nothing at all
+    # — and a probe with nothing to say is a probe that would silently pass.
+    probe = tmp / "dump_role_probe.py"
+    probe.write_text(
+        "# Written by tools/control_plane_selftest.py: ask the app's own parser and its\n"
+        "# own role classifier the same question, then ask the shutdown decision.\n"
+        "import sys\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "import main as M\n"
+        "import app.liveness as L\n"
+        "\n"
+        "argv = sys.argv[1:]\n"
+        "try:\n"
+        "    accepted = M.build_parser().parse_known_args(argv)\n"
+        "    dump = repr(accepted[0].dump)\n"
+        "    unknown = repr(accepted[1])\n"
+        "except SystemExit as exc:\n"
+        "    dump = unknown = 'rejected(%s)' % exc.code\n"
+        "role = M.dump_role_requested(argv)\n"
+        "wrote = M.note_deliberate_stop('probe')\n"
+        "print('PARSED %s UNKNOWN %s ROLE %s WROTE %s MARKER %s'\n"
+        "      % (dump, unknown, role, wrote, L.stopped_path().exists()))\n",
+        encoding="utf-8")
+    for label, value_argv, want_role, want_dump in [*spellings, malformed]:
+        plane = tmp / ("role-" + label.replace(" ", "-").strip("-="))
+        r = subprocess.run([sys.executable, str(probe), *value_argv("x.png")],
+                           cwd=str(ROOT), env=child_env(plane), capture_output=True,
+                           text=True, timeout=120)
+        line = next((ln for ln in r.stdout.splitlines() if ln.startswith("PARSED")), "")
+        m = re.match(r"PARSED (.+) UNKNOWN (.+) ROLE (True|False) WROTE (True|False) "
+                     r"MARKER (True|False)$", line)
+        if m is None:
+            # Silence fails the case rather than skipping it: a probe that cannot speak has
+            # asserted nothing.
+            check(f"{label}: the probe reported a parsed value and a role",
+                  f"got {line!r} (rc={r.returncode}) {(r.stderr or '')[-200:]!r}",
+                  "PARSED <value> UNKNOWN <list> ROLE <bool> WROTE <bool> MARKER <bool>")
+            continue
+        parsed, role = m.group(1), m.group(3) == "True"
+        wrote, marker = m.group(4) == "True", m.group(5) == "True"
+        # The finding, as a comparison: the value the parser resolved and the role the
+        # shutdown path derives have to be the same reading of one command line. `--du`
+        # used to be `'x.png'` here (argparse's abbreviation) against `False` (the raw
+        # scanner), which is a process that runs the production branch and never saves a
+        # frame.
+        check(f"{label}: the parse and dump_role_requested agree", role, want_role)
+        check(f"{label}: the parse resolved exactly the value it was given, or refused it",
+              parsed, want_dump)
+        # The role answer is meaningful in both directions: an accepted preview never
+        # writes the production marker, and a spelling that is not the preview is the
+        # owner's role — which is the branch that does. Asserting that the *owner* branch
+        # is really taken for a rejected spelling is what pins the conservative direction
+        # (both readings say "not the preview") instead of merely asserting a marker is
+        # absent for reasons the test cannot see.
+        if want_role:
+            check(f"{label}: a preview writes no deliberate-stop marker", marker, False)
+            check(f"{label}: and its Ctrl-C decision is not the owner's", wrote, False)
+        else:
+            check(f"{label}: not-the-preview follows the owner's shutdown branch",
+                  wrote, True)
+            check(f"{label}: and the marker landed in this spelling's own plane",
+                  marker, True)
+
+    # The real entry point, one process per spelling, and each one saves into this scratch
+    # directory: an absolute `--dump` value, so the assertions below are about the file
+    # that process wrote and a preview can never drop a frame into the working tree. The
+    # accepted spellings need `--frames 2` to reach the save-and-exit branch; the rejected
+    # ones exit at argv parsing.
+    for label, value_argv, want_role, _want_dump in spellings:
+        label_clean = label.strip("-=") or "dump"
+        out = (tmp / f"abbrev-{label_clean}.png").resolve()
+        r = subprocess.run([sys.executable, str(MAIN), *value_argv(str(out)),
+                            "--backend", "demo", "--frames", "2"], cwd=str(ROOT),
+                           env=child_env(control), capture_output=True, text=True,
+                           timeout=180.0)
+        check(f"{label}: the entry point agrees with the classifier", r.returncode == 0,
+              want_role)
+        check(f"{label}: a preview renders its frame", out.exists(), want_role)
+        if not want_role:
+            continue
+        untouched(control, before, f"{label} preview")
+        check(f"{label}: the preview beats under its own name",
+              (control / ".heartbeat-dump").exists(), True)
+        (control / ".heartbeat-dump").unlink(missing_ok=True)   # the next spelling's turn
+
+    # And the same for the malformed spelling, which the entry point refuses before it
+    # reaches the control plane: nothing is created, and nothing is touched.
+    out = (tmp / "abbrev-bare.png").resolve()
+    r = subprocess.run([sys.executable, str(MAIN), *malformed[1](str(out)),
+                        "--backend", "demo", "--frames", "2"], cwd=str(ROOT),
+                       env=child_env(control), capture_output=True, text=True, timeout=180.0)
+    check(f"{malformed[0]}: the entry point refuses it", r.returncode != 0, True)
+    check(f"{malformed[0]}: and saves nothing", out.exists(), False)
+    untouched(control, before, f"{malformed[0]} run")
+
+
 def _enclosing(tree: ast.AST, call: ast.Call) -> ast.AST:
     """The innermost function definition containing `call` (or the module itself).
 
@@ -408,6 +570,8 @@ def main() -> int:
         case_interrupted(tmp)
         print()
         case_dies_before_the_first_tick(tmp)
+        print()
+        case_abbreviated_dump_options(tmp)
         print()
         case_main_gates_every_shared_write()
     print("\n" + ("SELFTEST PASSED" if not fails else f"SELFTEST FAILED: {fails}"))

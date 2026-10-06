@@ -40,6 +40,15 @@ belongs to and reports its outcome into the operation, never into the hub, so
 a driver that finally answers after its backend was retired has nothing left
 to overwrite: the hub drops late results and late errors on the floor and says
 so in `describe()`.
+
+Two consequences of that fence are ownership rules rather than niceties. A
+retired generation still owns whatever it built, so its own thread - the only
+one that can touch those objects - gives them back on its way out, once the
+native call it was inside has returned (`_release_retired`), and a handle
+nobody can release is counted instead of forgotten. And a handed operation
+carries the instant it was handed over, so an answer that arrives two ticks
+late is published with its real age: it is the last good sample, marked held,
+and it never renews the retention window it is already spending (`_deferred`).
 """
 from __future__ import annotations
 
@@ -97,6 +106,19 @@ def _empty(snap: Snapshot) -> bool:
     return all(v is None for v in vals)
 
 
+def _forget(owned: list, backend) -> None:
+    """Drop one backend from a generation's ledger, by identity.
+
+    Identity (`is`), never equality: ownership is about *this* object, and a backend
+    whose `__eq__` is generous (a fake, a proxy) must not be able to take another
+    one's place in the books.
+    """
+    for i, held in enumerate(owned):
+        if held is backend:
+            del owned[i]
+            return
+
+
 class _Job:
     """One unit of owned driver work - and the fence around whatever it reports.
 
@@ -111,15 +133,22 @@ class _Job:
     ownership. `build_error` is a construction that failed: the hub is left
     holding the backend it tried and failed to replace. `error` is a sample that
     threw, which - when the backend itself was freshly built - leaves the hub
-    holding a *new* driver that must not be thrown away with the bad tick.
-    `why_close_failed` is the one nobody is waiting for: a release that threw on
-    its way out, recorded on the job so the *next* operation can ask again
-    (every backend's close is safe to repeat) rather than the reason being lost
-    with the generation that had it.
+    holding a *new* driver that must not be thrown away with the bad tick. Reading
+    the second as the first is what abandoned a replacement that had already been
+    built, adopted nowhere and closed nowhere (finding #1). `why_close_failed` is
+    the one nobody is waiting for: a release that threw on its way out, recorded on
+    the job so the *next* operation can ask again (every backend's close is safe to
+    repeat) rather than the reason being lost with the generation that had it.
+
+    `acquired_at` is the instant the job was handed to the worker, which is the
+    instant whatever it reports belongs to. The loop's clock is injected (the tests
+    pin it), so the worker cannot read it for itself: the hand-off is the only
+    honest stamp, and it is what lets a sample collected two ticks later be aged
+    and expired from when it was actually measured (finding #4).
     """
 
     __slots__ = ("kind", "gen", "snap", "done", "result", "backend",
-                 "error", "build_error", "why_close_failed")
+                 "error", "build_error", "why_close_failed", "acquired_at")
 
     def __init__(self, kind: str, gen: int, snap: Snapshot | None = None):
         self.kind = kind
@@ -128,9 +157,10 @@ class _Job:
         self.done = threading.Event()
         self.result: Snapshot | None = None
         self.backend = None                # the backend a `_REOPEN` built
-        self.error: str | None = None      # why this operation is not healthy
-        self.build_error: str | None = None
+        self.error: str | None = None      # why this operation's *sample* is unhealthy
+        self.build_error: str | None = None  # why the *construction* failed
         self.why_close_failed: str | None = None
+        self.acquired_at = 0.0             # the instant the values belong to
 
 
 _STOP_JOB = _Job(_STOP, -1)
@@ -181,9 +211,20 @@ class SensorHub:
         self._retired: list[threading.Thread] = []
         self._inflight: _Job | None = None
         self._handed_at = 0.0
+        # The instant the sample `_apply_locked` is about to publish was handed over
+        # (its job's `acquired_at`). Written only by the loop, and consumed by the
+        # `tick()` that publishes it, so a deferred answer is aged against the tick
+        # that asked for it rather than the one that collected it.
+        self._snap_acquired_at: float | None = None
         self._want_reopen = False
         self._wedged = 0                     # deliberate retirements (escalations)
         self._dropped = 0                    # fenced results from retired generations
+        # Handles a *retired* generation gave back on its way out, and the ones it
+        # could not (a close that threw on the way out is the only real leak left).
+        # Counted here because the whole point of finding #2 is that this used to
+        # happen nowhere at all, invisibly.
+        self._retired_closed = 0
+        self._retired_leaked = 0
         self._stopping = False
 
     # ------------------------------------------------------------------ ownership
@@ -238,12 +279,16 @@ class SensorHub:
         # whole budget and then leaks the driver it was asked to give up.
         if self._worker is not None:
             return
+        # The hub's current backend is handed over as this generation's seed, which
+        # is where the worker's ledger of what it owns starts. That is what makes a
+        # generation that is retired before it adopted anything able to give the
+        # backend back (finding #2) instead of leaking it with the thread.
         self._worker = threading.Thread(target=self._supervise,
-                                        args=(self._q, self._gen),
+                                        args=(self._q, self._gen, self._backend),
                                         daemon=True, name="sensor-supervisor")
         self._worker.start()
 
-    def _supervise(self, q, gen: int) -> None:
+    def _supervise(self, q, gen: int, seed) -> None:
         """The only thread that touches the owned backend, one job at a time.
 
         It is persistent on purpose: a tick that gives up does not leave it
@@ -251,37 +296,100 @@ class SensorHub:
         answer when the driver eventually lets go. It exits as soon as its
         generation is retired *and* the call it is inside returns, which is the
         one form of cancellation Python has for a native call.
-        """
-        while True:
-            job = q.get()
-            if job.kind == _STOP or gen != self._gen:
-                return
-            try:
-                self._perform(job)
-            finally:
-                job.done.set()
-            if gen != self._gen:
-                return
 
-    def _perform(self, job: _Job) -> None:
-        """Run one operation. Shared hub state is read here and never written."""
-        if job.kind == _CLOSE:
-            self._release(self._backend, job)
-            return
+        Exiting is also where this generation's ownership ends (finding #2). The
+        hub deliberately does not close a generation it retires - something native
+        may still be inside it - and nothing else ever closes it afterwards, so
+        *this* thread, the one inside that call, gives the handles back the moment
+        the call returns. `owned` is the generation's ledger: the backend it was
+        seeded with plus every replacement it built, so a replacement it constructed
+        but never handed over (a reopen still in flight, or one the hub never
+        collected) is released here too, instead of leaking with the thread.
+        """
+        owned: list = [] if seed is None else [seed]
+        try:
+            while True:
+                job = q.get()
+                if job.kind == _STOP or gen != self._gen:
+                    return
+                try:
+                    self._perform(job, owned)
+                finally:
+                    job.done.set()
+                if gen != self._gen:
+                    return
+        finally:
+            self._release_retired(gen, owned)
+
+    def _release_retired(self, gen: int, owned: list) -> None:
+        """Give back what a retired generation still owns, on its own thread.
+
+        The safe rule, and the reason this is a rule rather than "close everything":
+        a backend may be released here only when the hub has no claim on it left.
+        Two claims count. The hub's current `_backend` is one - it releases that
+        itself (the next successful `_REOPEN` closes what it replaces, and `close()`
+        releases whatever is left), so closing it here as well would be the second
+        owner this whole design exists to prevent. The other is a job the hub is
+        still holding (`_inflight.backend`): that backend has *not* been handed over
+        yet, and a loop that collects the job a moment later must not find itself
+        adopting something this thread already closed. So the check is deliberately
+        "nobody can still claim it", not just "the hub is not using it this instant".
+
+        `_retired_closed`/`_retired_leaked` make it visible in `describe()`: the first
+        counts handles given back here (before finding #2 there was no owner for them
+        at all), and the second a close that threw even on the way out, which is the
+        only outcome that is a genuine, permanent leak.
+        """
+        while owned:
+            backend = owned.pop()
+            with self._lock:
+                if backend is self._backend:
+                    continue
+                pending = self._inflight
+                if pending is not None and pending.backend is backend:
+                    continue                     # still the hub's to adopt
+            released = self._release(backend, _Job(_CLOSE, gen))
+            with self._lock:
+                if released:
+                    self._retired_closed += 1
+                else:
+                    self._retired_leaked += 1
+
+    def _perform(self, job: _Job, owned: list) -> None:
+        """Run one operation. Shared hub state is read here and never written.
+
+        `owned` is this generation's ledger (see `_supervise`), and `_release`'s
+        answer is what keeps it honest: an object is only dropped from the books once
+        it has really been given back.
+        """
         with self._lock:
             backend = self._backend
+        if job.kind == _CLOSE:
+            if self._release(backend, job):
+                _forget(owned, backend)
+            return
         if job.kind == _REOPEN:
             # Close what we own before building more of it - a leaked Computer or
             # NVML owner is the reason the rebuild was asked for. A previous
             # release attempt that threw leaves the same object still held, so it
             # is asked again; every backend's close is safe to repeat.
-            self._release(backend, job)
+            if self._release(backend, job):
+                _forget(owned, backend)
             try:
-                job.backend = _make_backend(self._cfg, self.want)
+                built = _make_backend(self._cfg, self.want)
             except Exception as e:  # noqa: BLE001 - the hub backs off on this
-                job.error = f"{type(e).__name__}: {e}"
+                # A construction failure is *not* a sample failure (finding #1). The
+                # hub must keep the backend it already owns and back off; what it must
+                # never do is read the *sample* raise below as "the build failed",
+                # which abandoned the freshly built replacement - and everything it
+                # had just acquired - while the hub went on holding the backend this
+                # line had already closed.
+                job.build_error = f"{type(e).__name__}: {e}"
                 return
-            backend = job.backend
+            job.backend = built
+            if built is not None:
+                owned.append(built)              # ours until the hub adopts it
+            backend = built
         if job.snap is None:
             return
         if backend is None:
@@ -296,25 +404,32 @@ class SensorHub:
             job.error = f"sample raised {type(e).__name__}: {e}"
         job.result = job.snap
 
-    def _release(self, backend, job: _Job) -> None:
+    def _release(self, backend, job: _Job) -> bool:
         """Ask an owned backend to give up its handles, on *this* thread.
 
         The old helper spawned a short-lived thread so the loop would not wait
         for a close that never returns; that made the close concurrent with
-        whatever the abandoned sampler was still doing to the same driver, and
-        it grew a thread per rebuild. Here the close is just another bounded
+        whatever the abandoned sampler was still doing to the same driver, and it
+        grew a thread per rebuild. Here the close is just another bounded
         operation: the loop stops waiting after `_CLOSE_BUDGET_S`, the worker
         stays with the driver, and `_escalate` retires it once the grace window
         says the wait is over. Leaking a hung handle is still the accepted cost
         of never blocking the loop - it is just counted now.
+
+        Returns True when the backend is no longer held: there was nothing to close,
+        or the close returned. A close that threw leaves the same object held, so
+        the caller keeps it in the generation's ledger and asks again rather than
+        booking a handle as released that is still open.
         """
         close = getattr(backend, "close", None)
         if close is None:
-            return
+            return True                          # nothing held is nothing to release
         try:
             close()
         except Exception as e:  # noqa: BLE001 - a half-dead backend may not close clean
             job.why_close_failed = f"{type(e).__name__}: {e}"
+            return False
+        return True
 
     # ------------------------------------------------------------------ dispatch
     def _idle(self) -> bool:
@@ -336,7 +451,16 @@ class SensorHub:
         When the budget runs out the job stays in flight and the next tick
         collects it - a slow driver still gets to produce fresh samples, just not
         on the tick it was late on.
+
+        A finished job is collected *before* it is replaced below (finding #3): a
+        completed operation is not an idle worker, it is an ownership transition the
+        hub has not applied yet. Overwriting it - which is what `recover()` and
+        `close()` used to do when they arrived between the worker finishing and the
+        next tick draining - dropped a replacement backend that nothing else knew
+        about: never adopted, so its resources were never released either, while the
+        operation dispatched over it closed the *old* backend a second time.
         """
+        self._drain(now)
         with self._lock:
             if self._stopping:
                 return None
@@ -346,6 +470,7 @@ class SensorHub:
                              f"{now - self._handed_at:.1f}s (gen {job.gen})")
                 return None
             job = _Job(kind, self._gen, snap)
+            job.acquired_at = now                # what this operation's values belong to
             self._inflight = job
             self._handed_at = now
             self._ensure_worker_locked()
@@ -377,14 +502,22 @@ class SensorHub:
         if job.kind == _CLOSE:
             return None
         if job.kind == _REOPEN:
-            if job.error is not None or job.backend is None:
-                # Construction itself failed (or hung and this is its answer):
-                # retry on the backoff clock, never per tick.
-                self._why = f"reopen failed: {job.error or 'produced no backend'}"
+            if job.build_error is not None or job.backend is None:
+                # *Construction* failed (or hung, and this is its answer): retry on
+                # the backoff clock, never per tick, and keep the backend the hub
+                # already owns. The sample is a different fact and is handled below -
+                # reading its raise as a build failure here is what abandoned a
+                # freshly built replacement, unadopted and unclosed (finding #1).
+                self._why = ("reopen failed: "
+                             f"{job.build_error or 'produced no backend'}")
                 self._next_try = now + self._backoff
                 self._backoff = min(self._backoff * 2, self._backoff_max_s)
                 self._want_reopen = True
                 return None
+            # Construction succeeded, so the replacement - and everything it just
+            # acquired - is adopted *whatever its first sample did*. The sample's
+            # outcome decides only what this tick publishes; throwing the backend
+            # away here would leave the hub holding the driver it has already closed.
             self._backend = job.backend
             self._rebuilds += 1
             self._fails = 0
@@ -402,17 +535,30 @@ class SensorHub:
             if job.error is not None:
                 self._why = job.error
             return None
+        # The values belong to the instant the job was handed over, not to this
+        # collection: `tick` ages and expires the sample from here, so a late answer
+        # cannot renew a retention window it has already spent (finding #4).
+        self._snap_acquired_at = job.acquired_at
         return snap
 
     # ---------------------------------------------------------------------- tick
     def tick(self, now: float | None = None) -> Snapshot:
         """One bounded sample: fresh if the backend answered, the last good
         one within the grace window, blank after it. `now` is a pinned
-        monotonic clock for the deterministic tests."""
+        monotonic clock for the deterministic tests.
+
+        A published sample is stamped with the instant it was *acquired* - the tick
+        that handed the job over - and never with the tick that happened to collect
+        it (finding #4). A value measured at t=100 and collected at t=120 is twenty
+        seconds old, so it is published marked held at that age and it expires on
+        t=100's grace, not on a window that the collection silently renewed.
+        """
         now = time.monotonic() if now is None else now
         snap = self._attempt(now)
         if snap is not None:
-            self._good, self._good_at = snap, now
+            acquired = now if self._snap_acquired_at is None else self._snap_acquired_at
+            self._snap_acquired_at = None
+            self._good, self._good_at = snap, acquired
             if not snap.failed:
                 # A clean answer ends the failure streak. Anything named as
                 # failed - a sample that died partway *or* a group that keeps
@@ -420,6 +566,8 @@ class SensorHub:
                 # quiet forever is a driver that needs re-acquiring, and the
                 # only repair this hub has is the rebuild below.
                 self._fails = 0
+            if acquired < now:
+                return self._deferred(snap, acquired, now)
             self._phase = "ok" if not snap.failed else "partial"
             self._why = "ok" if not snap.failed else \
                 "groups failed: " + ",".join(snap.failed) + self._detail()
@@ -429,6 +577,28 @@ class SensorHub:
             return self._held(now)
         self._phase = "blind"
         return self._blank(now)
+
+    def _deferred(self, snap: Snapshot, acquired: float, now: float) -> Snapshot:
+        """Publish a sample the worker took on an earlier tick, at its real age.
+
+        The answer is genuine and it is the last good one, but it is not *this*
+        tick's measurement: the panel may keep showing it and history must not take
+        it as current (main pushes measured samples only), which is what `held`
+        means here, and `age_s` says how old it really is. A late answer must not
+        renew the retention window either - so if it arrives after the grace that
+        its own acquisition started has already run out, publishing it would be
+        putting old data back on the panel as live. It is kept as the last good
+        sample, with its true age, and this tick stays honest and blind.
+        """
+        age = now - acquired
+        self._why = (f"a deferred sample acquired {age:.1f}s ago was collected "
+                     f"(gen {self._gen}, handed over at {acquired:.1f}s)")
+        if age > self.stale_grace_s:
+            self._phase = "blind"
+            return self._blank(now)
+        self._phase = "held"
+        return dataclasses.replace(snap, held=True, age_s=age,
+                                   frames=copy.copy(snap.frames))
 
     def _detail(self) -> str:
         """The backend's own note about the driver behind a named gap.
@@ -515,7 +685,10 @@ class SensorHub:
         purpose*, counted in `_wedged`, capped at `MAX_LIVE_WORKERS`, and a fresh
         supervisor takes a freshly built backend. The abandoned backend is not
         closed (something is still inside it), which is why its generation is
-        retired rather than re-used.
+        retired rather than re-used - and it is not leaked forever either: the
+        retired thread hands it back the moment the call it is inside returns (see
+        `_release_retired`), so a *live* worker is again an honest count of the
+        handles this process still owns, which is what makes the cap mean anything.
         """
         with self._lock:
             job = self._inflight
@@ -571,7 +744,15 @@ class SensorHub:
                 self._q.put(_STOP_JOB)
                 self._why = f"shutdown while gen {job.gen} is still inside the driver"
                 return                           # bounded: leak it, do not join it
+        # A finished operation is an ownership transition the hub still owes, and the
+        # `_CLOSE` job below is about to take its place in `_inflight` (finding #3):
+        # a completed reopen is drained - and its backend adopted - first, so the
+        # close releases the backend the hub actually owns instead of abandoning the
+        # replacement and closing the old one a second time.
+        self._drain(time.monotonic())
+        with self._lock:
             job = _Job(_CLOSE, self._gen)
+            job.acquired_at = time.monotonic()
             self._inflight = job
             q = self._q
             self._ensure_worker_locked()
@@ -589,7 +770,9 @@ class SensorHub:
                     f"fails={self._fails} rebuilds={self._rebuilds} "
                     f"gen={self._gen} owed={owed} "
                     f"workers={self._live_workers_locked()}/{MAX_LIVE_WORKERS} "
-                    f"wedged={self._wedged} dropped={self._dropped} ({self._why})")
+                    f"wedged={self._wedged} dropped={self._dropped} "
+                    f"retired_closed={self._retired_closed} "
+                    f"retired_leaked={self._retired_leaked} ({self._why})")
 
     def changed_to_log(self) -> str | None:
         """One sentence per distinct state. A blind window is loggable; a
@@ -626,9 +809,36 @@ def _make_backend(cfg: dict, want: str):
     raise ValueError(f"unknown sensor backend: {want}")
 
 
-def make_hub(cfg: dict, force: str | None = None) -> SensorHub:
+def make_hub(cfg: dict, force: str | None = None,
+             backend=None) -> SensorHub:
+    """Build the hub, constructing the first backend **inside** its supervisor.
+
+    The initial acquisition used to run on the caller's thread, right here, before the
+    supervisor existed — so `tick_timeout_s` did not cover it. `LhmBackend.__init__`
+    calls `Computer.Open()`, and `FallbackBackend.__init__` calls `nvmlInit()`: both are
+    native calls that can block indefinitely, and a factory that hangs at start-up
+    prevented the control loop from ever starting. The same call is reached again from
+    `main.py`'s degraded-backend retry, where hanging would block host-event processing
+    and the watchdog heartbeat instead (#17/#23 review, P1). `Guard.run` catches an
+    exception there, but it cannot bound a call that never returns.
+
+    So the hub is created with no backend and the first `_REOPEN` is handed to the
+    supervisor like every later rebuild: bounded by `tick_timeout_s`, collectable on a
+    later tick if it is slow, and escalated by `_escalate` if it never answers. The loop
+    starts degraded (the panel, the light rules and the sleep/lock handling all keep
+    working) and adopts the backend when the factory finally returns.
+
+    `backend` is for tests and for callers that already hold one; `None` is the normal
+    production path.
+    """
     want = (force or cfg["sensors"]["backend"]).lower()
-    hub = SensorHub(_make_backend(cfg, want), cfg=cfg, want=want)
+    if backend is None:
+        hub = SensorHub(None, cfg=cfg, want=want)
+        with hub._lock:
+            hub._want_reopen = True
+            hub._why = "the first backend is being acquired on the supervisor"
+    else:
+        hub = SensorHub(backend, cfg=cfg, want=want)
     # Shutdown releases the driver handles too, not just the process: NVML and
     # the LHM ring0 device are polite about it, and a leaked Computer() is one
     # more reason the next start behaves differently from this one.

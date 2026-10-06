@@ -355,7 +355,8 @@ def case_backoff_when_all_is_lost() -> None:
     seen: list[str] = []
     link = PanelLink(simu_cfg(), log=seen.append)
 
-    def fail_build(first: bool = False, reason: str = "") -> bool:
+    def fail_build(first: bool = False, reason: str = "",
+                   wait_s: float = 0.0) -> bool:
         link.down_reason = "no port present"
         return False
 
@@ -368,6 +369,13 @@ def case_backoff_when_all_is_lost() -> None:
     link._restart_attempts = 3          # every rung of the ladder has now been spent
     link._retry_at = 0.0
     link._last_down_log = 0.0
+    # The first attempt runs on the background worker, so wait for it to hand the build
+    # lease back before timing the next one: this case is about the retry clock, and a
+    # tick that lands while a build is still in flight returns early without logging.
+    deadline = time.monotonic() + 10.0
+    while link.building and time.monotonic() < deadline:
+        time.sleep(0.05)
+    seen.clear()                        # the assertion below is about *this* tick's line
     link.tick()
     gap = link._retry_at - time.monotonic()
     check("attempts slow down after the ladder", 50.0 < gap <= 62.0, True)

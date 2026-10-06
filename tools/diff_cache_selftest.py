@@ -301,9 +301,11 @@ def case_vendor_boundary_does_not_swallow_a_timeout() -> None:
     # left the host and the vendor dropped that number on the floor.
     class ShortSerial(FakeSerial):
         def write(self, data):
+            self.writes.append(bytes(data))
             return len(data) - 1
 
-    dev.lcd_serial = ShortSerial()
+    short_serial = ShortSerial()
+    dev.lcd_serial = short_serial
     raised = None
     try:
         dev.serial_write(b"0123456789")
@@ -311,6 +313,14 @@ def case_vendor_boundary_does_not_swallow_a_timeout() -> None:
         raised = e
     check("a short write raises too", raised is not None, True)
     check("and names what happened", "short write" in str(raised), True)
+    # ...and it is *not* the exception whose shape invites the reconnect-and-resend
+    # path: writing `line` again after `len(line) - 1` bytes were accepted would put
+    # two copies of the same bytes on the wire. `type()` is how `WriteLine` tells the
+    # two failure arms apart, so this is the check that keeps them apart.
+    check("and it is not a SerialException (that arm would resend the buffer)",
+          isinstance(raised, real_serial.SerialException), False)
+    check("the short buffer was written exactly once (nothing was replayed)",
+          len(short_serial.writes), 1)
 
     # And the whole chain: a real DiffPusher over a PanelLink whose device times out
     # must not commit, and the retry must be a whole frame rather than a band.
@@ -337,11 +347,146 @@ def case_vendor_boundary_does_not_swallow_a_timeout() -> None:
     link.close()
 
 
+class PartialDevice:
+    """A device whose first write is short and whose next one is complete.
+
+    This is the endpoint shape the reconnect-and-resend-once path was *made* for and
+    could not survive: 3 bytes of the first buffer are accepted, the rest are not, and
+    the following write goes out whole. See the case below for why that makes the two
+    failure arms of `WriteLine` have to stay apart.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[bytes] = []      # every buffer written, in order
+
+    def write(self, data):
+        self.calls.append(bytes(data))
+        return 3 if len(self.calls) == 1 else len(data)
+
+    def close(self):
+        pass
+
+    def flush(self):
+        pass
+
+
+def case_vendor_boundary_does_not_resent_a_short_write() -> None:
+    """A short write must fail the push, not be repaired by replaying the buffer (#9).
+
+    The previous fix made a *short* write raise, which was right, but it raised inside
+    the arm of the vendored `WriteLine` that closes the port, reopens it and writes the
+    buffer **from byte zero**. Against this device the first write accepts 3 bytes of a
+    250-byte padded command and the retry delivers all 250, so the wire receives
+    `b'abcabcdefgh'` — the accepted prefix followed by a second copy of the whole buffer.
+    `WriteLine` returned normally, so `PanelLink` acknowledged the push, so `DiffPusher`
+    committed a shadow frame the panel does not hold: from then on the diff transport
+    stops re-sending exactly the bands that are missing. That is the state this case
+    pins, and the fix is that a *partial* delivery is never resent — only a
+    `SerialException` raised with nothing on the wire buys the reconnect-and-resend-once,
+    because only then is the buffer still unsent.
+
+    Driven the way the finding requires: through `WriteLine` *and* the acknowledgement
+    chain (real vendored `LcdComm` under `harden_vendor`, a real `PanelLink`, a real
+    `DiffPusher`), not by calling `serial_write` directly. The assertion is about bytes,
+    not about the exception, so a fix that changed the exception type without changing
+    the write behaviour would still fail here.
+    """
+    print("case: a short write is not resent from byte zero (#9)")
+    from app import display as disp
+
+    try:
+        from library.lcd.lcd_comm import LcdComm
+    except ImportError as e:
+        print(f"  SKIP the vendored library is not present ({e})")
+        return
+
+    # `harden_vendor` is idempotent and `_pcmonitor_hardened` is sticky per process, so
+    # the flag is reset the same way the case above does it: the patch must be the one
+    # this process runs, not whichever revision an earlier import installed.
+    disp._vendor_hardened = False
+    disp.harden_vendor()
+
+    class Dev(LcdComm):
+        def InitializeComm(self): pass
+        def Reset(self): pass
+        def Clear(self): pass
+        def ScreenOff(self): pass
+        def ScreenOn(self): pass
+        def SetBrightness(self, level): pass
+        def SetOrientation(self, orientation): pass
+        def DisplayPILImage(self, *a, **k): pass
+
+    class RealDriver(Dev):
+        """A driver whose image call really goes out through the vendored `WriteLine`.
+
+        That is the point of driving the class instead of a hand-written fake: the
+        failure under test lives in the write path, and this call reaches it exactly the
+        way the vendored revision-C full-frame push does — `WriteData` → `WriteLine` →
+        `serial_write`, one padded 250-byte command per call. The payload here is a
+        stand-in rather than `_generate_full_image`'s bytes (there is no panel and no ROM
+        version to generate for), but the number, order and framing of the writes is the
+        real shape, which is what the byte assertions below are about.
+        """
+
+        def __init__(self, serial_port):
+            super().__init__(com_port="COM_TEST")
+            self.lcd_serial = serial_port
+
+        def DisplayPILImage(self, image, x: int = 0, y: int = 0,   # noqa: N802
+                            image_width: int = 0, image_height: int = 0) -> None:
+            self.WriteData(bytearray(b"PC-BITMAP-COMMAND".ljust(250, b" ")))
+            if image.width * image.height:
+                self.WriteData(bytearray(b"PC-BITMAP-PAYLOAD".ljust(250, b" ")))
+
+    device = PartialDevice()
+    dev = RealDriver(device)
+
+    # The link the diff cache holds, with the real hardened driver installed as its
+    # device — the same hand-over `PanelLink.lcd` does at bring-up. The command type is
+    # `bytearray`, which is why `PartialDevice.write` reads `len(data)` and not the
+    # length of some `bytes` conversion.
+    link = PanelLink(simu_cfg(), log=lambda m: None)
+    check("open()", link.open(), True)
+    link.lcd = dev
+    pusher = DiffPusher(link)
+    img = Image.new("RGB", (800, 480), (7, 7, 7))
+    check("the push whose first write is short reports failure", pusher.push(img), False)
+    check("so the shadow frame was not committed", pusher.prev, None)
+    check("the device was asked exactly once (no blind resend of the buffer)",
+          len(device.calls), 1)
+
+    # And the next push is a whole frame on a fresh handle that writes cleanly — the
+    # recovery path the propagation hands the failure to. `_discard` left the cache
+    # dirty, so this one is the whole 800x480 image rather than a band, and every byte
+    # of it arrives exactly once.
+    link.lcd = dev
+    check("the retry of the same image is acknowledged", pusher.push(img), True)
+    check("and each of its commands went out whole, exactly once",
+          [len(c) for c in device.calls[1:]], [250, 250])
+    # The push above proves the *chain* refused to commit; the same `WriteLine` is then
+    # called once more, directly, so the `_ShortWrite` arm itself is pinned: one call for
+    # one buffer. The old arm wrote twice (and a buffer written twice is the corruption),
+    # so this is the count that distinguishes the fix from it.
+    dev.lcd_serial = PartialDevice()
+    direct = None
+    try:
+        dev.WriteLine(b"PC-ONE-COMMAND")
+    except BaseException as e:  # noqa: BLE001 - the raise is the point of the case
+        direct = e
+    check("an unacknowledgeable short-write command raises from WriteLine",
+          type(direct).__name__, "_ShortWrite")
+    check("and WriteLine wrote that buffer exactly once (no resend from byte zero)",
+          len(dev.lcd_serial.calls), 1)
+    check("the bytes it wrote are the buffer it was given, in order",
+          dev.lcd_serial.calls[0], b"PC-ONE-COMMAND")
+
+
 def main() -> int:
     for fn in (case_healthy_diff, case_failed_full_frame, case_failed_mid_band,
                case_relink_during_push, case_invalidate_during_push,
                case_late_old_generation_completion, case_link_acks_and_counts,
-               case_vendor_boundary_does_not_swallow_a_timeout):
+               case_vendor_boundary_does_not_swallow_a_timeout,
+               case_vendor_boundary_does_not_resent_a_short_write):
         fn()
         print()
     print("SELFTEST PASSED" if not fails else f"SELFTEST FAILED: {fails}")

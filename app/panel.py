@@ -432,7 +432,12 @@ class PanelLink:
         # the attempt is over and the gate is back. `_state` cannot stand in for it —
         # `_retire` parks the state at `_CLOSED` for the whole slow part of a build — so
         # every "is it safe to act?" question asks this instead. See `building`.
+        #
+        # The reservation is claimed by the *dispatching* thread (see `start_build`), so
+        # there is no window between scheduling a bring-up and its lease being visible.
+        # `_lease_seq` is what makes the release owner-checked.
         self._building = False
+        self._lease_seq = 0
         self._closing = False
         self._retry_at = 0.0
         self._last_down_log = 0.0
@@ -526,8 +531,14 @@ class PanelLink:
         return self._build_now(first=True)
 
     def _build(self, reason: str = "") -> bool:
-        """Synchronous rebuild — used for a resume, where the caller wants the answer."""
-        return self._build_now(reason=reason)
+        """Synchronous rebuild — used for a resume, where the caller wants the answer.
+
+        `wait_s=-1` waits without a cap here because the caller (`relink`) has already
+        chosen to queue and the attempt it is queueing behind is itself bounded by one
+        build window — see `_claim_lease`. It cannot wait forever: the build it waits for
+        either finishes or is retired by a deadline inside `_build_owned`.
+        """
+        return self._build_now(reason=reason, wait_s=-1.0)
 
     def start_build(self, reason: str = "background retry") -> None:
         """Rebuild on a background thread, so a deaf panel cannot stall the loop.
@@ -542,22 +553,57 @@ class PanelLink:
         running — is what stops a second attempt starting while this one is still queued
         on `_gate`: one build per moment, whether it has reached its vendor traffic yet
         or not.
+
+        The **lease** is taken here, in this dispatching thread, before the worker
+        exists (#6 review, P1). Setting only `_state` and then spawning meant the honest
+        `building` signal was false for the whole gap between `Thread.start()` and the
+        worker's first instruction: during that window a second `start_build()` was
+        accepted and `tick()`'s escalation guard saw `not building` and could enter
+        `_usb_restart()` underneath the queued bring-up. With a scheduler that queues the
+        target without running it, two calls created two workers with `building` false
+        throughout. Reserving before scheduling removes the gap, and only the reservation's
+        owner may release it, so a momentary contender can never drop a live build's lease.
+
+        A background retry has nothing to do while the link is already up, so that check
+        lives *here* rather than in the lease: `relink` is the deliberate exception, and a
+        lease that refused whenever the state was `_READY` would refuse exactly the resume
+        it exists for — a healthy link is precisely when a resume re-makes it.
         """
         with self._lock:
-            if self._closing or self.building or self._state == _READY:
+            if self._closing or self._state == _READY:
                 return
-            self._set_state(_BUILDING)
+        token = self._claim_lease()
+        if token is None:
+            return
+        with self._lock:
+            if self._state != _BUILDING:
+                self._set_state(_BUILDING)
+        # From here the lease belongs to `work`, which adopts it and is the only thread
+        # that releases it. Releasing here as well would fight the worker.
+
+        held: list = []                     # the token this worker adopted
+        me = threading.get_ident
 
         def work() -> None:
+            # The reservation is adopted here, on the worker, so the release token and
+            # the work live on one thread. `start_build` published it in the dispatching
+            # thread purely so it is visible *before* this thread is scheduled — the
+            # window the review's P1 was about — and then hands ownership over.
+            #
+            # This `finally` is the *only* place a `start_build` lease is released, and it
+            # is why the release cannot live inside `_build_now`: whatever `_build_now`
+            # does — return, raise, or not be `_build_now` at all in a test — the lease
+            # this worker owns is given back. An earlier draft released on the worker only
+            # via `_build_now`, and a path that never reached its release left the link
+            # permanently "building" (the `_READY` check then refused every later rebuild).
             try:
-                self._build_now(reason=reason)
+                held.append(self._claim_lease(adopt=True))
+                self._build_now(reason=reason, adopt=True)
             finally:
-                # `_build_now` clears the claim on every path where it ran. This catches
+                # `_build_now` clears the state on every path where it ran. This catches
                 # the one where it did not: it could not get the gate, so the attempt now
-                # inside it belongs to somebody else and the flag would otherwise stay up
-                # forever with nothing left to drop it. An idle `_gate` is the proof that
-                # nobody is building, and holding it across the reset means no build can
-                # start between the check and the write.
+                # inside it belongs to somebody else and the state would otherwise stay
+                # `_BUILDING` forever with nothing left to drop it.
                 if self._gate.acquire(blocking=False):
                     try:
                         with self._lock:
@@ -565,25 +611,108 @@ class PanelLink:
                                 self._set_state(_CLOSED)
                     finally:
                         self._gate.release()
+                self._release_lease(held[0] if held else None, owner=me())
 
         threading.Thread(target=work, daemon=True, name="panel-bring-up").start()
 
-    def _build_now(self, first: bool = False, reason: str = "") -> bool:
-        """Run one bring-up, holding the build lease for the whole attempt.
+    def _claim_lease(self, wait_s: float = 0.0, adopt: bool = False):
+        """Take the build lease, or return None if one is already held.
 
-        The lease is raised *before* the gate is taken and dropped *after* it is
-        released, which is the property #6 asked for and the one `_state` cannot express:
-        `_build_owned` retires the old connection as its first act, and `_retire` parks
-        the state at `_CLOSED`, so for the slow half of a bring-up the lifecycle claims
-        nothing is happening while this thread is inside the gate holding the port.
+        The reservation is a number, not a boolean, and that is the point: a contender
+        that loses must not be able to *release* the winner's lease. The old code's
+        `finally` cleared the same flag it may never have set, so a caller that timed out
+        waiting for `_gate` could drop the flag belonging to the build still running
+        inside it.
+
+        `adopt=True` is for `start_build`'s worker: the dispatcher has already raised the
+        lease so it is visible before the thread is scheduled, and the worker *adopts*
+        that same reservation — same token, same owner, no second claim and no window in
+        which the lease is unowned. That is what keeps the release with the thread that
+        does the work while still closing the scheduling gap.
+
+        `wait_s` is for the callers that are supposed to queue: `relink` is a resume
+        asking for the link to be re-made, and its contract has always been to wait for a
+        background attempt rather than refuse. A negative value waits until it is free.
+        Waiting here rather than on `_gate` is deliberate — the gate is released a moment
+        before the lease, so a waiter that only watched the gate could claim it while the
+        previous lease was still up.
         """
+        deadline = None if wait_s < 0 else time.monotonic() + wait_s
+        while True:
+            with self._lock:
+                if adopt and self._building:
+                    # The dispatcher's reservation: same token, and the *owner* moves to
+                    # this thread, so the release lands where the work does.
+                    self._lease_owner = threading.get_ident()
+                    return self._lease_seq
+                if self._closing:
+                    return None
+                if not self._building:
+                    self._building = True
+                    self._lease_seq += 1
+                    self._lease_owner = threading.get_ident()
+                    return self._lease_seq
+            # Somebody else owns the link's rebuild. Wait only if this caller was told
+            # to; `start_build` and the loop's own paths must answer immediately.
+            if deadline is None and wait_s >= 0:
+                return None
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            time.sleep(0.05)
+
+    def _release_lease(self, token, owner=None) -> None:
+        """Give back the lease, but only if `token` (and, if given, `owner`) still holds it.
+
+        Two guards because there are two ways a stale release could land: a contender that
+        never owned the lease (the token check), and the *dispatcher* releasing the
+        reservation its worker has since adopted (the owner check). The second is why
+        `start_build` passes its own thread identity — the worker adopts the same token,
+        so `token` alone cannot tell them apart.
+
+        The owner comparison is `!=`, not `is not`, and that is not a style choice:
+        `threading.get_ident()` builds a new `int` object per call, so two identities that
+        are equal can still be distinct objects. Identity comparison there silently
+        refused *every* release — a bug that made the link permanently "building" and
+        every later rebuild a no-op.
+        """
+        if token is None:
+            return
         with self._lock:
-            self._building = True
+            if not self._building or self._lease_seq != token:
+                return
+            if owner is not None and self._lease_owner != owner:
+                return
+            self._building = False
+            self._lease_owner = None
+
+    def _build_now(self, first: bool = False, reason: str = "",
+                   wait_s: float = 0.0, adopt: bool = False) -> bool:
+        """Run one bring-up on *this* thread, holding the lease for the whole attempt.
+
+        Used by start-up, by `relink`, and by `start_build`'s worker. The lease is raised
+        before the gate is taken and dropped after it is released, which is the property
+        #6 asked for and the one `_state` cannot express: `_build_owned` retires the old
+        connection as its first act, and `_retire` parks the state at `_CLOSED`, so for
+        the slow half of a bring-up the lifecycle claims nothing is happening while this
+        thread is inside the gate holding the port.
+
+        `wait_s` is passed through to `_claim_lease`: 0 (the default) refuses at once,
+        which is what the loop's own paths want; `relink` passes a negative value to queue
+        behind a background attempt instead of failing the resume. `adopt=True` means this
+        thread is `start_build`'s worker taking over the reservation its dispatcher
+        already published.
+        """
+        token = self._claim_lease(wait_s=wait_s, adopt=adopt)
+        if token is None:
+            # Somebody else owns the link's rebuild right now, and this caller was not
+            # asked to wait. Saying so is the answer; two attempts at one port is the
+            # fault this whole mechanism prevents.
+            self.down_reason = "a rebuild is already in flight"
+            return False
         try:
             return self._build_attempt(first=first, reason=reason)
         finally:
-            with self._lock:
-                self._building = False
+            self._release_lease(token)
 
     def _build_attempt(self, first: bool = False, reason: str = "") -> bool:
         """Bring the link up: one build at a time, and never after `close()`.

@@ -12,6 +12,7 @@ pinned clock. Real driver behaviour on real hardware stays the documented
 Windows manual step (`tools/sensor_probe.py`).
 """
 import sys
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -97,6 +98,97 @@ class NanBackend(OkBackend):
         snap.cpu.load_pct = float("nan")
         snap.cpu.temp_c = float("inf")
         snap.ram_used_mb = float("-inf")
+
+
+class GateBackend(OkBackend):
+    """A native call the test holds open, and then lets go.
+
+    `wedge_on` picks which call blocks. A gate is what makes a *wedge* schedulable:
+    the call sits inside the driver for exactly as long as the test wants, and the
+    same call finishing later is the moment a retired generation has to give its
+    backend back (#2) - the half no live-thread count could ever have caught.
+    """
+
+    def __init__(self, gate: threading.Event, tag: str = "gated", wedge_on: int = 1):
+        super().__init__(tag=tag)
+        self.gate = gate
+        self.wedge_on = wedge_on
+        self.calls = 0
+
+    def sample(self, snap):
+        self.calls += 1
+        snap.cpu.load_pct = 42.0
+        if self.calls == self.wedge_on:
+            self.gate.wait(5.0)
+
+
+class FirstSampleRaisesBackend(OkBackend):
+    """Built successfully, and then dies on the very sample it was built for.
+
+    Finding #1's shape: a `_REOPEN` whose construction worked and whose first
+    sample threw. The backend is the hub's to keep - someone has to close the
+    driver it just acquired - and the raise is only this tick's bad news.
+    """
+
+    def __init__(self, tag: str = "new"):
+        super().__init__(tag=tag)
+        self.calls = 0
+
+    def sample(self, snap):
+        self.calls += 1
+        if self.calls == 1:
+            raise RuntimeError("the freshly built driver answered nothing")
+        super().sample(snap)
+
+
+class SlowThenDeadBackend(OkBackend):
+    """Answers late, then dies: an old reading must not be renewed by arriving.
+
+    The first call takes its reading and then stays inside the driver until the
+    test opens the gate - finding #4's measured shape, a value acquired on one tick
+    and collected several ticks later. Every call after it fails, which is what
+    makes the tick after the collection cross the *original* sample's grace deadline
+    instead of quietly replacing it with a new one.
+    """
+
+    def __init__(self, gate: threading.Event, tag: str = "slow"):
+        super().__init__(tag=tag)
+        self.gate = gate
+        self.calls = 0
+
+    def sample(self, snap):
+        self.calls += 1
+        if self.calls > 1:
+            raise RuntimeError("the driver is gone")
+        snap.cpu.load_pct = 42.0
+        snap.cpu.temp_c = 55.0
+        snap.ram_used_mb = 1000.0
+        self.gate.wait(5.0)
+
+
+def at(seq: list, i: int):
+    """`seq[i]`, or None when a case's factory was not called that many times.
+
+    A regression that stops building replacements has to surface as a failed check
+    with a readable name — not as an IndexError that hides every later assertion in
+    the case, and not as an empty-list comparison that agrees for the wrong reason.
+    """
+    return seq[i] if 0 <= i < len(seq) else None
+
+
+def settle_inflight(hub, timeout: float = 2.0) -> bool:
+    """Wait for the operation the hub is holding to finish, as a later tick would.
+
+    The cases that need a *completed but uncollected* job (finding #3) cannot ask
+    the loop to wait for it - not waiting is the whole point of the dispatch budget
+    - so they wait on the job the loop still holds. That is the same event `_drain`
+    looks at, which is why it is the honest way to schedule "the worker finished
+    and the loop has not noticed yet". Returns False when there is nothing in flight.
+    """
+    job = hub._inflight
+    if job is None:
+        return False
+    return job.done.wait(timeout)
 
 
 def hub_with(backend, **over):
@@ -556,8 +648,10 @@ def case_nvml_reference_balance() -> None:
 
         # E: backend replacement while the old one still owns a reference. The point is
         # that the *retired* backend's reference is given back — not that the balance
-        # reaches zero, because the replacement legitimately owns one of its own. Both
-        # are closed here, and zero is the only correct end state.
+        # reaches zero, because the replacement legitimately owns one of its own. Since
+        # #2 the case no longer does that by hand: the retired generation's worker was
+        # idle at the swap, so it releases what it owned on its way out, and this pins
+        # that instead. Zero is still the only correct end state.
         fake = make_counting_nvml(devices=1)
         sys.modules["pynvml"] = fake
         fb.psutil = fake_psutil()
@@ -566,16 +660,22 @@ def case_nvml_reference_balance() -> None:
         hub = sens.SensorHub(old_b, cfg=c3, want="fallback")
         hub.tick(now=1.0)
         check("the replaced backend owned a reference", fake.refs["live"], 1)
+        retired_worker = hub._worker
         new_b = FallbackBackend(c3)
         hub.backend = new_b
         hub.tick(now=2.0)
-        check("two live backends each own one reference", fake.refs["live"], 2)
-        old_b.close()
-        check("the retired backend gave its reference back", fake.refs["live"], 1)
+        retired_worker.join(2.0)
+        check("the retired generation gave its reference back on its way out, so only "
+              "the replacement is still owning one",
+              (fake.refs["live"], fake.refs["over"]), (1, 0))
+        old_b.close()                    # the #69 contract: a repeated close is a no-op
+        check("and a repeated close of the released backend changes nothing",
+              (fake.refs["live"], fake.refs["over"]), (1, 0))
         new_b.close()
-        check("and the replacement gave back its own",
+        check("the replacement gave back its own",
               (fake.refs["live"], fake.refs["over"]), (0, 0))
         hub.close()
+        check("shutdown leaves nothing owned", fake.refs["live"], 0)
     finally:
         fb.psutil = real_psutil
         if have:
@@ -668,6 +768,472 @@ def case_lhm_update_failure_is_not_a_healthy_scan() -> None:
         b.close()
 
 
+def case_built_replacement_is_adopted_when_its_first_sample_raises() -> None:
+    """Finding #1: a built backend is the hub's even when its first sample throws.
+
+    `_perform` recorded the construction failure and the sample failure in the same
+    field, and `_apply_locked` read it as "the build failed": the hub went on holding
+    the backend the reopen had already closed, and the replacement - with everything
+    it had just acquired - was never adopted and never released. Measured on the
+    broken code: two such recoveries left two replacement backends with close count
+    zero, even after `hub.close()`. The other half is kept here too: a factory that
+    throws must *not* be adopted, and must back off.
+    """
+    print("case: a replacement whose first sample raises is still adopted (#1)")
+    old = RaisingBackend()
+    h = hub_with(old)
+    made: list[OkBackend] = []
+
+    def fake_make(_cfg, _want):
+        b = FirstSampleRaisesBackend(tag=f"made{len(made) + 1}")
+        made.append(b)
+        return b
+
+    real = sens._make_backend
+    sens._make_backend = fake_make
+    try:
+        h.tick(now=100.0)
+        h.tick(now=101.0)
+        h.tick(now=102.0)              # failure 3 -> rebuild, whose first sample dies
+        check("the replacement the reopen built is the hub's backend",
+              h.backend is at(made, 0), True)
+        check("the rebuild is counted, not mistaken for a failed construction",
+              (h._rebuilds, h._want_reopen), (1, False))
+        check("and the backend it replaced was closed exactly once", old.closed, 1)
+        # And a second recovery, which is the shape that was measured leaving *two*
+        # replacements with close count zero: this reopen releases the first
+        # replacement, and its own replacement is adopted even though its first
+        # sample dies as well.
+        h.recover("test-again", now=103.0)
+        check("the second recovery built and adopted a second replacement",
+              (len(made), h._rebuilds, h.backend is at(made, 1)), (2, 2, True))
+        check("and released the replacement it replaced",
+              [b.closed for b in made], [1, 0])
+        s = h.tick(now=104.0)          # the next tick samples the newest replacement
+        check("the next sample uses that replacement, not a closed one",
+              s.cpu.load_pct, 42.0)
+        check("a healthy second sample is fresh again",
+              (s.held, s.failed), (False, ()))
+        check("and neither dead backend was sampled again",
+              (old.closed, [b.closed for b in made]), (1, [1, 0]))
+    finally:
+        sens._make_backend = real
+    h.close()
+    # Balance, and the balance has to survive shutdown: every backend the factory
+    # returned is closed exactly once, by whoever ended up owning it.
+    check("every backend the factory returned is closed exactly once",
+          [b.closed for b in made], [1, 1])
+    check("the backend it replaced is still closed exactly once", old.closed, 1)
+
+    # The other direction: a factory that cannot build must change nothing about
+    # ownership. The hub keeps the backend it holds (its close is asked again, which
+    # every backend survives) and retries on the backoff clock, never per tick.
+    old2 = RaisingBackend()
+    h2 = hub_with(old2)
+
+    def broken_make(_cfg, _want):
+        raise RuntimeError("no driver to build")
+
+    real = sens._make_backend
+    sens._make_backend = broken_make
+    try:
+        h2.tick(now=100.0)
+        h2.tick(now=101.0)
+        h2.tick(now=102.0)             # failure 3 -> a reopen that cannot build
+        check("a construction failure leaves the hub on the backend it owns",
+              h2.backend is old2, True)
+        check("and schedules the retry on the backoff clock",
+              (h2._next_try, h2._backoff), (107.0, 10.0))
+        check("the reason names the construction, not a sample",
+              "no driver to build" in h2._why, True)
+        check("nothing was adopted", h2._rebuilds, 0)
+    finally:
+        sens._make_backend = real
+    h2.close()
+    check("and the backend the hub kept is still released at shutdown",
+          old2.closed >= 1, True)
+
+
+def case_retired_generation_releases_its_backend() -> None:
+    """Finding #2: a retired generation gives its backend back when its call returns.
+
+    `_supervise` returned as soon as its generation was retired, and `_escalate`
+    deliberately does not close a backend something is still inside - so nothing
+    closed it *after* that call returned. A retired worker that finished late leaked
+    its backend for good, and because `MAX_LIVE_WORKERS` only counts live threads,
+    each finished-then-retired thread freed a slot while its native initialization
+    was still owned: repeated slow-then-return recoveries piled resources up and
+    never reached the cap. The resources are what this case asserts, not the count of
+    threads - three escalation cycles, every gate opened afterwards, and every
+    backend accounted for.
+    """
+    print("case: a retired generation releases the backend it was inside (#2)")
+    seed_gate = threading.Event()
+    seed = GateBackend(seed_gate, tag="seed", wedge_on=1)
+    made: list[GateBackend] = []
+
+    def fake_make(_cfg, _want):
+        # The replacement answers the reopen's own sample (call 1) and wedges on the
+        # next tick's sample (call 2): the hub adopts it first, *then* the generation
+        # holding it is retired while it is inside the driver. That is the leak - the
+        # hub has already moved on to the next generation, so only this thread can
+        # give the backend back.
+        b = GateBackend(threading.Event(), tag=f"made{len(made) + 1}", wedge_on=2)
+        made.append(b)
+        return b
+
+    h = hub_with(seed, tick_timeout_s=0.05, stale_grace_s=0.2)
+    real = sens._make_backend
+    sens._make_backend = fake_make
+    try:
+        h.tick(now=100.0)              # the seed wedges on its first sample
+        for i in range(3):
+            wedged_worker = h._worker          # the thread inside the wedged call
+            inside = h.backend                 # the backend it is inside
+            h.recover("test-wedge", now=200.0 + 100.0 * i)
+            check(f"cycle {i}: the replacement was adopted",
+                  (len(made), h.backend is at(made, i)), (i + 1, True))
+            check(f"cycle {i}: the generation was retired rather than joined",
+                  h._wedged, i + 1)
+            if inside is not None:
+                inside.gate.set()              # the native call finally returns
+            wedged_worker.join(2.0)
+            check(f"cycle {i}: the retired supervisor has exited",
+                  wedged_worker.is_alive(), False)
+            check(f"cycle {i}: and released the backend it was inside",
+                  None if inside is None else inside.closed, 1)
+            if i < 2:
+                h.tick(now=200.0 + 100.0 * i)  # wedge the backend it just adopted
+        h.close()
+    finally:
+        sens._make_backend = real
+    check("no backend the factory built was left unclosed",
+          [b.closed for b in made], [1, 1, 1])
+    check("the seed was released exactly once", seed.closed, 1)
+    check("every retirement cleaned up after itself, and none leaked",
+          (h._retired_closed, h._retired_leaked), (3, 0))
+
+
+def case_completed_operation_is_collected_before_dispatching_another() -> None:
+    """Finding #3: a finished-but-uncollected job is not an idle worker.
+
+    `_dispatch` treated `job.done` as "nothing owed", so a `recover()` or `close()`
+    arriving between the worker finishing a reopen and the next tick draining it
+    overwrote `_inflight` - and the replacement that job was holding went with it:
+    never adopted, therefore never closed either, while the operation dispatched over
+    it closed the *old* backend a second time and built yet another backend. Both
+    entry points are driven here, with the close counts as the evidence.
+    """
+    print("case: a completed operation is drained before another is dispatched (#3)")
+
+    def drive_to_a_gated_reopen(fake_hub, gate):
+        """Fail three ticks so the streak asks for a reopen, and stall that reopen."""
+        fake_hub.tick(now=100.0)
+        fake_hub.tick(now=101.0)
+        fake_hub.tick(now=102.0)       # failure 3 -> reopen, whose sample wedges
+        check("the reopen is in flight, not finished",
+              settle_inflight(fake_hub, timeout=0.0), False)
+        gate.set()                     # the driver answers on the worker's thread
+        check("the worker finished the reopen the loop stopped waiting for",
+              settle_inflight(fake_hub), True)
+
+    # A: recover() while a finished reopen is waiting to be collected.
+    old_a = RaisingBackend()
+    h = hub_with(old_a, tick_timeout_s=0.05)
+    gate_a = threading.Event()
+    made_a: list[GateBackend] = []
+
+    def factory_a(_cfg, _want):
+        b = GateBackend(gate_a, tag=f"made{len(made_a) + 1}")
+        made_a.append(b)
+        return b
+
+    real = sens._make_backend
+    sens._make_backend = factory_a
+    try:
+        drive_to_a_gated_reopen(h, gate_a)
+        check("the first replacement exists only in the uncollected job",
+              (len(made_a), h.backend is old_a, [b.closed for b in made_a]),
+              (1, True, [0]))
+        h.recover("test-collect", now=103.0)
+        check("recover collected that replacement and reopened from it",
+              (len(made_a), h._rebuilds), (2, 2))
+        check("the replacement it collected was closed on the way past",
+              [b.closed for b in made_a], [1, 0])
+        check("and the old backend was closed once, not twice",
+              old_a.closed, 1)
+        s = h.tick(now=104.0)
+        check("the hub is sampling the backend it ended up with",
+              (s.cpu.load_pct, s.held, h.backend is at(made_a, 1)),
+              (42.0, False, True))
+    finally:
+        sens._make_backend = real
+    h.close()
+    check("every backend the factory returned is closed exactly once",
+          [b.closed for b in made_a], [1, 1])
+    check("and so is the backend the case started from", old_a.closed, 1)
+
+    # B: the same shape on the shutdown path.
+    old_b = RaisingBackend()
+    h2 = hub_with(old_b, tick_timeout_s=0.05)
+    gate_b = threading.Event()
+    made_b: list[GateBackend] = []
+
+    def factory_b(_cfg, _want):
+        b = GateBackend(gate_b, tag=f"b{len(made_b) + 1}")
+        made_b.append(b)
+        return b
+
+    sens._make_backend = factory_b
+    try:
+        drive_to_a_gated_reopen(h2, gate_b)
+        check("a completed reopen is waiting to be collected at shutdown",
+              (len(made_b), h2.backend is old_b), (1, True))
+        h2.close()
+    finally:
+        sens._make_backend = real
+    check("shutdown adopted that replacement, then released it",
+          (h2.backend is at(made_b, 0), [b.closed for b in made_b]), (True, [1]))
+    check("and closed the old backend exactly once", old_b.closed, 1)
+
+
+def case_deferred_sample_keeps_its_age() -> None:
+    """Finding #4: a deferred answer is published at its real age, and cannot re-live.
+
+    The worker's result was returned untouched and `tick()` stamped `_good_at = now`,
+    so a value acquired at t=100 and collected after the worker was finally released
+    at t=120 was published as age 0: the retention window restarted for free, and the
+    next failure at t=131 still showed the reading as 11 s old, inside a grace the
+    original sample had already spent. The clock is injected here, so the ages below
+    are exact rather than approximate.
+    """
+    print("case: a deferred sample keeps its acquisition age (#4)")
+    gate = threading.Event()
+    b = SlowThenDeadBackend(gate)
+    h = hub_with(b, tick_timeout_s=0.05, stale_grace_s=30.0)
+    s = h.tick(now=100.0)              # handed over at 100, and it stalls there
+    check("the stalled tick publishes nothing it does not have",
+          (s.cpu.load_pct, s.held), (None, False))
+    gate.set()                         # the native call returns, twenty seconds on
+    check("the worker finished the sample the loop gave up on",
+          settle_inflight(h), True)
+    s = h.tick(now=120.0)              # ... and it is collected on a later tick
+    check("the deferred sample is published at its true age, not as a fresh zero",
+          (s.cpu.load_pct, s.held, s.age_s), (42.0, True, 20.0))
+    s = h.tick(now=131.0)              # a later sample fails; the ORIGINAL grace is over
+    check("past the original acquisition's grace it is not presented as fresh",
+          (s.cpu.load_pct, s.held), (None, False))
+    check("and the tick says why it is blank", "blind" in s.failed, True)
+    h.close()
+
+    # An answer that outlives its own grace before it is even collected must not put
+    # the panel back on old data either: the window it is spending is already closed.
+    gate2 = threading.Event()
+    b2 = SlowThenDeadBackend(gate2, tag="slow2")
+    h2 = hub_with(b2, tick_timeout_s=0.05, stale_grace_s=30.0)
+    h2.tick(now=100.0)
+    gate2.set()
+    check("the second worker finished its sample too", settle_inflight(h2), True)
+    s = h2.tick(now=140.0)
+    check("a sample that arrives after its own grace is retained, not shown as live",
+          (s.cpu.load_pct, s.held), (None, False))
+    check("the deadline the hub keeps is the one the sample started",
+          h2._good_at, 100.0)
+    h2.close()
+
+
+def case_lhm_partial_update_failure_keeps_the_readings() -> None:
+    """Finding #5: one hardware node that will not update must not blank the backend.
+
+    `hw.Update()` failing on the controller is one group of the walk dying, not the
+    driver: CPU temperature, clocks and package power are all readable from the nodes
+    that *did* update. `if self._update_fails: raise` threw every one of them away and
+    started the rebuild clock, so a single bad controller blanked the panel and
+    re-opened the Computer on every streak. The all-nodes-fail half is deliberately
+    kept - see `case_lhm_update_failure_is_not_a_healthy_scan` - because a driver that
+    answers nothing must still be named failed, or the rebuild is unreachable again.
+    """
+    print("case: a partial LHM update failure keeps the healthy readings (#5)")
+    from app.sensors.lhm import LhmBackend
+
+    class Sensor:
+        def __init__(self, srt: str, name: str, value):
+            self.SensorType = type("T", (), {"ToString": staticmethod(lambda: srt)})()
+            self.Name = name
+            self.Value = value
+
+    class HW:
+        def __init__(self, hwt: str, sensors, fails: bool = False):
+            self.HardwareType = type("T", (), {"ToString": staticmethod(lambda: hwt)})()
+            self.SubHardware: list = []
+            self.Sensors = sensors
+            self._fails = fails
+
+        def Update(self):
+            if self._fails:
+                raise RuntimeError("the controller driver stopped answering")
+
+    class Computer:
+        def __init__(self, hardware=None):
+            self.Hardware = hardware if hardware is not None else [
+                HW("Cpu", [Sensor("Load", "CPU Total", 33.0),
+                           Sensor("Temperature", "Core (Tctl/Tdie)", 65.0),
+                           Sensor("Clock", "Core #1", 4000.0),
+                           Sensor("Clock", "Core #2", 3900.0),
+                           Sensor("Power", "Total Power", 90.0)]),
+                HW("Controller", [], fails=True),
+            ]
+
+        def Open(self): pass
+
+        def Close(self): pass
+
+    class Host:
+        last_error = ""
+
+        def sample(self, snap):
+            snap.ram_used_mb = 111.0
+
+        def close(self): pass
+
+    # Bypass `_open`'s DLL load: this case is about the walk, not pythonnet's ability
+    # to find a file. The fake host is minimal because the LHM half must stand on its
+    # own here - a real psutil reading would only obscure which backend answered.
+    b = LhmBackend.__new__(LhmBackend)
+    b._host = Host()
+    b._c = Computer()
+    b._sensors = []
+    b._objs = []
+    b._lhm_fails = 0
+    b._update_fails = 0
+    b._update_total = 0
+    b._update_fail_nodes = []
+    b._reopen_after = 3
+    b._dll = ""
+    b.last_error = ""
+    rebuilt: list[int] = []
+    b._reopen_lhm = lambda: rebuilt.append(1)
+    try:
+        snap = Snapshot(ts=0.0, source="lhm")
+        raised = None
+        try:
+            b._lhm_sample(snap)        # one dead controller must not raise
+        except BaseException as e:     # noqa: BLE001 - the raise is the finding
+            raised = e
+        check("a partial update failure does not raise out of the walk", raised, None)
+        check("the healthy CPU temperature survives a dead controller",
+              snap.cpu.temp_c, 65.0)
+        check("its clocks survive too",
+              (snap.cpu.clock_max_mhz, snap.cpu.clock_avg_mhz), (4000.0, 3950.0))
+        check("and its package power and load", (snap.cpu.power_w, snap.cpu.load_pct),
+              (90.0, 33.0))
+        check("the failing node is recorded, not hidden",
+              (b._update_fails, b._update_total, b._update_fail_nodes),
+              (1, 2, ["Controller"]))
+        check("and it is not mistaken for the whole walk failing",
+              b._update_fails >= b._update_total, False)
+
+        # Through `sample()`: nothing is named failed, so a controller the CPU never
+        # needed cannot drive the hub's failure streak into a rebuild.
+        s = Snapshot(ts=0.0, source="lhm")
+        b.sample(s)
+        check("a partial update failure is not a failed lhm group",
+              "lhm" in s.failed, False)
+        check("the CPU readings are in the published snapshot", s.cpu.temp_c, 65.0)
+        check("the host readings still stand", s.ram_used_mb, 111.0)
+        check("no rebuild was asked for", rebuilt, [])
+        check("and the streak did not climb on a healthy sample", b._lhm_fails, 0)
+
+        # The other half of the predicate: a walk that leaves nothing readable is not
+        # a healthy scan either, even when only one node refused. That is the shape
+        # the inverse bug (#17) hid behind, so it still fails the group and climbs.
+        b._c = Computer([HW("Memory", [Sensor("Load", "Memory Used", 40.0)]),
+                         HW("Controller", [], fails=True)])
+        b._lhm_fails = 0
+        empty = Snapshot(ts=0.0, source="lhm")
+        raised = None
+        try:
+            b._lhm_sample(empty)
+        except BaseException as e:     # noqa: BLE001 - the raise is the finding
+            raised = e
+        check("a walk with nothing readable still fails", raised is not None, True)
+        check("and says the driver, not a metric, is the problem",
+              "would not update" in str(raised), True)
+        b.sample(Snapshot(ts=0.0, source="lhm"))
+        check("the hub names the group, so the streak can climb", b._lhm_fails, 1)
+    finally:
+        b.close()
+
+
+def case_a_blocked_factory_cannot_stall_the_loop() -> None:
+    """The review's extra P1: the *initial* acquisition must be bounded too.
+
+    `make_hub` used to evaluate `_make_backend(cfg, want)` on the caller's thread before
+    the hub existed, so `tick_timeout_s` did not cover it. `LhmBackend.__init__` calls
+    `Computer.Open()` and `FallbackBackend.__init__` calls `nvmlInit()`: a factory that
+    blocks there prevented the control loop from ever starting, and the same call is
+    reached again from `main.py`'s degraded retry, where blocking would stop host-event
+    processing and heartbeat production instead. `Guard.run` catches a raise; it cannot
+    bound a call that never returns.
+
+    `make_hub` now builds the hub *without* a backend and hands the first acquisition to
+    the supervisor as an ordinary `_REOPEN`. This drives exactly that: a factory blocked
+    until the test releases it must not stop the caller, must leave the hub
+    degraded-but-alive, and must be adopted once it finally answers.
+    """
+    print("case: a factory that blocks cannot stall the loop (#17/#23 review)")
+    import app.sensors as sens_mod
+
+    release = threading.Event()
+    built: list[str] = []
+
+    def blocking_factory(cfg_, want):
+        built.append(want)
+        release.wait(30.0)              # the native call that does not return
+        return OkBackend(tag="slow")
+
+    real = sens_mod._make_backend
+    sens_mod._make_backend = blocking_factory
+    try:
+        c = cfg(tick_timeout_s=0.10, stale_grace_s=30.0)
+        t0 = time.monotonic()
+        hub = sens_mod.make_hub(c, force="fallback")
+        made = time.monotonic() - t0
+        check("make_hub returned without waiting for the factory", made < 1.0, True)
+        check("nothing was built on the caller's thread", built, [])
+        # The loop must keep ticking and stay honest about being blind, not block.
+        t1 = time.monotonic()
+        snap = hub.tick(now=100.0)
+        tick_s = time.monotonic() - t1
+        check("a tick inside the blocked acquisition is bounded",
+              tick_s <= c["sensors"]["tick_timeout_s"] + 1.0, True)
+        check("and it reports a gap rather than blocking", bool(snap.failed), True)
+        check("the hub is still answering", isinstance(hub.describe(), str), True)
+        # More ticks while the factory is still inside the driver: the budget is per
+        # tick, and nothing here may accumulate threads or wait for the driver.
+        for i in range(5):
+            hub.tick(now=101.0 + i)
+        check("the outstanding acquisition is not multiplied", len(built), 1)
+        check("and only one supervisor is alive", hub._live_workers_locked() <= 1, True)
+
+        # Now let it finish: the hub must adopt it and answer with real data.
+        release.set()
+        deadline = time.monotonic() + 15.0
+        got = hub.tick(now=200.0)
+        while got.cpu.load_pct is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+            got = hub.tick(now=200.0)
+        check("the backend was adopted when the factory finally returned",
+              got.cpu.load_pct, 42.0)
+        check("and it is the backend the factory built",
+              type(hub.backend).__name__, "OkBackend")
+        check("the rebuild was counted", hub._rebuilds >= 1, True)
+        hub.close()
+    finally:
+        release.set()
+        sens_mod._make_backend = real
+
+
 def main() -> int:
     if not preflight():
         print()
@@ -676,7 +1242,13 @@ def main() -> int:
     for fn in (case_ok, case_hold_and_blank, case_bounded, case_partial, case_nan,
                case_reopen, case_reopen_backoff, case_recover, case_close,
                case_fallback_backend, case_nvml_reference_balance,
-               case_lhm_update_failure_is_not_a_healthy_scan):
+               case_lhm_update_failure_is_not_a_healthy_scan,
+               case_built_replacement_is_adopted_when_its_first_sample_raises,
+               case_retired_generation_releases_its_backend,
+               case_completed_operation_is_collected_before_dispatching_another,
+               case_deferred_sample_keeps_its_age,
+               case_lhm_partial_update_failure_keeps_the_readings,
+               case_a_blocked_factory_cannot_stall_the_loop):
         fn()
         print()
     print("SELFTEST PASSED" if not fails else f"SELFTEST FAILED: {fails}")

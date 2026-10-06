@@ -492,6 +492,90 @@ def case_one_build_at_a_time() -> None:
     link.close()
 
 
+def case_the_lease_is_reserved_before_the_worker_runs() -> None:
+    """The review's [P1]: the lease must be claimed in the *dispatching* thread.
+
+    `start_build` used to set only `_state` and then spawn. The honest `building` signal
+    was therefore false for the whole gap between `Thread.start()` and the worker's first
+    instruction — and in that gap a second `start_build()` was accepted, and `tick()`'s
+    escalation guard saw `not building` and could enter `_usb_restart()` underneath the
+    queued bring-up. With a scheduler that queues the target without running it, two
+    calls created two workers with `building` false throughout. There was a second
+    ownership bug in the same place: a contender that timed out waiting for `_gate` still
+    ran the `finally` and cleared the *active* builder's flag.
+
+    This case pauses the worker before its target ever executes, which is the only way to
+    see either bug; the mid-HELLO check in `case_build_lease_is_truthful_and_bars_escalation`
+    starts far too late to cover them.
+    """
+    print("case: the lease is reserved before the worker is scheduled (review P1)")
+    PORT.reset()
+    link = PanelLink(cfg(), log=say)
+    started: list[tuple] = []
+    real_start = threading.Thread.start
+
+    def capture_start(self):          # queue the target; never run it
+        started.append((self, self._target))
+
+    threading.Thread.start = capture_start
+    try:
+        link.start_build("first")
+        check("the lease is held before the worker has run", link.building, True)
+        check("the worker was scheduled but is not running", len(started), 1)
+        check("no device traffic yet (the worker has not run)", PORT.hello, 0)
+
+        # The scheduling gap is exactly where the review found the hole.
+        link.start_build("second")
+        check("a second attempt during the gap did not arm", len(started), 1)
+        check("and the lease is still the first one's", link.building, True)
+
+        # With no worker running there is no build holding `_gate`, so the gate alone
+        # could not have refused this; only the reservation does.
+        calls: list[str] = []
+        link._pnputil = lambda *a, **k: (calls.append(" ".join(str(x) for x in a)),
+                                        (False, "not attempted"))[1]
+        check("escalation is refused while the lease is merely reserved",
+              link._usb_restart(), False)
+        check("and issued no device verb", calls, [])
+    finally:
+        threading.Thread.start = real_start
+
+    # Now let the queued worker actually run, and confirm the reservation it inherited is
+    # released by it — once, and only after the attempt is over.
+    check("still exactly one worker queued", len(started), 1)
+    thread, target = started[0]
+    check("the queued target is the bring-up", callable(target), True)
+    target()
+    check("the worker released the lease when it finished", link.building, False)
+    check("the link came up", link.ok, True)
+    check("with one driver", PORT.open_count(), 1)
+    check("and never more than one handshake", PORT.peak_hello, 1)
+
+    # A contender that times out on the gate must not clear somebody else's lease.
+    PORT.reset()
+    gate = threading.Event()
+    PORT.next_behaviour = {"hello_gate": gate}
+    holder = PanelLink(cfg(), log=say)
+    holder.start_build()
+    check("the holder reached the device", wait_for(lambda: PORT.hello == 1), True)
+    check("the holder holds the lease", holder.building, True)
+    # A second, standalone attempt that cannot get the gate inside the build window.
+    # It must report failure and leave the holder's lease untouched.
+    saved_wait = panel_mod._BUILD_WAIT_S
+    panel_mod._BUILD_WAIT_S = 0.2
+    try:
+        refused = holder._build_now(reason="contender")
+    finally:
+        panel_mod._BUILD_WAIT_S = saved_wait
+    check("the contender was refused", refused, False)
+    check("and the holder's lease survived the contender", holder.building, True)
+    check("the holder's attempt is still inside the device", PORT.hello, 1)
+    gate.set()
+    check("the holder finished", wait_for(lambda: holder.ok), True)
+    check("and released its own lease", holder.building, False)
+    holder.close()
+
+
 def case_build_lease_is_truthful_and_bars_escalation() -> None:
     """Issue #6's unmet half: the build-in-progress signal must hold for the *lease*.
 
@@ -603,6 +687,7 @@ def main() -> int:
                case_close_during_build,
                case_one_build_at_a_time,
                case_build_lease_is_truthful_and_bars_escalation,
+               case_the_lease_is_reserved_before_the_worker_runs,
                case_hundred_outages):
         fn()
         print()

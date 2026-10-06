@@ -364,9 +364,15 @@ class Engine:
         after a hot reload the once-imported `DemoBackend` names the class of
         whichever generation imported it, while `demo_mod.DemoBackend` is the
         one `make_hub` just built against — comparing against the stale name
-        rejected every legitimate reload and left the game hub un-flagged."""
-        idle = make_hub(self.cfg, force="demo")
-        game = make_hub(self.cfg, force="demo")
+        rejected every legitimate reload and left the game hub un-flagged.
+
+        The backend is built here and handed to `make_hub` rather than left to the hub's
+        own lazy first acquisition, because the preview reads `hub.backend` immediately
+        (to set `.game` and to flag the pane). `DemoBackend` is pure Python state with no
+        native call behind it, so there is nothing to bound: the lazy path exists for the
+        factories that can block on a driver (#17/#23 review), and this is not one."""
+        idle = make_hub(self.cfg, force="demo", backend=demo_mod.DemoBackend(self.cfg))
+        game = make_hub(self.cfg, force="demo", backend=demo_mod.DemoBackend(self.cfg))
         assert isinstance(idle.backend, demo_mod.DemoBackend)
         idle.backend.game = False
         game.backend.game = True

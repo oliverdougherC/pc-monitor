@@ -48,6 +48,25 @@ schedule that is only *configuration*. The second opinion works the same way in
 miniature: the gamma ramp may only take back the look it gave (see #68), because
 Windows' own night light does not go through the ramp at all.
 
+`StateRead` is that distinction as one value, and it is returned rather than
+inferred: a poll that could not read an *established* state and a poll that
+decoded one are not allowed to be the same `state=None`. An earlier review round
+shipped the `StateUnreadable` exception and still failed acceptance, because
+`FileNotFoundError` was read as "nothing was ever stored" — and CloudStore
+deletes the value while it rewrites it, so a confirmed OFF at 23:00 inside a
+21:00→07:00 schedule was converted into ON/windows-schedule by a poll that
+merely caught the store mid-write. The read status now travels out of
+`_read_windows`, and only `ABSENT` — a key this build has never had, with
+nothing yet confirmed — may be answered by the schedule. A payload that will not
+decode is `MALFORMED`, which is an unreadable poll and not an absence, so it
+holds too.
+
+The state blob and the settings blob are also read independently ever since the
+same review: a confirmed OFF needs no warmth setting, and a settings-only read
+error must not be allowed to hold a state we did read. Mixing the two failures
+is how a valid OFF was swallowed by `except CBError` around the *second* read,
+left to escape to `refresh()`, and held the previous ON.
+
 The panel has no colour-temperature hardware, so the warmth is applied to the
 pixels: `warm_lut()` builds a 768-entry per-channel LUT from the Kelvin value
 (the same Helland blackbody approximation every temperature→RGB helper uses) and
@@ -61,6 +80,7 @@ import math
 import os
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import NamedTuple
 
 # Bond CompactBinary v1 type ids (only the ones the night-light schemas use).
@@ -86,6 +106,37 @@ class StateUnreadable(OSError):
     is how a transient hiccup came to look like "no state" and let a schedule
     guess replace a confirmed effective state (issue #15).
     """
+
+
+# Defined beside the two registry-read types so the vocabulary lives in one
+# place: `StateRead` is what `_blob`/`StateUnreadable` and the decoder can be
+# reduced to for their caller, and it is what `_read_windows` returns.
+class StateRead(Enum):
+    """What this poll's read of the *effective state* key actually established.
+
+    The review after #15 landed showed that a boolean could not carry this: with
+    `state=None` alone, a genuine first run and a poll that caught the store
+    mid-write are the same value, so the schedule — which is only configuration
+    — was allowed to answer for a state that had already been confirmed. Four
+    outcomes, because the *caller* needs the difference between "nothing was
+    ever here" and "we could not look right now", and between "windows says off"
+    and "windows would not say" (see `NightLight._read`):
+
+    READING   the blob was decoded; `state` is the answer (ON *or* OFF).
+    ABSENT    the key is not in this build. Schedule fallback is honest — but
+              only when nothing has been confirmed yet, which the caller knows
+              and this read cannot.
+    UNREADABLE winreg refused (`StateUnreadable`): access denied, a hive being
+              rewritten.
+    MALFORMED the value was there and would not decode (`CBError`, or a payload
+              `parse_state` does not recognise). Never an absence, however much
+              it looks like one from the outside.
+    """
+
+    READING = "state-read"
+    ABSENT = "state-absent"
+    UNREADABLE = "state-unreadable"
+    MALFORMED = "state-malformed"
 
 
 # ------------------------------------------------------------------ CB reader
@@ -314,6 +365,16 @@ class NightAppearance:
 
 
 # ------------------------------------------------------------------- the reader
+def _leaf(key: str) -> str:
+    """The last path component of a registry key, for a message a person can act on.
+
+    The CloudStore keys are long (`...\\CloudStore\\Store\\DefaultAccount\\...\\
+    windows.data.bluelightreduction.settings`) and only the tail distinguishes them, so
+    an error that names the whole path buries the one word that says which read failed.
+    """
+    return key.replace("/", "\\").rstrip("\\").rsplit("\\", 1)[-1]
+
+
 class NightLight:
     """Answers "is the user's night mode on, and how warm did they set it?".
 
@@ -329,7 +390,16 @@ class NightLight:
     `hold_grace_s` the policy is explicitly to keep holding, because the
     alternative — guessing "day" from a store we cannot read — is the one
     outcome that brightens a dark room on a read error. A *confirmed* read
-    replaces the appearance at once, OFF included.
+    replaces the appearance at once, OFF included. A *confirmed OFF* survives a
+    settings-only read error just as promptly: the two registry blobs are read
+    and handled independently, because on/off lives in one and warmth in the
+    other, and neither is allowed to hold the answer the other one gave.
+
+    "Nothing was ever confirmed" (`self.on is None`) is what licenses inference
+    from configuration — the Windows schedule in `_read_windows` or the
+    `night.schedule` fallback in `_read`. Once `self.on` holds an answer, a poll
+    that cannot read the state is a *lost* poll, never a "no state" fact, and
+    the schedule no longer gets a vote on it.
     """
 
     def __init__(self, cfg: dict, refresh_s: float = 3.0):
@@ -374,15 +444,40 @@ class NightLight:
             raise StateUnreadable(f"{_leaf(key)}: {type(e).__name__}: {e}") from e
         return bytes(v) if v else None
 
-    def _read_windows(self, now=None) -> tuple[bool | None, int | None, str, str, float]:
-        """(on, temp_k, source, detail, state_mtime) — state, override, schedule kept apart.
+    def _read_windows(self, now=None, established: bool = False) -> tuple[bool | None, int | None,
+                                                                         str, str, float,
+                                                                         "StateRead"]:
+        """(on, temp_k, source, detail, state_mtime, status) — state, config, schedule apart.
 
         ONE tuple contract for both branches of this merge. `state_mtime` is the
         wrapper timestamp of the blob the on/off answer came from — Windows' own
         write time for it, kept so a published appearance can say how fresh it is
-        instead of re-guessing. The two blobs are read apart because they are
-        written apart; the caller turns their answer into one appearance, so a
-        half-failure never swaps in a new state beside an old warmth.
+        instead of re-guessing. The sixth value is the *state-read status*
+        (`StateRead`), and it is not decoration: the schedule may answer a poll
+        only when the state key is genuinely `ABSENT` *and* nothing has been
+        confirmed yet. A poll after an established state that comes back missing
+        — CloudStore unlinks the value while it rewrites it — is `UNREADABLE`,
+        not `ABSENT`, because one collapsed `state=None` is exactly how a
+        confirmed OFF at 23:00 was turned into ON/windows-schedule by a schedule
+        that is only configuration. A payload that will not decode is
+        `MALFORMED`, also an unreadable poll: the value was *there*.
+
+        The returned status is deliberately the raw fact about the read and
+        nothing about what to do with it: whether fallback is allowed also
+        depends on what has already been confirmed, which this method cannot see
+        — so `established` hands it in. The schedule branch below must be inside
+        *this* method, because the schedule is one of the two places an answer
+        can be inferred from, and a guard sitting in the caller would never run:
+        by the time `_read` saw the tuple, this method had already turned an
+        absent key into a concrete ON. Measured: a confirmed ON plus one poll
+        with the key unlinked came back `windows-schedule`, and the caller's
+        `on is None` guard was unreachable.
+
+        The two blobs are read apart because they are written apart, and the
+        failures are handled independently: a state payload that decodes to OFF
+        decides on/off even when the settings read raises, because a confirmed
+        OFF needs no warmth setting, and a `PermissionError` on the *settings*
+        key must not be allowed to escape and hold the previous ON.
 
         The state blob is the *effective* state: what Windows is applying to the
         display right now, rewritten at every scheduled transition and at every
@@ -398,19 +493,38 @@ class NightLight:
         """
         state = settings = None
         state_mtime = 0.0
+        # `read_err` is "why this poll could not read the state", kept as text so
+        # the hold that follows can name the failure instead of swallowing it.
+        state_read, read_err = StateRead.READING, ""
         try:
             raw = self._blob(_STATE_KEY)
             if raw:
                 state_mtime, inner = unwrap(raw)
                 state = parse_state(inner)
-        except CBError:
-            state = None
+        except StateUnreadable as e:
+            # Unreadable mid-rewrite, or the whole call raised (the settings
+            # fixture's handler): both mean "cannot look right now".
+            state, state_read, read_err = None, StateRead.UNREADABLE, str(e)
+        except CBError as e:
+            # The value was there and would not decode, which is not an absence
+            # however much "no state" and "no *readable* state" look alike from
+            # here. Half of issue #15's acceptance failure came from this line.
+            state, state_read, read_err = None, StateRead.MALFORMED, str(e)
+        # Some builds write a payload whose schema `parse_state` does not know,
+        # which is a decode failure from the caller's point of view, not a
+        # missing key. Naming it here keeps the two apart everywhere below.
+        if state is None and state_read is StateRead.READING:
+            state_read = StateRead.ABSENT
+
+        settings_err = ""
         try:
             raw = self._blob(_SETTINGS_KEY)
             if raw:
                 settings = parse_settings(unwrap(raw)[1])
-        except CBError:
-            settings = None
+        except StateUnreadable as e:
+            settings, settings_err = None, str(e)
+        except CBError as e:      # same again for configuration: warmth, not on/off
+            settings, settings_err = None, f"{_leaf(_SETTINGS_KEY)}: CBError: {e}"
         temp = settings.get("temp_k") if settings else None
         if now is None:
             now = time.localtime()
@@ -438,30 +552,48 @@ class NightLight:
                 det += (f"; config: schedule={settings['schedule']} "
                         f"{'set-hours' if settings['set_hours'] else 'sunset-sunrise'}"
                         f" {_hhmm(settings['start'])}-{_hhmm(settings['end'])} temp={temp}K")
-            return on, temp, "windows", det, state_mtime
-        if settings and settings["schedule"]:
-            # No state blob but a schedule we can evaluate ourselves: honest
-            # inference on a build that stores state somewhere we cannot read —
-            # and it says `windows-schedule` so nobody mistakes it for state.
+            elif settings_err:
+                # The state decided on/off; only the warmth/schedule is missing.
+                # The caller holds the last known warmth (`temp` is None) and
+                # this sentence is what says *which* read failed.
+                det += f"; settings unavailable ({settings_err}); state still applied"
+            return on, temp, "windows", det, state_mtime, state_read
+        # No state to publish. If the key was *there* and this poll could not
+        # read it, say so on the way out: `_read` must hold rather than let the
+        # schedule answer for a state that has already been confirmed once.
+        if state_read is not StateRead.ABSENT:
+            return (None, temp, "unknown",
+                    f"state {state_read.value}: {read_err or 'no readable payload'}",
+                    0.0, state_read)
+        if settings and settings["schedule"] and not established:
+            # No state blob, a schedule we can evaluate ourselves, and nothing
+            # ever confirmed: honest inference on a build that stores state
+            # somewhere we cannot read — and it says `windows-schedule` so nobody
+            # mistakes it for state. `established` is what keeps this honest once
+            # an answer exists: a key that answered a moment ago and is gone now
+            # is a store mid-rewrite, and the schedule is configuration, not
+            # state, so it is not allowed to replace a confirmed appearance.
             # Without readable endpoints there is nothing to infer from:
             # inventing 21:00→07:00 (or a sunset for the user's longitude)
             # would go amber on a guess, so we degrade to unknown instead.
             win = _in_window(mins, settings)
             if win is None:
-                # Five values, always: `_read_windows` publishes the CloudStore
-                # write time alongside the state (#15), and a path that returns
-                # four is a caller that unpacks into five and dies. There is no
-                # state blob on this path, so the timestamp is "none known".
+                # Six values, always: `_read_windows` publishes the CloudStore
+                # write time alongside the state (#15) and the read status
+                # beside both, and a path that returns four is a caller that
+                # unpacks into six and dies. There is no state blob on this
+                # path, so the timestamp is "none known".
                 return (None, temp, "unknown",
                         ("schedule is enabled but its endpoints are unreadable; "
-                         "not guessing a window"), 0.0)
+                         "not guessing a window"), 0.0, state_read)
             start, end = ((settings["start"], settings["end"]) if settings["set_hours"]
                           else (settings["sunset"], settings["sunrise"]))
             det = (f"no state blob; inferred from schedule {_hhmm(start)}-"
                    f"{_hhmm(end)} now={now.tm_hour:02d}:{now.tm_min:02d} "
                    f"{'in' if win else 'outside'} window")
-            return win, temp, "windows-schedule", det, 0.0
-        return (None, temp, "unknown", "no readable night-light state in CloudStore", 0.0)
+            return win, temp, "windows-schedule", det, 0.0, state_read
+        return (None, temp, "unknown",
+                "no night-light state key in this build's CloudStore", 0.0, state_read)
 
     def _read(self, now: float) -> None:
         mode = str(self.cfg.get("mode", "auto")).lower()
@@ -474,16 +606,28 @@ class NightLight:
             self._publish(NightAppearance(False, self.temp_k, None, "config",
                                           "night.mode: off", 0.0, now), now)
             return
-        on, temp, src, det, state_mtime = self._read_windows()
+        on, temp, src, det, state_mtime, state_read = self._read_windows(
+            established=self.on is not None)
         temp = int(self.cfg.get("color_temp_k") or 0) or temp
         if on is None:
             sched = str(self.cfg.get("schedule") or "").strip()
-            if sched:
+            # See `_read_windows`: the Windows settings schedule already checked
+            # `established` before inferring, and this config-side schedule is
+            # the same kind of evidence — configuration, not state. It answers
+            # only a poll with genuinely nothing established; once an answer has
+            # been confirmed, an unavailable read holds it.
+            may_infer = state_read is StateRead.ABSENT and self.on is None
+            if sched and may_infer:
                 on = _in_clock_range(sched, time.localtime())
                 src = "config-schedule"
                 det = f"{det}; using night.schedule {sched} → {on}"
             else:
                 det = f"{det}; night mode unavailable"
+                if self.on is not None:
+                    # Name it: the log line is the only place a wrong read here
+                    # becomes visible, and "unavailable" alone reads like the
+                    # build has no night light rather than "this poll missed".
+                    det += (f" - holding the last confirmed appearance ({state_read.value})")
         # Second opinion: the gamma ramp the OS is actually applying. Night light
         # does not touch it on this build, but f.lux and friends do, and the ask was
         # to follow the user's night mode however they run it. A warm ramp may turn

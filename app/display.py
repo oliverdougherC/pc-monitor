@@ -258,6 +258,43 @@ _SAFE_OPEN_RETRY_S = 1.0
 _vendor_hardened = False
 
 
+class _ShortWrite(NotImplementedError):
+    """A command frame that left the host in part — the one failure a resend cannot fix.
+
+    It has to be an exception at all (the vendor's `serial_write` returns None and
+    throws away the count pyserial hands back), and it has to be recognisable as
+    *this* failure, because the vendor's reconnect-and-resend-once exists for a
+    different one. That retry replays the buffer **from byte zero**, which is correct
+    only when nothing was delivered; after a partial write the same bytes are still
+    sitting in the endpoint's buffer, so replaying prepends a second copy of the
+    prefix. Measured against a fake endpoint that accepts 3 bytes of `b'abcdefgh'` and
+    all 8 on the retry, the wire sees `b'abcabcdefgh'` — and every caller above, from
+    `PanelLink._verdict` to `DiffPusher`, saw a method that returned normally.
+
+    `NotImplementedError` is the middle of the ladder these writes are raised on:
+
+      * it is a `RuntimeError` — an ordinary app failure — so `PanelLink._verdict`
+        (which special-cases `BaseException` and catches `SystemExit` separately) treats
+        it exactly like a raised `SerialException`, and `DiffPusher` discards the shadow
+        frame: the partial delivery cannot be acknowledged;
+      * it is deliberately **not** a `serial.SerialException`, which is the type the
+        vendor's `WriteLine` catches in order to reconnect and resend. That arm of the
+        vendored library is `except serial.SerialException` and nothing wider, so this
+        type is what keeps a partial frame out of it even in a process where something
+        else has replaced the write path — and it is why the replacement below has to
+        handle this case *above* the vendor-shaped `SerialException` arm;
+      * the stack trace is there to be read, because by the time it surfaces it has
+        crossed a vendored class and a link class and the text is the only thing that
+        still says which of the two write paths produced it.
+
+    There is no protocol-level resynchronisation available here to make the retry safe
+    instead: the pinned revision-C driver sends an image as separate SETUP / HEADER /
+    PAYLOAD / STATUS commands (`_send_command` pads each one to its own 250-byte
+    boundary), and reopening a host COM handle is neither a rollback of the prefix the
+    endpoint already took nor a replay of the transaction. So this fails, loudly.
+    """
+
+
 def harden_vendor() -> None:
     """Wrap `LcdComm.openSerial` and the write path so a failed push cannot look like one.
 
@@ -284,10 +321,15 @@ def harden_vendor() -> None:
 
     So `serial_write` is replaced with one that requires the whole buffer to leave, and
     `WriteLine` with one that lets a failure propagate instead of swallowing it. The
-    vendor's own reconnect-and-retry-once stays: if that retry succeeds, the write
-    really did succeed and the caller should hear so; if it fails, the exception reaches
+    vendor's own reconnect-and-retry-once stays — but **only for a failure where nothing
+    was delivered**, which is the one case replaying the buffer from byte zero is correct
+    in. A *short* write is the opposite case and it is why `_ShortWrite` exists: some of
+    the frame is in the endpoint's buffer, so the reconnect-and-resend path would
+    prepend a second copy of the prefix and corrupt the stream while reporting success.
+    A short write therefore propagates from the first attempt: the exception reaches
     `PanelLink._verdict`, which reports the push as not acknowledged, which is what keeps
-    the diff cache honest.
+    the diff cache honest. Nothing else in this module — the rebuild loop, the full-frame
+    recovery, `DiffPusher._discard` — has to change to recover from it.
 
     This touches nothing on disk. `vendor/` is a pinned, hash-verified tree and stays
     byte-identical: the patch is applied to the class in the running process, exactly as
@@ -321,22 +363,41 @@ def harden_vendor() -> None:
         number, so a half-delivered frame counted as delivered. Half a frame is worse
         than none: the panel's parser is left mid-command and the next write lands in
         the wrong place.
+
+        `_ShortWrite` rather than a plain `SerialException`, so the replacement
+        `WriteLine` can tell this failure from a port that delivered nothing at all
+        (see the class docstring: only the second one may be resent).
         """
         if self.lcd_serial is None:
             raise serial.SerialException(
                 "PC Monitor: the port is closed, so this command was not sent")
         sent = self.lcd_serial.write(data)
         if sent is not None and sent != len(data):
-            raise serial.SerialException(
+            raise _ShortWrite(
                 f"PC Monitor: short write, {sent} of {len(data)} bytes left the host")
 
     def write_line(self, line: bytes):
         """The vendor's write path, with its silence about failure removed.
 
-        The one retry the vendor performs (close, reopen, send again) is kept, because
-        a transient `SerialException` that a reconnect repairs *did* deliver the frame.
-        What is not kept is the `SerialTimeoutException` branch returning normally: a
-        timeout means the bytes did not go out, and saying nothing is how a failed push
+        The one retry the vendor performs (close, reopen, send again) is kept for the
+        failure it can actually repair: a `SerialException` raised before any byte was
+        delivered — a port that vanished, a handle that was closed, a device that
+        refused the write outright. Nothing on the wire, so replaying the buffer is
+        exactly a second first attempt, and if it succeeds the frame *did* arrive.
+
+        A `_ShortWrite` is deliberately not in that group, and this is the whole point
+        of the fix: the bytes the endpoint already accepted are still there, and the
+        vendor's replay writes the buffer from byte zero, so the panel would receive
+        `accepted-prefix + whole buffer` and `WriteLine` would return normally — a
+        corrupted stream that every caller above reads as a completed push, after which
+        `PanelLink` acks it and `DiffPusher` commits a shadow frame the panel does not
+        hold. There is no way to repair it down this path: reopening the host handle
+        neither rolls back the accepted prefix nor replays the image transaction (the
+        pinned driver sends header and payload as separate commands), so the failure is
+        raised on the first attempt and the rebuild/full-frame recovery above owns it.
+
+        What is also not kept is the `SerialTimeoutException` branch returning normally:
+        a timeout means the bytes did not go out, and saying nothing is how a failed push
         became an acknowledged one (#9).
         """
         try:
@@ -347,6 +408,20 @@ def harden_vendor() -> None:
             # A print is not enough. This is the failure the diff cache must hear about.
             app_log("[display] write timed out - the endpoint is not draining; the "
                     "frame was NOT sent")
+            raise
+        except _ShortWrite as e:
+            # The port is closed for the same reason the reconnect path would have
+            # closed it — the packet boundary this endpoint is parsing is already lost
+            # — but the frame is *not* re-sent: it would be prepended to the bytes that
+            # did leave. The link is marked down by the caller; its rebuild opens a
+            # fresh handle, and the diff cache's invalidation makes the next frame
+            # whole, which is the resynchronisation this case does not get here.
+            app_log(f"[display] {e} - a partial frame cannot be resent from byte zero; "
+                    f"the frame was NOT sent and the port is closed")
+            try:
+                self.closeSerial()
+            except Exception:  # noqa: BLE001 - closing is best effort, the raise is not
+                pass
             raise
         except serial.SerialException as e:  # noqa: BLE001 - reconnect once, as before
             app_log(f"[display] serial write failed ({e}); closing and reopening the "
@@ -408,7 +483,8 @@ def harden_vendor() -> None:
     app_log("[display] vendor write path hardened: openSerial is bounded, "
             "raise-not-exit and retirement-checked after acquisition; serial_write "
             "requires the whole buffer; WriteLine propagates a failed write so a push "
-            "is never acknowledged on a frame that did not land")
+            "is never acknowledged on a frame that did not land, and a short write is "
+            "never repaired by a resend from byte zero")
 
 
 def make_lcd(cfg: dict):
