@@ -517,7 +517,14 @@ def main() -> None:
         status(f"[frames] raw capture → {frames_mon.output_file}; frame stats off by design")
     else:
         frames_desc = "starting"
-    status(f"[start] pid={os.getpid()} ppid={os.getppid()} backend={type(hub.backend).__name__} "
+    # `hub` is None whenever the backend could not be built — the guard returns the
+    # degraded fallback on purpose, and the loop retries it on its own clock. The
+    # diagnostic must not be the thing that ends that degraded run: `type(hub.backend)`
+    # on a None hub is an AttributeError *outside* the guard, before the loop, which is a
+    # dead process waiting for the next logon (and the exact failure the retry exists to
+    # avoid). "none" is the honest word for it, and the loop says when it comes back.
+    backend_desc = "none" if hub is None else type(hub.backend).__name__
+    status(f"[start] pid={os.getpid()} ppid={os.getppid()} backend={backend_desc} "
            f"revision={cfg['display']['revision']} port={cfg['display']['com_port']} "
            f"panel={panel_desc} frames={frames_desc} "
            f"interval={cfg['sensors']['interval_s']}s")
@@ -965,6 +972,24 @@ def main() -> None:
             g.run("wait", lambda: host.wait(sleep_left))
 
 
+def note_deliberate_stop(reason: str = "keyboard-interrupt") -> bool:
+    """Did *this* role's Ctrl-C mean "the app was stopped on purpose"?
+
+    The answer is the whole of #67's Ctrl-C clause, so it lives in the app rather than in
+    the `__main__` block: a preview may not write the marker the outside observer reads,
+    because that marker is what makes recovery *hold* and refuse to restart the real app.
+    Keeping it here also makes it reachable from module scope — the handler cannot see
+    anything `main()` binds, and reading a local there was a `NameError` inside the one
+    handler that must never fail.
+
+    Returns whether the marker was written: True for the owner, False for a diagnostic
+    role. Only the owner's "I meant to stop" is a statement about the installation.
+    """
+    if dump_role_requested():
+        return False
+    return bool(mark_stopped(reason))
+
+
 if __name__ == "__main__":
     _console_safe()
     try:
@@ -975,18 +1000,11 @@ if __name__ == "__main__":
         # from `atexit`, because an unhandled exception unwinds through `atexit` too,
         # and that is precisely the case the observer must still act on.
         #
-        # Role-scoped (#67): Ctrl-C on a `--dump` preview says nothing about the app, and
-        # the marker it used to write was the one that holds the watchdog back — so a
-        # preview interrupted at the wrong moment could stop the real app being recovered.
-        # The owner is the only role whose "I meant to stop" the observer is entitled to.
-        #
-        # The role comes from `dump_role_requested()`, not from a name bound inside
-        # `main()`: this block is module scope and cannot see that frame, and reading it
-        # anyway is a NameError inside the one handler that must never fail. It also has
-        # to work when `main()` never returned at all — Ctrl-C during bring-up is exactly
-        # when the marker matters most, and no variable `main()` sets exists yet.
-        if not dump_role_requested():
-            mark_stopped("keyboard-interrupt")
+        # Role-scoped (#67), and the role is derived from argv rather than from a name
+        # inside `main()` — this block is module scope and cannot see that frame, and it
+        # also has to work when `main()` never returned at all, which is exactly when the
+        # marker matters most.
+        note_deliberate_stop("keyboard-interrupt")
         bootlog.note("[boot] stopped on request (Ctrl-C)")
     except BaseException:  # noqa: BLE001 - start-up is the one place a death is final
         # Setup failures (config unreadable, sensors library missing, port denied)

@@ -190,6 +190,25 @@ def case_the_recycled_pid_is_not_ownership() -> None:
     check("and that refusal is reported", any("recycled" in x or "not an app we own" in x
                                               for x in d.report), True)
 
+    # An unreadable creation time is *not* identity (#25's follow-up). Treating "cannot
+    # ask" as "nothing to contradict it" made ignorance into proof, on the one check whose
+    # answer licenses a terminate — so a process that inherited the recorded pid and
+    # whose command line belongs to another project must survive, and the canonical-path
+    # checks must be the ones that decide.
+    unknown = Proc(pid=40268, name="pythonw.exe", exe="C:\\Python312\\pythonw.exe",
+                   cmd='"C:\\work\\main.py"', ppid=4, created=None)
+    check("an unreadable creation time is not identity",
+          stopped_pids(plan([unknown], rec)), [])
+    check("and it falls through to the path checks, which refuse it",
+          any("left alone" in x and "40268" in x for x in plan([unknown], rec).report),
+          True)
+    # The same ignorance with a command line that *is* ours: the canonical checks identify
+    # it anyway, which is the point of falling through rather than refusing outright.
+    ours_unknown = Proc(pid=40268, name="pythonw.exe", exe=VENV + "\\pythonw.exe",
+                        cmd=f'"{VENV}\\pythonw.exe" "{MAIN}"', ppid=4, created=None)
+    check("but a real path check still identifies the app",
+          stopped_pids(plan([ours_unknown], rec)), [40268])
+
 
 def case_collectors_are_told_apart() -> None:
     print("case: three presentmon.exe processes, one of them ours")
@@ -214,6 +233,26 @@ def case_collectors_are_told_apart() -> None:
           True)
     check("a collector whose command line cannot be read is left alone",
           any("304" in x and "left alone" in x for x in d.report), True)
+
+    # The session name is matched as a *value*, not as a substring. A diagnostic capture
+    # run under a longer role name contains ours character for character, and a substring
+    # test classified it as the app's own child — the same mistake as matching a filename,
+    # one level down.
+    neighbour = Proc(pid=305, name="presentmon.exe", exe=COLLECTOR,
+                     cmd=f'"{COLLECTOR}" -session_name {SESSION}-diagnostic', ppid=996,
+                     created=1.0)
+    d2 = plan(procs + [neighbour])
+    check("a longer session name that merely contains ours is not ours",
+          stopped_pids(d2), [100])
+    check("and that is said out loud",
+          any("305" in x and ("no session" in x or "left alone" in x)
+              for x in d2.report), True)
+    # The same name in the `--session_name=` spelling is the same claim.
+    eq = Proc(pid=306, name="presentmon.exe", exe=COLLECTOR,
+              cmd=f'"{COLLECTOR}" --session_name={SESSION} --v1_metrics',
+              ppid=995, created=1.0)
+    check("the = spelling names the same session",
+          stopped_pids(plan(procs + [eq])), [100, 306])
 
 
 # ---------------------------------------------------------------------- the stop
@@ -268,12 +307,27 @@ def case_stop_is_graceful_then_bounded(tmp: Path) -> None:
                                                     for x in log), True)
 
     s2 = Script({100: True, 301: True})          # ignores the request entirely
+    # `still_ours` is the pre-terminate re-check: the decision was made before the
+    # graceful wait, so the identity is re-proven immediately before the force. The
+    # scripted world is asked the same question a real run asks, and here it says yes.
     log2 = owned.apply(d, alive=s2.is_alive, kill=s2.kill, sleep=s2.sleep, graceful_s=2.0,
-                       collector_grace_s=1.0, stop_path=stop_file)
+                       collector_grace_s=1.0, stop_path=stop_file,
+                       still_ours=lambda p: True)
     check("an app that ignores it is forced, once", s2.killed, [100, 301])
     check("forcing is said out loud", any("forcing" in x for x in log2), True)
     check("the stranger was never even offered to the killer",
           201 not in s2.killed and 201 not in stopped_pids(d), True)
+
+    # And when the pid has been recycled during the wait, the force is refused. This is
+    # the window the old code left open: the process list was read once, twelve seconds
+    # pass, and `TerminateProcess` on a bare pid kills whoever holds the number now.
+    s3 = Script({100: True, 301: True})
+    log3 = owned.apply(d, alive=s3.is_alive, kill=s3.kill, sleep=s3.sleep, graceful_s=2.0,
+                       collector_grace_s=1.0, stop_path=stop_file,
+                       still_ours=lambda p: False)
+    check("a pid that was recycled is not killed", s3.killed, [])
+    check("and the refusal is said out loud",
+          any("no longer the process" in x or "recycled" in x for x in log3), True)
 
     # The request/consume pair, and its once-only behaviour.
     check("a request can be written", owned.request_stop(stop_file), True)

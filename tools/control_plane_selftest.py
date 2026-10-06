@@ -27,6 +27,7 @@ normally, the dump being interrupted (Ctrl-C), and the dump dying before it ever
 reached a tick.
 """
 import ast
+import json
 import os
 import signal
 import subprocess
@@ -109,42 +110,17 @@ def untouched(control: Path, before: dict[str, bytes], label: str) -> None:
 
 
 def run_dump(control: Path, out: Path, frames: int = 2, timeout: float = 180.0,
-             interrupt_after: float | None = None) -> subprocess.CompletedProcess:
-    """One real headless dump. `interrupt_after` interrupts it instead of waiting.
+             ) -> subprocess.CompletedProcess:
+    """One real headless dump, in its own scratch control plane.
 
-    The interrupt has to be a real Ctrl-C, because the thing under test is what the
-    child does *in its KeyboardInterrupt handler*. On Windows that means CTRL_BREAK
-    delivered to a process group of the child's own (`CREATE_NEW_PROCESS_GROUP`):
-    `Popen.send_signal(SIGINT)` raises `ValueError: Unsupported signal: 2`, and
-    `terminate()` would kill the child before the handler ever ran, which is the one
-    thing this case must not do. If the signal cannot be delivered at all the case
-    falls back to `kill()` and says so, rather than reporting a pass it did not earn.
+    A whole `main.py` per case, not a mocked entry point: the point of these cases is
+    what a *second process* does to the first one's files, and anything short of running
+    the real entry point would be testing the test.
     """
     cmd = [sys.executable, str(MAIN), "--dump", str(out),
            "--backend", "demo", "--frames", str(frames)]
-    if interrupt_after is None:
-        return subprocess.run(cmd, cwd=str(ROOT), env=child_env(control),
-                              capture_output=True, text=True, timeout=timeout)
-    flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    p = subprocess.Popen(cmd, cwd=str(ROOT), env=child_env(control),
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                         creationflags=flags)
-    delivered = False
-    try:
-        time.sleep(interrupt_after)
-        try:
-            os.kill(p.pid, signal.CTRL_BREAK_EVENT)
-            delivered = True
-        except (AttributeError, OSError, ValueError):
-            p.kill()
-        p.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        p.wait(timeout=30)
-    if not delivered:
-        print("    note: CTRL_BREAK could not be delivered; the child was killed "
-              "instead (the handler did not run)")
-    return subprocess.CompletedProcess(cmd, p.returncode, "", "")
+    return subprocess.run(cmd, cwd=str(ROOT), env=child_env(control),
+                          capture_output=True, text=True, timeout=timeout)
 
 
 def case_normal_completion(tmp: Path) -> None:
@@ -167,15 +143,41 @@ def case_normal_completion(tmp: Path) -> None:
 
 def case_interrupted(tmp: Path) -> None:
     print("case: an interrupted dump cannot mark the app deliberately stopped")
+    # This is the sharp end of #67, and it is deliberately *not* driven by a signal.
+    # Delivering a real Ctrl-C to a console-less child on this platform proved
+    # unreliable enough that a case built on it would be asserting on a process nobody
+    # interrupted: `send_signal(SIGINT)` raises, CTRL_BREAK reaches a bare `python -c`
+    # loop but not this one through `runpy`, and `PyThreadState_SetAsyncExc` reports
+    # success while the exception is never observed (the loop is inside a pipe write).
+    #
+    # So the decision itself is called, in a child process, with the same argv a real
+    # `main.py --dump` gets. `note_deliberate_stop` is the *app's own* function now —
+    # the `__main__` handler is a two-line call to it — so this exercises the production
+    # code path rather than a re-implementation of it.
     control = tmp / "interrupted"
     before = seed_production(control)
-    out = tmp / "interrupted.png"
-    r = run_dump(control, out, frames=600, interrupt_after=12.0)
-    check("the dump did not finish", r.returncode != 0, True)
-    # This is the sharp end of #67: `.stopped` is what makes the observer *hold* and
-    # refuse to restart the app. A Ctrl-C on a preview used to write it.
-    check("no deliberate-stop marker was written",
-          (control / ".stopped").exists(), False)
+    probe = (
+        "import sys; sys.path.insert(0, %r);"
+        "import main as M;"
+        "print('WROTE', M.note_deliberate_stop('keyboard-interrupt'));"
+        % str(ROOT)
+    )
+    for role, argv in (("dump", ["main.py", "--dump", "x.png"]),
+                       ("main", ["main.py"])):
+        r = subprocess.run([sys.executable, "-c", probe, *argv], cwd=str(ROOT),
+                           env=child_env(control), capture_output=True, text=True,
+                           timeout=120)
+        wrote = r.stdout.strip().endswith("WROTE True")
+        marker = (control / (".stopped" if role == "main" else ".stopped-dump")).exists()
+        if role == "dump":
+            check("a preview's Ctrl-C does not write the app's marker", wrote, False)
+            check("and writes no deliberate-stop marker at all", marker, False)
+        else:
+            check("the owner's Ctrl-C does write it", wrote, True)
+            check("in the production marker file", marker, True)
+    # The production marker the owner just wrote is *not* part of the seeded baseline, so
+    # it is checked and cleared before the byte-for-byte comparison.
+    (control / ".stopped").unlink(missing_ok=True)
     untouched(control, before, "interrupted dump")
 
 
@@ -241,14 +243,15 @@ def case_main_gates_every_shared_write() -> None:
         check(f"main.py calls {name}", len(found) >= 1, True)
         for call in found:
             gate = nearest_role_gate(tree, call)
-            check(f"{name} at line {call.lineno} sits inside a role gate",
-                  gate is not None, True)
-            if gate is not None:
-                # Two spellings of the same gate are legitimate: `owns_installation`
-                # (the startup block, the loop) and `not dump_role_requested()` (the
-                # `__main__` handler, which cannot see a name `main()` binds).
-                check(f"...and that gate is a role check ({name}:{call.lineno})",
-                      owner_gate(gate) or dump_gate(gate), True)
+            # Three spellings of the same gate are legitimate: `owns_installation` (the
+            # startup block and the loop), `not dump_role_requested()` (the Ctrl-C
+            # decision), and the early return a function uses when the role check comes
+            # first and the marker after it — `nearest_role_gate` cannot see that one,
+            # because `mark_stopped` is not lexically inside the `if`.
+            covered = (gate is not None
+                       and (owner_gate(gate) or dump_gate(gate))) \
+                or _mark_stopped_is_role_gated(_enclosing(tree, call))
+            check(f"{name} at line {call.lineno} sits inside a role gate", covered, True)
     for call in calls_named("beat_liveness"):
         kw = {k.arg for k in call.keywords}
         check("every beat names its role", "role" in kw, True)
@@ -257,11 +260,26 @@ def case_main_gates_every_shared_write() -> None:
           "owns_installation = not dump_mode" in src, True)
     check("and each beat role reaches beat_liveness",
           src.count('beat_role = "dump" if dump_mode else "main"'), 1)
-    # The `__main__` handler cannot see a name bound inside `main()`. This is the bug
-    # that reading caught and running did not: `mark_stopped` there used
-    # `owns_installation`, which does not exist at module scope, so the handler raised
-    # NameError and wrote no marker for *any* role — production included, which is #23's
-    # contract. Anything the handler reads must be reachable without `main()`'s frame.
+    # The Ctrl-C decision lives in an app function (`main.note_deliberate_stop`), not in
+    # the `__main__` block, and that is a correctness requirement rather than a style
+    # one: the block is module scope, so it cannot see anything `main()` binds. Reading
+    # `owns_installation` there was a NameError inside the one handler that must never
+    # fail — no marker would have been written for *any* role, production included, which
+    # is #23's contract. Keeping the decision in a function makes it reachable, testable,
+    # and impossible to get wrong by scope.
+    decision = next((n for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef)
+                     and n.name == "note_deliberate_stop"), None)
+    if decision is None:
+        fails.append("note_deliberate_stop exists")
+        print("  FAIL note_deliberate_stop exists")
+        return
+    decision_names = {n.id for n in ast.walk(decision) if isinstance(n, ast.Name)}
+    check("the decision asks the module which role this is",
+          "dump_role_requested" in decision_names, True)
+    check("it is the role check that gates the deliberate-stop marker",
+          _mark_stopped_is_role_gated(decision), True)
+
     handler = next((n for n in ast.walk(tree) if isinstance(n, ast.Try)
                     and any(isinstance(h, ast.ExceptHandler)
                             and h.type is not None
@@ -274,25 +292,61 @@ def case_main_gates_every_shared_write() -> None:
     handler_names = {n.id for n in ast.walk(handler) if isinstance(n, ast.Name)}
     handler_calls = {n.func.id for n in ast.walk(handler)
                      if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
-    check("the Ctrl-C handler asks the module which role this is",
-          "dump_role_requested" in handler_calls, True)
+    check("the Ctrl-C handler calls that decision",
+          "note_deliberate_stop" in handler_calls, True)
     check("and never reads a name main() binds locally",
           "owns_installation" in handler_names, False)
-    check("the deliberate-stop marker is behind the role check",
-          _mark_stopped_is_role_gated(handler), True)
 
 
-def _mark_stopped_is_role_gated(handler: ast.Try) -> bool:
-    """Is the handler's `mark_stopped` inside `if not dump_role_requested():`?"""
-    for node in ast.walk(handler):
-        if not isinstance(node, ast.If):
+def _enclosing(tree: ast.AST, call: ast.Call) -> ast.AST:
+    """The innermost function definition containing `call` (or the module itself).
+
+    Needed because two of the gates are *early returns* at the top of a function rather
+    than an `if` around the call, and "is this call gated?" then becomes a question about
+    the function it sits in, not about its lexical neighbours.
+    """
+    best: ast.AST = tree
+    best_line = -1
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.lineno <= call.lineno and node.lineno > best_line:
+                best, best_line = node, node.lineno
+    return best
+
+
+def _mark_stopped_is_role_gated(node: ast.AST) -> bool:
+    """Is `mark_stopped` reachable only under an early return for the diagnostic role?
+
+    Two shapes are legitimate and both appear in the app: the handler form
+    (`if not dump_role_requested(): mark_stopped(...)`) and the function form, where the
+    function returns early for the diagnostic role and calls `mark_stopped` after it.
+    """
+    for sub in ast.walk(node):
+        if not isinstance(sub, ast.If):
             continue
-        calls = [n.func.id for n in ast.walk(node)
+        calls = [n.func.id for n in ast.walk(sub)
                  if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
-        names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        names = {n.id for n in ast.walk(sub) if isinstance(n, ast.Name)}
         if "mark_stopped" in calls and "dump_role_requested" in names:
             return True
+    # The early-return form: `if dump_role_requested(): return False` then a bare
+    # `return bool(mark_stopped(...))`, so `mark_stopped` is not lexically inside an `If`.
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.If) and _is_early_return_for_dump(sub):
+            after = [n for n in ast.walk(node)
+                     if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                     and n.func.id == "mark_stopped" and n.lineno > sub.lineno]
+            if after:
+                return True
     return False
+
+
+def _is_early_return_for_dump(node: ast.If) -> bool:
+    """`if dump_role_requested(): return …` — the diagnostic role leaves first."""
+    names = {n.id for n in ast.walk(node.test) if isinstance(n, ast.Name)}
+    if "dump_role_requested" not in names:
+        return False
+    return any(isinstance(s, ast.Return) for s in node.body)
 
 
 def nearest_role_gate(tree: ast.AST, call: ast.Call) -> ast.AST | None:

@@ -308,8 +308,21 @@ def case_deliberate_shutdown_is_marked() -> None:
     ki = [h for t in tried for h in t.handlers
           if isinstance(h.type, ast.Name) and h.type.id == "KeyboardInterrupt"]
     check("there is a Ctrl-C handler", len(ki) >= 1, True)
-    marked = any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "mark_stopped"
-                 for h in ki for n in ast.walk(h))
+    # The handler delegates the decision to an app function rather than calling
+    # `mark_stopped` itself (#67): the role has to be known, and the `__main__` block
+    # cannot see anything `main()` binds. Reading a local there was a NameError inside
+    # the one handler that must never fail, which would have silenced the marker for the
+    # production role as well — exactly what this case exists to prevent.
+    check("the Ctrl-C handler records the stop through the app's own decision",
+          any(isinstance(n, ast.Call)
+              and getattr(n.func, "id", "") == "note_deliberate_stop"
+              for h in ki for n in ast.walk(h)), True)
+    decision = next((n for n in ast.walk(tree)
+                     if isinstance(n, ast.FunctionDef)
+                     and n.name == "note_deliberate_stop"), None)
+    marked = decision is not None and any(
+        isinstance(n, ast.Call) and getattr(n.func, "id", "") == "mark_stopped"
+        for n in ast.walk(decision))
     check("it marks the stop as deliberate", marked, True)
     check("... and atexit does not (a crash unwinds through atexit too)",
           any(isinstance(n, ast.Call) and getattr(n.func, "id", "") == "mark_stopped"

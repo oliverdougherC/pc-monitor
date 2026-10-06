@@ -180,6 +180,9 @@ CASES = [
      "install/remove stops this app and its collector, and only those", None, None),
     ("env_check", ["tools/env_check_selftest.py"],
      "the vendor pin verifies instead of agreeing with whatever it finds", None, None),
+    ("control_plane", ["tools/control_plane_selftest.py"],
+     "one control plane per role: a real --dump child leaves the app's owner record, "
+     "stop request, heartbeat and deliberate-stop marker byte-identical (#67)", None, None),
 
     # -------- the combined control loop: every contract at once --------
     ("e2e_loop", ["tools/e2e_control_loop_selftest.py"],
