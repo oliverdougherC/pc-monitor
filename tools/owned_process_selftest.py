@@ -286,10 +286,11 @@ def case_the_record_is_honest(tmp: Path) -> None:
     print("case: what the app says about itself")
     p = tmp / ".owner"
     check("nothing recorded yet", owned.read_record(p), None)
-    check("a real record is written", owned.write_record(main_py=Path(MAIN),
-                                                         interpreter=VENV + "\\pythonw.exe",
-                                                         session=SESSION,
-                                                         collector=COLLECTOR, path=p), True)
+    token = owned.write_record(main_py=Path(MAIN),
+                               interpreter=VENV + "\\pythonw.exe",
+                               session=SESSION,
+                               collector=COLLECTOR, path=p)
+    check("a real record is written", bool(token), True)
     rec = owned.read_record(p)
     check("it names this process", rec["pid"] == os.getpid(), True)
     check("with the time it started", isinstance(rec["started"], float), True)
@@ -298,11 +299,29 @@ def case_the_record_is_honest(tmp: Path) -> None:
     # is written by the app, so it cannot be forged by a stranger's main.py.
     check("and paths in canonical form", (rec["main"], rec["root"], rec["session"]),
           (canon(MAIN), canon(owned.ROOT), SESSION))
+    check("and it carries the instance token it was given back", rec["instance"], token)
     check("no half-written file is left", (tmp / ".owner.tmp").exists(), False)
+
+    # #67: the record belongs to the instance that wrote it. This is the case that used
+    # to be an unconditional unlink — any second process (a `main.py --dump`) could
+    # delete the running app's identity on its way out, and the installer's stop path
+    # reads exactly this file to decide which pid to ask.
+    print("case: the record can only be cleared by the instance that wrote it")
+    check("a stranger's token does not own it", owned.owns_record("not-this-one", p), False)
+    check("nor does an empty one", owned.owns_record("", p), False)
+    check("and refusing to clear leaves it alone",
+          (owned.clear_record("not-this-one", p), owned.read_record(p) is not None),
+          (False, True))
+    check("the tokenless call is the old unconditional unlink, so it refuses too",
+          (owned.clear_record("", p), owned.read_record(p) is not None), (False, True))
+    check("our own token owns it", owned.owns_record(token, p), True)
+    check("and clears it", (owned.clear_record(token, p), owned.read_record(p)), (True, None))
+
     p.write_text("{ not json", encoding="utf-8")
     check("a corrupt record reads as no record", owned.read_record(p), None)
-    owned.clear_record(p)
-    check("and clearing it never raises", owned.read_record(p), None)
+    check("and a corrupt record can never be claimed",
+          owned.clear_record(token, p), False)
+    p.unlink()
     check("creation time of this process is real",
           owned.process_start_time(os.getpid()) is not None, True)
     check("and of a pid nobody has, it is not", owned.process_start_time(2147483646), None)

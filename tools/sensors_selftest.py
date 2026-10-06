@@ -405,6 +405,185 @@ def case_fallback_backend() -> None:
             sys.modules["pynvml"] = old_pynvml
 
 
+def make_counting_nvml(*, devices: int = 1, handle_raises: bool = False,
+                       query_raises: bool = False) -> SimpleNamespace:
+    """A counting NVML whose reference balance is the point (#69).
+
+    NVIDIA's contract is reference-counted (`nvmlInit` takes a reference, the matching
+    `nvmlShutdown` gives it back, the library unloads at zero), so the only honest way
+    to test it is to count both halves and assert the invariant, rather than to check
+    that some method was called. The counters live on the fake itself as `refs`:
+
+      inits       successful `nvmlInit()` calls
+      shutdowns   `nvmlShutdown()` calls
+      live        the reference count the library itself would see
+      over        a release beyond what was ever taken — the mirror-image bug
+
+    `state["live"]` reaching zero after cleanup, with `over` still zero, is the whole
+    acceptance criterion: no successful init is abandoned, and none is released twice.
+    """
+    state = {"inits": 0, "shutdowns": 0, "live": 0, "over": 0}
+
+    class NVMLError(Exception):
+        pass
+
+    def nvmlInit():
+        state["inits"] += 1
+        state["live"] += 1
+
+    def nvmlShutdown():
+        state["shutdowns"] += 1
+        state["live"] -= 1
+        if state["live"] < 0:
+            state["over"] += 1
+
+    def get_count():
+        return devices
+
+    def get_handle(i):
+        if handle_raises:
+            raise NVMLError("handle lookup failed")
+        if devices < 1:
+            raise NVMLError("no device")
+        return f"handle{i}"
+
+    def util(h):
+        if query_raises:
+            raise NVMLError("driver reset")
+        return SimpleNamespace(gpu=77.0)
+
+    return SimpleNamespace(
+        refs=state,
+        NVMLError=NVMLError, nvmlInit=nvmlInit, nvmlShutdown=nvmlShutdown,
+        nvmlDeviceGetCount=get_count, nvmlDeviceGetHandleByIndex=get_handle,
+        nvmlDeviceGetUtilizationRates=util,
+        nvmlDeviceGetTemperature=lambda h, t: 61.0,
+        nvmlDeviceGetClockInfo=lambda h, c: 2400.0,
+        nvmlDeviceGetPowerUsage=lambda h: 300_000.0,
+        nvmlDeviceGetMemoryInfo=lambda h: SimpleNamespace(used=8e9, total=32e9),
+        NVML_TEMPERATURE_GPU=0, NVML_CLOCK_GRAPHICS=0,
+    )
+
+
+def case_nvml_reference_balance() -> None:
+    print("case: NVML initialization is reference-balanced on every path (#69)")
+    # The defect was never a wrong answer, it was unbalanced *ownership*: a successful
+    # init whose device lookup failed returned without releasing the reference, `close()`
+    # could not see it, and a query error re-initialized on the next tick while the
+    # previous reference was still outstanding. Each scenario below therefore asserts
+    # the contract the issue names — successful inits minus shutdowns equals the
+    # initializations currently owned, and reaches zero after cleanup.
+    import app.sensors.fallback as fb
+    from app.sensors.fallback import FallbackBackend
+
+    have = "pynvml" in sys.modules
+    old = sys.modules.get("pynvml")
+    real_psutil = fb.psutil
+
+    def drive(fake, ticks: int = 5):
+        """Sample `ticks` times, then close. Returns the backend.
+
+        The retry window is deliberately *not* the `cfg()` default of zero here: a zero
+        window means "try again this instant", which is exactly the condition #69 is
+        about, and with a real window the ticks below cannot race the retry clock. The
+        reference accounting is what is under test, not the backoff (which
+        `case_reopen_backoff` covers).
+        """
+        sys.modules["pynvml"] = fake
+        fb.psutil = fake_psutil()
+        c = cfg(nvml_retry_s=60.0)
+        b = FallbackBackend(c)
+        hub = sens.SensorHub(b, cfg=c, want="fallback")
+        try:
+            for i in range(ticks):
+                hub.tick(now=100.0 + i)
+                time.sleep(0.01)
+        finally:
+            hub.close()
+        return b
+
+    try:
+        # A: init succeeds, the driver reports no device, and the backend keeps the
+        # initialization while it waits — but never takes a second one, and gives the
+        # one it owns back on close.
+        fake = make_counting_nvml(devices=0)
+        drive(fake)
+        check("no device: nothing is left owned",
+              (fake.refs["live"], fake.refs["over"]), (0, 0))
+        check("no device: the initialization was taken exactly once",
+              fake.refs["inits"], 1)
+        check("no device: and it was given back on close",
+              fake.refs["inits"] - fake.refs["shutdowns"], 0)
+
+        # B: init succeeds, the handle lookup fails. Same contract.
+        fake = make_counting_nvml(devices=1, handle_raises=True)
+        drive(fake)
+        check("handle lookup failure leaves nothing owned",
+              (fake.refs["live"], fake.refs["over"]), (0, 0))
+        check("and balances to zero", fake.refs["inits"] - fake.refs["shutdowns"], 0)
+        check("without re-initializing on every retry", fake.refs["inits"], 1)
+
+        # C: a healthy handle whose every query fails. This is the init-per-tick loop:
+        # five ticks must not mean five outstanding references, and the reference is
+        # *kept* across the failures rather than re-taken.
+        fake = make_counting_nvml(devices=1, query_raises=True)
+        drive(fake, ticks=5)
+        check("repeated query failure did not re-initialize per tick",
+              fake.refs["inits"], 1)
+        check("close released the one reference it owned",
+              (fake.refs["live"], fake.refs["over"]), (0, 0))
+
+        # D: a healthy device owns exactly one, and a repeated close is a no-op.
+        fake = make_counting_nvml(devices=1)
+        b = drive(fake, ticks=3)
+        check("a healthy device owns exactly one initialization",
+              fake.refs["inits"] - fake.refs["shutdowns"], 0)
+        check("and never releases more than it took",
+              (fake.refs["live"], fake.refs["over"]), (0, 0))
+        sys.modules["pynvml"] = fake
+        fb.psutil = fake_psutil()
+        c2 = cfg(nvml_retry_s=60.0)
+        b2 = FallbackBackend(c2)
+        b2.sample(Snapshot(ts=0.0, source="fallback"))
+        owned_before = fake.refs["live"]
+        b2.close()
+        shutdowns_after_first = fake.refs["shutdowns"]
+        b2.close()
+        check("the backend owned a reference before closing", owned_before, 1)
+        check("a repeated close does not shut NVML down twice",
+              fake.refs["shutdowns"], shutdowns_after_first)
+        check("and the balance is still zero", fake.refs["live"], 0)
+
+        # E: backend replacement while the old one still owns a reference. The point is
+        # that the *retired* backend's reference is given back — not that the balance
+        # reaches zero, because the replacement legitimately owns one of its own. Both
+        # are closed here, and zero is the only correct end state.
+        fake = make_counting_nvml(devices=1)
+        sys.modules["pynvml"] = fake
+        fb.psutil = fake_psutil()
+        c3 = cfg(nvml_retry_s=60.0)
+        old_b = FallbackBackend(c3)
+        hub = sens.SensorHub(old_b, cfg=c3, want="fallback")
+        hub.tick(now=1.0)
+        check("the replaced backend owned a reference", fake.refs["live"], 1)
+        new_b = FallbackBackend(c3)
+        hub.backend = new_b
+        hub.tick(now=2.0)
+        check("two live backends each own one reference", fake.refs["live"], 2)
+        old_b.close()
+        check("the retired backend gave its reference back", fake.refs["live"], 1)
+        new_b.close()
+        check("and the replacement gave back its own",
+              (fake.refs["live"], fake.refs["over"]), (0, 0))
+        hub.close()
+    finally:
+        fb.psutil = real_psutil
+        if have:
+            sys.modules["pynvml"] = old
+        else:
+            sys.modules.pop("pynvml", None)
+
+
 def main() -> int:
     if not preflight():
         print()
@@ -412,7 +591,7 @@ def main() -> int:
         return 1
     for fn in (case_ok, case_hold_and_blank, case_bounded, case_partial, case_nan,
                case_reopen, case_reopen_backoff, case_recover, case_close,
-               case_fallback_backend):
+               case_fallback_backend, case_nvml_reference_balance):
         fn()
         print()
     print("SELFTEST PASSED" if not fails else f"SELFTEST FAILED: {fails}")

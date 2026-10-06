@@ -316,6 +316,29 @@ def _prime(hub, tries: int = PRIME_TRIES, wait_s: float = PRIME_WAIT_S,
     log(f"[sensors] first sample failed ({type(last).__name__}: {last}) — starting "
         f"without a snapshot; the loop keeps retrying every tick")
     return None
+def dump_role_requested(argv: list[str] | None = None) -> bool:
+    """Was this process started as the headless preview (`--dump`)?
+
+    One definition of "which role am I", reachable from module scope as well as from
+    `main()`, because the shutdown handler in `__main__` has to know the role even when
+    `main()` is still inside bring-up and has bound nothing yet (#67). It reads the
+    argument the same way argparse does — last one wins, `--dump=x` and `--dump x` both
+    count — so the two cannot disagree about which process this is.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    for i, a in enumerate(args):
+        if a == "--dump":
+            # `--dump` takes a value, so the flag is present whether or not one follows;
+            # argparse would refuse a valueless trailing `--dump`, and refusing it is a
+            # start-up error, not a reason to call this process the owner.
+            return True
+        if a.startswith("--dump="):
+            return True
+        if a == "--" and i + 1 < len(args):
+            break
+    return False
+
+
 def main() -> None:
     global _boot_phase        # set False once the loop is running; see `status()`
     ap = argparse.ArgumentParser()
@@ -348,7 +371,10 @@ def main() -> None:
     # the app on purpose, so it takes no lock — and it captures under its own
     # session role below, so rendering a preview never reclaims the live app's
     # capture either.
-    dump_mode = bool(args.dump)
+    # One derivation, shared with the `__main__` shutdown handler (`dump_role_requested`):
+    # two independent readings of "am I the preview" would eventually disagree, and the
+    # role decides whether this process may touch the installer's control plane at all.
+    dump_mode = dump_role_requested()
     if not dump_mode:
         owned, why = acquire_main_role()
         if not owned:
@@ -406,16 +432,33 @@ def main() -> None:
     # app about itself (this pid, this instance's creation time, canonical paths, and the
     # ETW session its own collector was told to own) is what turns "stop the app" into a
     # statement about one specific process instead of one specific filename.
+    #
+    # Only the role that owns the installation writes that record, and it writes it with
+    # a token so that only *this* instance can clear it (#67). `--dump` used to write the
+    # shared record too and unlink it on the way out, which meant a preview running
+    # alongside the app replaced the app's identity while it ran and then deleted it —
+    # on the one file the installer's whole stop path reads. A diagnostic that cannot be
+    # told apart from the app is not a diagnostic, it is a second owner.
     session = (frames_mon.session_name if frames_mon is not None
                else f"PCMonitor-{cfg['frames'].get('role', 'main')}")
-    write_record(session=session,
-                 collector=str(ROOT / str(cfg["frames"].get("presentmon_path", ""))))
-    import atexit
-    atexit.register(clear_record)
-    # A request left behind by a run that died between "stop" and "exited" belonged to
-    # that run. Consumed here, once, or every later start would quit immediately.
-    if stop_requested():
-        status("[stop] cleared a stop request left by a previous run")
+    owns_installation = not dump_mode
+    if owns_installation:
+        # The record this process writes about itself, plus the token that makes it
+        # ours alone — `clear_record` refuses to remove a file another instance has
+        # since written, which is the difference between "clean up after myself" and
+        # "delete the running app's identity on my way out" (#67).
+        record_token = write_record(
+            session=session, role="main",
+            collector=str(ROOT / str(cfg["frames"].get("presentmon_path", ""))))
+        import atexit
+        atexit.register(clear_record, record_token)
+        # A request left behind by a run that died between "stop" and "exited" belonged
+        # to that run. Consumed here, once, or every later start would quit immediately —
+        # and consumed only by the owner, because the request is addressed to the process
+        # that holds the installation and a preview that ate one would leave the
+        # installer waiting on an app that is still running (#67).
+        if stop_requested():
+            status("[stop] cleared a stop request left by a previous run")
 
     panel = None
     pusher = None
@@ -528,6 +571,12 @@ def main() -> None:
     # log that says nothing wrong. One line every 15 min (first one after a minute,
     # so a start is provably alive without waiting a quarter of an hour).
     beat_every_s = float(cfg["display"].get("heartbeat_s", 900))
+    # Which heartbeat file this process is allowed to write (#67). A `--dump` preview
+    # runs a real loop beside the app on purpose, and the observer that decides whether
+    # the app is alive reads the unsuffixed beat: a diagnostic refreshing *that* could
+    # make a stalled app look healthy, and one writing `.stopped` on Ctrl-C could talk
+    # the watchdog out of recovering the app it never owned.
+    beat_role = "dump" if dump_mode else "main"
     next_beat = time.monotonic() + 60.0
     started = time.monotonic()
     ticks = 0
@@ -542,7 +591,8 @@ def main() -> None:
         # own COM port and stops its own collector on the way out — which a forced stop
         # never lets it do, and that is exactly where an orphaned ETW session comes from.
         # Checked at the top of a tick, so the worst-case answer is one interval.
-        if g.run("stop-request", stop_requested, False):
+        # Only the owner consumes it (#67): see the start-up block above.
+        if owns_installation and g.run("stop-request", stop_requested, False):
             status("[stop] shutdown requested — closing the link and exiting cleanly")
             return
 
@@ -665,8 +715,10 @@ def main() -> None:
                     g.run("brightness", lambda: panel.set_brightness(plan.brightness))
                     g.run("screen-on", lambda: panel.screen(True))
             # Say it to the outside world too: an observer that cannot see this tick
-            # will restart an app that is degraded but perfectly alive.
-            beat_liveness(tick=ticks, state="degraded")
+            # will restart an app that is degraded but perfectly alive. Scoped by role
+            # like the healthy beat above (#67): a degraded tick is still a tick the
+            # *owner* has to report, and a preview must not report one for it.
+            beat_liveness(tick=ticks, state="degraded", role=beat_role)
             sleep_left = interval - (time.monotonic() - t0)
             if sleep_left > 0:
                 g.run("wait", lambda: host.wait(sleep_left))
@@ -862,7 +914,10 @@ def main() -> None:
         # way a *hung* loop is observable at all — its own log cannot say anything,
         # because the line that would say it is the line that never gets written.
         # Cheap by construction: one small file, replaced atomically, never raises.
-        beat_liveness(tick=ticks, state=state)
+        # Scoped by role: a `--dump` preview beats into `.heartbeat-dump`, because the
+        # observer that reads the unsuffixed file is deciding whether the *app* is alive,
+        # and a preview refreshing it would hide exactly the hang it exists to catch (#67).
+        beat_liveness(tick=ticks, state=state, role=beat_role)
         if t0 >= next_beat:
             next_beat = t0 + beat_every_s
             up = int(t0 - started)
@@ -919,7 +974,19 @@ if __name__ == "__main__":
         # that relaunches the app the user just stopped is not recovery. Not written
         # from `atexit`, because an unhandled exception unwinds through `atexit` too,
         # and that is precisely the case the observer must still act on.
-        mark_stopped("keyboard-interrupt")
+        #
+        # Role-scoped (#67): Ctrl-C on a `--dump` preview says nothing about the app, and
+        # the marker it used to write was the one that holds the watchdog back — so a
+        # preview interrupted at the wrong moment could stop the real app being recovered.
+        # The owner is the only role whose "I meant to stop" the observer is entitled to.
+        #
+        # The role comes from `dump_role_requested()`, not from a name bound inside
+        # `main()`: this block is module scope and cannot see that frame, and reading it
+        # anyway is a NameError inside the one handler that must never fail. It also has
+        # to work when `main()` never returned at all — Ctrl-C during bring-up is exactly
+        # when the marker matters most, and no variable `main()` sets exists yet.
+        if not dump_role_requested():
+            mark_stopped("keyboard-interrupt")
         bootlog.note("[boot] stopped on request (Ctrl-C)")
     except BaseException:  # noqa: BLE001 - start-up is the one place a death is final
         # Setup failures (config unreadable, sensors library missing, port denied)
