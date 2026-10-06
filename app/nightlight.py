@@ -37,6 +37,17 @@ process, so a failed read holds the last *confirmed* appearance (see
 `NightLight`) instead of flashing the panel back to day brightness, and the log
 says where every answer came from.
 
+"Not there" and "could not be read" are not the same silence, and #15 was the
+day they were treated as one. A key the registry says it does not have is a fact
+about this build — the schedule may answer for it, because nothing else will.
+A key that refused (access denied, a hive mid-rewrite, a payload that will not
+decode), and a key that answered a moment ago and is gone now, say nothing at
+all about whether night light is on: both keep the answer unknown so the
+confirmed appearance survives, and neither is allowed to hand the decision to a
+schedule that is only *configuration*. The second opinion works the same way in
+miniature: the gamma ramp may only take back the look it gave (see #68), because
+Windows' own night light does not go through the ramp at all.
+
 The panel has no colour-temperature hardware, so the warmth is applied to the
 pixels: `warm_lut()` builds a 768-entry per-channel LUT from the Kelvin value
 (the same Helland blackbody approximation every temperature→RGB helper uses) and
@@ -63,6 +74,18 @@ _STATE_KEY = (r"Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\Defau
 _SETTINGS_KEY = (r"Software\Microsoft\Windows\CurrentVersion\CloudStore\Store\DefaultAccount"
                  r"\Current\default$windows.data.bluelightreduction.settings"
                  r"\windows.data.bluelightreduction.settings")
+
+
+class StateUnreadable(OSError):
+    """The registry said *I cannot answer right now* — not *there is nothing here*.
+
+    Absence (`FileNotFoundError`) really does mean the feature was never touched
+    on this machine, which is the honest trigger for schedule fallback. Anything
+    else winreg raises — access denied, a hive being rewritten, the value torn
+    mid-write — is a failed read, and swallowing every `OSError` into one `None`
+    is how a transient hiccup came to look like "no state" and let a schedule
+    guess replace a confirmed effective state (issue #15).
+    """
 
 
 # ------------------------------------------------------------------ CB reader
@@ -327,15 +350,29 @@ class NightLight:
 
     # -- registry -----------------------------------------------------------
     def _blob(self, key: str) -> bytes | None:
+        """The stored value, or None when the registry says there is nothing stored.
+
+        The distinction is the whole of issue #15: `FileNotFoundError` is the key
+        or value not being there, which is a fact about this build and the honest
+        trigger for schedule fallback. Anything else winreg raises — access
+        denied, a hive being rewritten, the value torn mid-write — leaves as
+        `StateUnreadable`, because "I cannot answer right now" must never be
+        mistaken for "there is nothing here" and handed to a schedule guess.
+        """
         if os.name != "nt":
             return None
         try:
             import winreg
+        except ImportError:                # a Python without the registry
+            return None
+        try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
                 v, _ = winreg.QueryValueEx(k, "Data")
-            return bytes(v) if v else None
-        except OSError:
+        except FileNotFoundError:
             return None       # absent value = the feature has never been touched
+        except OSError as e:
+            raise StateUnreadable(f"{_leaf(key)}: {type(e).__name__}: {e}") from e
+        return bytes(v) if v else None
 
     def _read_windows(self, now=None) -> tuple[bool | None, int | None, str, str, float]:
         """(on, temp_k, source, detail, state_mtime) — state, override, schedule kept apart.

@@ -48,6 +48,7 @@ import subprocess
 import threading
 import time
 import uuid
+from typing import Callable
 
 NT = os.name == "nt"
 
@@ -689,21 +690,33 @@ class HostState:
     """
 
     def __init__(self, gap_s: float = 5.0, poll_s: float = 5.0,
-                 cadence_s: float = 1.0, events: bool = True) -> None:
+                 cadence_s: float = 1.0, events: bool = True,
+                 now: Callable[[], float] = time.monotonic) -> None:
         self.gap_s = float(gap_s)
         # What the caller says a tick is *supposed* to cost. The gap watchdog needs an
         # expectation to judge against; without one it has nothing but the number it is
         # measuring, which is how a 30-second suspend came to be compared with 90.
         self.cadence_s = float(cadence_s)
         self.poll_s = float(poll_s)
+        # The clock this view of the machine measures against — declared as a seam
+        # exactly like `EventWindow`'s `api`, because the timestamps that decide a
+        # suspend are worth as little as the readings they are paired with if a test
+        # cannot place both at a scripted instant (tools/hoststate_selftest.py).
+        self._now = now
         self.asleep = False
         self.asleep_reason = ""
         # A suspend is tracked as a request as well as a belief: `asleep` is what the
         # light decision acts on, `suspend_pending` that Windows has not answered the
-        # request yet, and `_input_age` the last read of the input clock an answer is
-        # judged against. See `_request_suspend`.
+        # request yet, and `_input_pair` the last reading of the input clock *and the
+        # moment it was taken*, as one unit — an answer is judged over the interval
+        # between two observations, which needs a timestamp to mean anything. The
+        # event thread installs the request's pair while the loop reads and replaces
+        # it, so the two fields move only under `_input_lock`: an age from one
+        # instant and a timestamp from another is the mismatch that invented input.
+        # See `_request_suspend` and `_note_input`.
         self.suspend_pending = False
-        self._input_age: float | None = None
+        self._input_pair: tuple[float | None, float] | None = None
+        self._input_lock = threading.Lock()
         self.monitor_on: bool | None = None      # None = nothing has said yet
         self.monitor_seeded = False              # the current value is a derivation
         self.monitor_seed = ""                   # …and how it was arrived at
@@ -721,10 +734,10 @@ class HostState:
         # to sleep" switches the panel off in milliseconds rather than at the top
         # of the next second — which is the only window in which it still works.
         self.event = threading.Event()
-        self._tick_now = time.monotonic()
+        self._tick_now = self._now()
         self._primed = False
         self._asleep_since = 0.0
-        self._since_resume = time.monotonic()
+        self._since_resume = self._now()
         self._poll_left = 0.0
         self._event_lock: bool | None = None
         # Started last, and only last: the window's thread calls `_on_event` the
@@ -910,29 +923,43 @@ class HostState:
         relinked on its way into a suspend.
 
         So the request arms `_note_input` with a first reading of the clock, and only a
-        reading that moved forward from there answers it. The read may fail; a missing
-        clock is not an answer either, and the anchor simply waits for one it can use.
+        reading that moved forward from there answers it. The reading is stored *with
+        the instant it was taken*: it arrives on the event thread, mid-interval of a
+        loop that measures its own gaps between ticks, and an age without its own
+        timestamp is a number the loop can only judge against the wrong interval — a
+        request landing 0.1 s before the next tick, judged over the loop's whole
+        second, invented input from a desk nobody had touched (the review of #43).
+        The read may fail; a missing clock is not an answer either, and the anchor
+        simply waits for one it can use — but it waits from *this* instant.
         """
         if not self.asleep:
             self.suspends += 1
-            self._asleep_since = time.monotonic()
+            self._asleep_since = self._now()
         self.asleep = True
         self.asleep_reason = why
+        # Read the clock and the pair's own instant, then install both under the lock:
+        # the loop is reading the pair every tick, and an age from the event thread
+        # mixed with a timestamp from the loop (either order) is the same mismatch
+        # this whole method exists to avoid. The pair goes in *before* the flag, so a
+        # tick that sees an outstanding request also sees the anchor it must answer to.
+        age = idle_seconds()
+        at = self._now()
+        with self._input_lock:
+            self._input_pair = (age, at)
         self.suspend_pending = True
-        self._input_age = idle_seconds()
 
-    def _note_input(self, seen: float | None, interval: float) -> bool:
-        """Has the input clock moved forward since the last time it was read?
+    def _note_input(self, seen: float | None, now: float) -> bool:
+        """Has the input clock moved forward between *these two observations*?
 
-        `interval` is the gap measured *here*, between this reading and the previous
-        one - never the caller's `dt`. Those two are different numbers: `dt` is the
-        loop's own elapsed time, clamped and accounted, while the readings are taken
-        at the top of each tick by this function. Comparing a sample against an
-        interval that is not the one between the samples is what made a *stale*
-        reading answer: the reading at t=.90 said .20 and the one at t=.91 said .21
-        - .01 apart, aged .01, nobody touched anything - but handed in with the
-        loop's dt of .91 it looked like .90 seconds of input and answered a suspend
-        nobody had woken the machine from.
+        `now` is the instant `seen` was taken, and the pair it replaces was installed
+        with its own instant — by a previous call here, or by `_request_suspend` on
+        the event thread, arriving mid-interval between two loop ticks. The interval
+        that matters is therefore `now - prev_at`: the elapsed time between the
+        readings themselves, which is not the loop's `dt`, and is not the loop's
+        measured `gap` either. Those two are what this rule got wrong before: a
+        request's age judged over the interval since the *previous tick* credited the
+        interval with aging a reading that had not existed for most of it, and the
+        click that invoked the Sleep answered its own suspend.
 
         A reading taken `interval` after the previous one is `interval` older if
         nothing happened, so a reading *younger* than that - by more than the slack
@@ -945,12 +972,15 @@ class HostState:
         to a desk that had not been asked to sleep yet, and the click that asked for
         it keeps reporting "just now" for two seconds afterwards.
         """
-        if seen is None:
-            self._input_age = None      # unreadable: nothing to judge the next by
-            return False
-        prev = self._input_age
-        self._input_age = seen
-        return prev is not None and seen + INPUT_PROGRESS_S < prev + interval
+        with self._input_lock:
+            prev = self._input_pair
+            self._input_pair = (seen, now)
+            if seen is None:
+                return False      # an unreadable clock answers with nothing, even its instant
+            if prev is None or prev[0] is None:
+                return False      # no usable anchor yet: this reading only anchors
+            interval = max(0.0, now - prev[1])  # out-of-order threads: judge nothing
+            return seen + INPUT_PROGRESS_S < prev[0] + interval
 
     def _exit_asleep(self, why: str) -> None:
         was = self.asleep
@@ -959,7 +989,8 @@ class HostState:
         self.asleep = False
         self.asleep_reason = ""
         self.suspend_pending = False
-        self._input_age = None
+        with self._input_lock:
+            self._input_pair = None
         # A wake arrives before anyone knows the display state, and
         # PBT_APMRESUMEAUTOMATIC lands while the screen is still dark: after a
         # real sleep, drop the monitor flag to unknown rather than guessing on,
@@ -970,7 +1001,7 @@ class HostState:
             self.monitor_on = None
             self.monitor_seeded = False
         self.resume = why
-        self._since_resume = time.monotonic()
+        self._since_resume = self._now()
 
     # -- start-up seed ---------------------------------------------------------
     def _display_timeout_s(self) -> float | None:
@@ -1070,9 +1101,13 @@ class HostState:
         # the flag set, and the wait after this tick returns at once instead of
         # sleeping through an event nobody read.
         self.event.clear()
-        now = time.monotonic()
+        now = self._now()
         gap = now - self._tick_now
         self._tick_now = now
+        # The reading and its instant: `now` pairs with `seen` and is handed to
+        # `_note_input` with it, because the anchor a request installed belongs to
+        # the event thread's clock-reading, mid-tick, and only a timestamp taken at
+        # the reading can say how far apart the two observations actually are.
         seen = idle_seconds()
         self.idle_known = seen is not None
         self.idle_s = seen if seen is not None else 0.0
@@ -1110,16 +1145,18 @@ class HostState:
             why = (f"wake-after-{self.asleep_reason}" if self.asleep
                    else f"gap:{gap:.0f}s")
             self._exit_asleep(self.resume or why)
-        if self.suspend_pending and self._note_input(seen, gap):
+        if self.suspend_pending and self._note_input(seen, now):
             # Nobody types while the machine is suspended, so input that moved the
             # clock *forward from the request* is proof it is awake again - the belt
             # to the resume message's braces, and the only answer available when a
             # sleep was aborted after the query (lid closed then reopened, a suspend
             # that failed to take) and no resume message is coming. What it must not be
             # is a small *age*: the click that invoked Sleep is input, and every
-            # reading for the next two seconds says so. Judged over `gap`, the interval
-            # between the two readings themselves - not the caller's dt, which is a
-            # different number and made a stale reading answer (#43).
+            # reading for the next two seconds says so. Nor may it borrow the loop's
+            # gap: the request's reading was taken mid-interval, on the event thread,
+            # and the answer is only owed the time between the two readings (see
+            # `_note_input`, and #43 for the borrowed dt that made a stale reading
+            # answer).
             self.last_event = "input after suspend"
             self._exit_asleep(self.resume or "input-after-suspend")
         # The first tick has no history to compare against: construction-to-first-tick
@@ -1145,7 +1182,7 @@ class HostState:
         r = self.resume
         if r:
             self.resume = None
-            self._since_resume = time.monotonic()
+            self._since_resume = self._now()
         return r
 
     def take_refresh(self) -> str | None:
@@ -1172,10 +1209,10 @@ class HostState:
         return bool(self.event.wait(timeout))
 
     def asleep_s(self) -> float:
-        return (time.monotonic() - self._asleep_since) if self.asleep else 0.0
+        return (self._now() - self._asleep_since) if self.asleep else 0.0
 
     def since_resume(self) -> float:
-        return time.monotonic() - self._since_resume
+        return self._now() - self._since_resume
 
     def summary(self) -> str:
         on = "?" if self.monitor_on is None else (
