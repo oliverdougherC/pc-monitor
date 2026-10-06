@@ -44,7 +44,7 @@ output is the evidence, and `tools/run_offline_tests.py --list` names each case.
 | #25 | P1 | install/remove kills *every* `python main.py` | `app/owned.py`, `tools/install_autostart.ps1` | `owned` |
 | #24 | P1 | single-instance/device ownership acquired too late | `app/instance.py`, `main.py` start-up order | `instance` |
 | #12 | P1 | PresentMon job-object rights wrong; child shutdown races the reaper | `app/frames.py` (`_KillJob.adopt`, `close`) | `frames_shutdown` |
-| #6 | P1 | serial I/O has no single owner: a build's lease was not truthful, so escalation could reset the device under a live bring-up | `app/panel.py` (`building`, `_usb_restart`, `openSerial` re-check) | `panel_owner` |
+| #6 | P1 | serial I/O has no single owner: a build's lease was not truthful, so escalation could reset the device under a live bring-up | `app/panel.py` (`building`, `_claim_lease`, `_usb_restart`, `openSerial` re-check) | `panel_owner` |
 
 The #7/#8 rule stands: non-destructive retry beats escalating to an unverified
 device disable, and both are only *offline*-verified. `panel.py` refuses rung 3
@@ -79,7 +79,7 @@ is not acknowledged on a frame that did not land.
 | #10 | P1 | PresentMon alive-but-stalled is never recovered; capture health latched on header receipt | `app/frames.py` (`_stall_reason`, `_read_stream`, `state`) | `frames_recovery` |
 | #11 | P1 | malformed present rows poison parsing; indefinite waits after reader failure | `app/frames.py` (`_ingest`, `_reap`) | `frames_rows` |
 | #13 | P1 | an obsolete swapchain shown forever; generation not fenced at commit; measurement age taken from pipe activity | `app/frames.py` (`_best`, `_sweep`, `_ingest`, `stats`, `presenters`) | `frames`, `frames_recovery` |
-| #17 | P1 | sensor acquisition unbounded; a retained snapshot presented as live telemetry | `app/sensors/__init__.py` (the supervisor), `app/sensors/lhm.py` | `sensors` |
+| #17 | P1 | sensor acquisition unbounded; a retained snapshot presented as live telemetry | `app/sensors/__init__.py` (the supervisor, `make_hub`), `app/sensors/lhm.py` | `sensors` |
 | #18 | P2 | disk/network counters not re-primed after absence, topology change or resume | `app/sensors/fallback.py` (`_Rate`) | `sensor_counters` |
 | #21 | P2 | game mode oscillates below the entry FPS threshold; pid reuse not verified without a capture | `app/gamewatch.py` (`_held`, `_window_holds`) | `gamewatch` |
 | #29 | P2 | Steam identity read environment keys with the wrong normalization | `app/steamid.py` | `steamid` |
@@ -159,6 +159,21 @@ This is the part the reviews said out loud, and nothing here changes it.
   barrier by injection (`frames_selftest`), not against a genuinely preempted
   reader thread mid-`_ingest` — the barrier is what the fix adds, and the case
   drives it deterministically rather than hoping for the interleaving.
+* **Two deliberate behaviour changes from the review round**, both product calls
+  rather than defect fixes, and both easy to reverse if the desk disagrees:
+
+  * a sensor sample that is collected on a *later* tick than it was acquired is
+    published `held=True` with its true age, and expires on its acquisition
+    tick's grace. A driver that consistently answers just past `tick_timeout_s`
+    therefore reads as held/dimmed rather than fresh — which is what "must not
+    enter history as a current measurement" requires, but it is one tick of
+    latency that the panel did not show before;
+  * `close()`'s early-return path (shutdown while a reopen is still inside the
+    driver) still leaks the backend the hub was holding, because the code
+    deliberately does not join a native call. `MAX_LIVE_WORKERS` still counts
+    live threads rather than owned handles — now an honest proxy, since a
+    generation releases its ledger before its thread exits, but the cap
+    semantics were left alone.
 
 When the hardware run and the soak have been executed and recorded — response
 latency, maximum outage, missed recoveries, process/thread/handle counts, memory,
