@@ -428,6 +428,11 @@ class PanelLink:
         self._gate = threading.Lock()
         self._state = _CLOSED
         self._gen = 0
+        # The build lease (#6): True from the instant a bring-up claims the port until
+        # the attempt is over and the gate is back. `_state` cannot stand in for it —
+        # `_retire` parks the state at `_CLOSED` for the whole slow part of a build — so
+        # every "is it safe to act?" question asks this instead. See `building`.
+        self._building = False
         self._closing = False
         self._retry_at = 0.0
         self._last_down_log = 0.0
@@ -539,7 +544,7 @@ class PanelLink:
         or not.
         """
         with self._lock:
-            if self._closing or self._state in (_READY, _BUILDING):
+            if self._closing or self.building or self._state == _READY:
                 return
             self._set_state(_BUILDING)
 
@@ -564,6 +569,23 @@ class PanelLink:
         threading.Thread(target=work, daemon=True, name="panel-bring-up").start()
 
     def _build_now(self, first: bool = False, reason: str = "") -> bool:
+        """Run one bring-up, holding the build lease for the whole attempt.
+
+        The lease is raised *before* the gate is taken and dropped *after* it is
+        released, which is the property #6 asked for and the one `_state` cannot express:
+        `_build_owned` retires the old connection as its first act, and `_retire` parks
+        the state at `_CLOSED`, so for the slow half of a bring-up the lifecycle claims
+        nothing is happening while this thread is inside the gate holding the port.
+        """
+        with self._lock:
+            self._building = True
+        try:
+            return self._build_attempt(first=first, reason=reason)
+        finally:
+            with self._lock:
+                self._building = False
+
+    def _build_attempt(self, first: bool = False, reason: str = "") -> bool:
         """Bring the link up: one build at a time, and never after `close()`.
 
         `_gate` is the single-owner rule. Two builds at once — a background retry and a
@@ -589,8 +611,8 @@ class PanelLink:
             with self._gate:
                 return self._build_owned(first=True, reason=reason)
         if not self._gate.acquire(timeout=_BUILD_WAIT_S):
-            # Leave the state alone here: `_BUILDING` is true information while another
-            # attempt is still inside the gate, and clearing it would invite a third.
+            # Leave the state alone here: an attempt is still inside the gate, and
+            # clearing anything would invite a third.
             self.down_reason = "a rebuild is already in flight"
             return False
         try:
@@ -753,6 +775,21 @@ class PanelLink:
         with self._lock:
             self._state = state
             self.ok = state == _READY
+
+    @property
+    def building(self) -> bool:
+        """Is a bring-up lease held right now — from *before* the gate to *after* it?
+
+        `_state == _BUILDING` cannot answer this (#6). `_build_owned` retires the old
+        connection as its first act and `_retire` parks the state at `_CLOSED`, so for
+        the whole slow part of a bring-up — auto-detect, HELLO, the vendor's reboot —
+        the lifecycle says "closed, nothing happening" while a thread is in fact inside
+        the gate holding the port. Everything that asks the state whether it is safe to
+        act (escalate to `pnputil`, authorise a lit rebuild, start another attempt) was
+        therefore acting against a false answer.
+        """
+        with self._lock:
+            return self._building
 
     def _retire(self):
         """Give up our claim on the current driver and hand it back to be disposed.
@@ -1060,7 +1097,7 @@ class PanelLink:
         self._retry_at = now + wait
         if self.ok:
             return True
-        if self._state == _BUILDING:
+        if self.building:
             return False                      # an attempt is already in flight
         if reconnect_only:
             # The rebuild is owed, not skipped: `authorize_light()` will do it.
@@ -1086,15 +1123,19 @@ class PanelLink:
         # word. pnputil needs Administrator — which the scheduled task has — and when
         # it does not, the answer is logged, not swallowed.
         #
-        # `self._state != _BUILDING` is not a nicety: `start_build` above has only
-        # *started* its thread, so without this the same tick that began a bring-up
-        # would reset the USB device underneath it, yanking the port out from under the
-        # attempt that was ten seconds from asking it for HELLO. The ladder waits for
-        # the next tick, which is a second away; a build that just failed has already
-        # moved the state out of `_BUILDING`, so escalation is delayed by one attempt,
-        # never suppressed.
+        # `self.building` is not a nicety: `start_build` above has only *started* its
+        # thread, so without this the same tick that began a bring-up would reset the USB
+        # device underneath it, yanking the port out from under the attempt that was ten
+        # seconds from asking it for HELLO. The ladder waits for the next tick, which is
+        # a second away; a build that just failed has already dropped its lease, so
+        # escalation is delayed by one attempt, never suppressed.
+        #
+        # This used to read `self._state != _BUILDING`, which is a *false* answer for
+        # almost the whole build (#6): `_build_owned` retires the old connection first
+        # and `_retire` sets the state to `_CLOSED`, so the guard was open exactly while
+        # a thread was inside the gate and the pnputil reset would do the most damage.
         if (self.cfg["display"].get("usb_restart_on_fail", True)
-                and self._state != _BUILDING
+                and not self.building
                 and now - self._down_since > _USB_RESTART_AFTER_S
                 and now - self._last_usb_restart > self._restart_wait()):
             self._last_usb_restart = now
@@ -1119,7 +1160,7 @@ class PanelLink:
         if not self.pending_setup:
             return self.ok
         self.pending_setup = False
-        if self.ok or self._state == _BUILDING:
+        if self.ok or self.building:
             return self.ok
         self.log(f"[panel] light authorised after {self.dark_deferred} dark pass(es) — "
                  f"reopening the panel now")
@@ -1467,6 +1508,17 @@ class PanelLink:
         to take the fault as far down as it can go and to say plainly, when it runs
         out, that the answer is the cable.
         """
+        # Refused outright while a bring-up holds the port (#6). The caller in `tick()`
+        # already declines to escalate during a build, but `_usb_restart` is also
+        # reachable from the recovery worker's retry path, and a pnputil reset — or the
+        # disable/enable rung, which takes the device off the bus — issued underneath a
+        # thread that is mid-HELLO is precisely the interference the single-owner rule
+        # exists to prevent. A refusal is its own answer: not a recovery, and not a
+        # verdict about the firmware (`_refuse_restart`).
+        if self.building:
+            self._refuse_restart("a bring-up is holding the port; its own attempt is "
+                                 "the answer to this fault")
+            return False
         port = self._port_device()
         if not port:
             self.usb_restart_error = "no COM port known for the panel"
@@ -1738,7 +1790,22 @@ class PanelLink:
                 self._quarantine(legacy, f"{owed} is already owed an enable")
                 continue
             if not owed:
-                self._write_record(self._new_record(dev, RecoveryPhase.DISABLED))
+                # Migration is a transaction, and the legacy file is the *only* memory
+                # that a device may be sitting disabled — so it is removed only once the
+                # new journal is durably on disk. `_write_record` returns "" on success
+                # and the reason on failure; discarding that answer used to mean a failed
+                # atomic replace (a permission problem, a full disk, an antivirus lock)
+                # logged "adopted" and then deleted the legacy marker, leaving a disabled
+                # device with no record anywhere that it needs enabling. On failure the
+                # legacy file is kept for the next bring-up, which retries the migration
+                # by doing the same thing again.
+                reason = self._write_record(
+                    self._new_record(dev, RecoveryPhase.DISABLED))
+                if reason:
+                    self.log(f"[panel] could not adopt the recovery record for {dev} "
+                             f"from {legacy} ({reason}) - leaving that file in place so "
+                             f"the next start can finish the migration")
+                    continue
                 self.log(f"[panel] adopted the recovery record for {dev} from {legacy} "
                          f"into {self._journal_name()}")
             try:

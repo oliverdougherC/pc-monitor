@@ -338,6 +338,36 @@ def case_the_old_mark_is_adopted() -> None:
         check("and stops being re-read", old.exists(), False)
 
 
+def case_a_failed_migration_keeps_the_debt() -> None:
+    print("case: a migration that cannot be written does not delete the record")
+    # The legacy marker is the *only* memory that a device may be sitting disabled, so
+    # deleting it is only safe once the new journal is durably on disk. The old code
+    # discarded `_write_record`'s answer, logged "adopted" regardless, and unlinked the
+    # legacy file — so a failed atomic replace (a locked file, a full disk, a permission
+    # problem) left a disabled device with no record of the debt anywhere.
+    with Scratch() as s:
+        old = Path(".panel_reset_pending")
+        old.write_text(PANEL + "\n", encoding="utf-8")
+        bus = FakeBus(says=["off", "on"])
+        link = s.link()
+        link._pnputil = bus.pnputil
+        link._device_state = bus.state
+        # Make the durable write itself fail, which is the one thing that must stop the
+        # migration rather than be absorbed by it.
+        link._write_record = lambda record: "write: PermissionError: locked"
+        check("the debt was still seen and reported", link._reconcile_recovery(), True)
+        check("the legacy marker is still there", old.exists(), True)
+        check("and it was not called adopted", any("adopted" in m for m in s.log), False)
+        check("the failure is said out loud with its reason",
+              any("could not adopt" in m and "locked" in m for m in s.log), True)
+        check("and no enable was commanded for a debt it could not record",
+              bus.calls, [])
+        # The state directory holds no journal either, so nothing claims the debt is
+        # tracked. That is the honest state: the legacy file still says so.
+        check("no journal was written", (s.dir / (JOURNAL + ".unreadable")).exists()
+              or (s.dir / JOURNAL).exists(), False)
+
+
 def case_the_state_verdicts() -> None:
     print("case: the answers a device node can give, and only those")
     real = panel_mod.subprocess
@@ -490,6 +520,7 @@ def main() -> int:
                case_a_second_cycle_is_refused_while_one_is_owed,
                case_an_unreadable_record_is_kept_aside,
                case_the_old_mark_is_adopted,
+               case_a_failed_migration_keeps_the_debt,
                case_the_state_verdicts,
                case_only_a_real_instance_id_is_touched):
         fn()

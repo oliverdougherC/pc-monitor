@@ -492,6 +492,66 @@ def case_one_build_at_a_time() -> None:
     link.close()
 
 
+def case_build_lease_is_truthful_and_bars_escalation() -> None:
+    """Issue #6's unmet half: the build-in-progress signal must hold for the *lease*.
+
+    `_state` could not express this. `_build_owned` retires the old connection as its
+    first act and `_retire` parks the state at `_CLOSED`, so for the whole slow part of
+    a bring-up — auto-detect, HELLO, the vendor's reboot — the lifecycle said "closed,
+    nothing happening" while a thread was inside the gate holding the port. Everything
+    that asked the state whether it was safe to act was answering against a false
+    reading: the escalation guard could fire a `pnputil` reset (or the disable/enable
+    rung that takes the device off the bus) underneath a thread that was mid-HELLO, and
+    a second `start_build` would arm another worker to queue on the gate.
+    """
+    print("case: the build lease covers the whole bring-up, and bars the device ladder")
+    PORT.reset()
+    gate = threading.Event()
+    PORT.next_behaviour = {"hello_gate": gate}
+    link = PanelLink(cfg(), log=say)
+    check("no lease before anything starts", link.building, False)
+    link.start_build()
+    check("the bring-up reached the device", wait_for(lambda: PORT.hello == 1), True)
+    # This is the assertion the old code fails: a build is in flight, and yet the
+    # lifecycle state is `_CLOSED` because the old connection has been retired.
+    check("a build is in flight", link.building, True)
+    check("and the lifecycle state is NOT the honest answer here",
+          link._state, panel_mod._CLOSED)
+    check("so `ok` is False while it runs", link.ok, False)
+
+    # A second attempt must not arm. `start_build` used to read `_state`, which is
+    # `_CLOSED` during the lease, so it re-armed `_BUILDING` and spawned a worker that
+    # queued on the gate behind this one.
+    threads_before = [t for t in threading.enumerate() if t.name == "panel-bring-up"]
+    link.start_build("second attempt")
+    time.sleep(0.3)
+    threads_after = [t for t in threading.enumerate() if t.name == "panel-bring-up"]
+    check("a second attempt did not arm while the lease is held",
+          len(threads_after) <= len(threads_before), True)
+    check("and no second handshake reached the device", PORT.peak_hello, 1)
+
+    # The escalation must refuse. `_usb_restart` is reachable from the recovery worker's
+    # retry path as well as from `tick()`, so the refusal belongs in the method itself.
+    calls: list[str] = []
+    link._pnputil = lambda *a, **k: (calls.append(" ".join(str(x) for x in a)),
+                                    (False, "not attempted"))[1]
+    check("the device ladder refuses while a build holds the port",
+          link._usb_restart(), False)
+    check("and issued no device verb at all", calls, [])
+    check("the refusal is reported as a refusal, not a recovery",
+          bool(link.usb_restart_refused), True)
+    check("and is not counted as an attempt that reached the device",
+          link.usb_restarts, 0)
+
+    gate.set()                         # let the bring-up finish
+    check("the bring-up finished", wait_for(lambda: link.ok), True)
+    check("the lease was dropped", link.building, False)
+    check("still one driver", PORT.open_count(), 1)
+    print(f"    {link.summary()}")
+    link.close()
+    check("and the lease is down after close", link.building, False)
+
+
 def case_hundred_outages() -> None:
     print("case: 100 outages, retried the way the loop retries them, leak nothing")
     PORT.reset()
@@ -542,6 +602,7 @@ def main() -> int:
                case_setup_failure_is_not_success,
                case_close_during_build,
                case_one_build_at_a_time,
+               case_build_lease_is_truthful_and_bars_escalation,
                case_hundred_outages):
         fn()
         print()

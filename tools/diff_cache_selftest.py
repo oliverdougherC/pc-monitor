@@ -225,10 +225,123 @@ def case_link_acks_and_counts() -> None:
     link.close()
 
 
+def case_vendor_boundary_does_not_swallow_a_timeout() -> None:
+    """The ack has to survive the *pinned vendor's* write path, not just a fake.
+
+    Issue #9's residual defect lived below this module: the vendored `LcdComm.WriteLine`
+    catches `serial.SerialTimeoutException` and returns normally, and `serial_write`
+    throws away the byte count. So a frame that never left the host still looked like a
+    method that returned, `PanelLink` acked it, and `DiffPusher` committed the shadow
+    frame — after which the diff transport stops re-sending the bands that are actually
+    missing. The other cases here drive scripted transports, which is why none of them
+    caught it. This one drives the real `LcdComm` class with the hardening `app/display`
+    installs, and a fake pyserial whose `write()` times out.
+    """
+    print("case: a swallowed vendor write timeout is not an acknowledgement (#9)")
+    from app import display as disp
+
+    try:
+        from library.lcd.lcd_comm import LcdComm
+    except ImportError as e:
+        print(f"  SKIP the vendored library is not present ({e})")
+        return
+
+    import serial as real_serial
+
+    class FakeSerial:
+        """A CDC endpoint that has stopped draining: every write times out."""
+
+        def __init__(self):
+            self.writes: list[bytes] = []
+
+        def write(self, data):
+            self.writes.append(bytes(data))
+            raise real_serial.SerialTimeoutException("the endpoint is not draining")
+
+        def close(self):
+            pass
+
+        def flush(self):
+            pass
+
+    # The real class gets the app's hardening, exactly as `app/panel.py` does at
+    # bring-up. `_vendor_hardened` is reset so the patch is applied to this process's
+    # copy of the class even if an earlier import already hardened it.
+    disp._vendor_hardened = False
+    disp.harden_vendor()
+    check("the vendor write path was patched", getattr(LcdComm, "_pcmonitor_hardened", False),
+          True)
+    check("serial_write is no longer the vendor's", LcdComm.serial_write.__name__,
+          "serial_write")
+    check("and WriteLine is not either", LcdComm.WriteLine.__name__, "write_line")
+
+    class Dev(LcdComm):
+        def InitializeComm(self): pass
+        def Reset(self): pass
+        def Clear(self): pass
+        def ScreenOff(self): pass
+        def ScreenOn(self): pass
+        def SetBrightness(self, level): pass
+        def SetOrientation(self, orientation): pass
+        def DisplayPILImage(self, *a, **k): pass
+
+    dev = Dev(com_port="COM_TEST")
+    dev.lcd_serial = FakeSerial()
+    raised = None
+    try:
+        dev.WriteLine(b"\\x00HELLO\\x00")
+    except BaseException as e:  # noqa: BLE001 - the raise *is* the finding
+        raised = e
+    check("a timed-out vendor write raises instead of returning",
+          raised is not None, True)
+    check("and it is the serial timeout, not something invented",
+          type(raised).__name__, "SerialTimeoutException")
+
+    # A short write is the same lie in a different shape: pyserial reports how much
+    # left the host and the vendor dropped that number on the floor.
+    class ShortSerial(FakeSerial):
+        def write(self, data):
+            return len(data) - 1
+
+    dev.lcd_serial = ShortSerial()
+    raised = None
+    try:
+        dev.serial_write(b"0123456789")
+    except BaseException as e:  # noqa: BLE001
+        raised = e
+    check("a short write raises too", raised is not None, True)
+    check("and names what happened", "short write" in str(raised), True)
+
+    # And the whole chain: a real DiffPusher over a PanelLink whose device times out
+    # must not commit, and the retry must be a whole frame rather than a band.
+    class TimingOutDevice:
+        def __init__(self):
+            self.attempts = 0
+
+        def DisplayPILImage(self, *a, **k):
+            self.attempts += 1
+            raise real_serial.SerialTimeoutException("the endpoint is not draining")
+
+        SetBrightness = ScreenOn = ScreenOff = closeSerial = DisplayPILImage
+        SetOrientation = DisplayPILImage
+
+    link = PanelLink(simu_cfg(), log=lambda m: None)
+    check("open()", link.open(), True)
+    device = TimingOutDevice()
+    link.lcd = device
+    pusher = DiffPusher(link)
+    img = Image.new("RGB", (800, 480), (3, 3, 3))
+    check("the push over a timing-out device fails", pusher.push(img), False)
+    check("so the shadow frame was not committed", pusher.prev, None)
+    check("and the device really was asked", device.attempts >= 1, True)
+    link.close()
+
+
 def main() -> int:
     for fn in (case_healthy_diff, case_failed_full_frame, case_failed_mid_band,
                case_relink_during_push, case_invalidate_during_push,
-               case_late_old_generation_completion, case_link_acks_and_counts):
+               case_late_old_generation_completion, case_link_acks_and_counts,
+               case_vendor_boundary_does_not_swallow_a_timeout):
         fn()
         print()
     print("SELFTEST PASSED" if not fails else f"SELFTEST FAILED: {fails}")

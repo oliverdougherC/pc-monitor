@@ -20,6 +20,7 @@ Revision → transport, as found on real hardware (README "When the screen arriv
 from __future__ import annotations
 
 import importlib
+import platform
 import sys
 import threading
 import time
@@ -258,11 +259,11 @@ _vendor_hardened = False
 
 
 def harden_vendor() -> None:
-    """Wrap `LcdComm.openSerial` so no driver can ever exit the process.
+    """Wrap `LcdComm.openSerial` and the write path so a failed push cannot look like one.
 
-    Idempotent; call it from every path that builds a vendor driver. The
-    replacement keeps the vendor's contract — open the port, or give up — and
-    changes only the two things the app must own:
+    Idempotent; call it from every path that builds a vendor driver. The replacements
+    keep the vendor's contract — open the port, or give up — and change only the things
+    the app must own:
 
       * giving up means a catchable `RuntimeError`, not `os._exit(0)`: the retry
         policy belongs to the app's rebuild loop, which is the only one that has
@@ -271,6 +272,26 @@ def harden_vendor() -> None:
         already retired cannot take the port back when it re-enumerates mid-loop —
         the vendor's fault path calls `openSerial` from inside a failed write,
         which is exactly the moment the app is rebuilding.
+
+    **A write that did not happen must not return normally** (#9). The pinned vendor's
+    `WriteLine` catches `serial.SerialTimeoutException` and returns — the frame is not
+    on the panel, but every caller above sees a method that returned, so `PanelLink`
+    acks it and `DiffPusher` commits the shadow frame. The panel is then believed to be
+    showing a picture it never received, and the diff transport stops sending the bands
+    that are actually missing: the next tick compares against a frame the screen does
+    not have. The same is true of a **short write**, which the vendor discards entirely
+    (`serial_write` throws away the byte count `pyserial` returns).
+
+    So `serial_write` is replaced with one that requires the whole buffer to leave, and
+    `WriteLine` with one that lets a failure propagate instead of swallowing it. The
+    vendor's own reconnect-and-retry-once stays: if that retry succeeds, the write
+    really did succeed and the caller should hear so; if it fails, the exception reaches
+    `PanelLink._verdict`, which reports the push as not acknowledged, which is what keeps
+    the diff cache honest.
+
+    This touches nothing on disk. `vendor/` is a pinned, hash-verified tree and stays
+    byte-identical: the patch is applied to the class in the running process, exactly as
+    the `openSerial` replacement already was.
 
     The class, not the instance: the constructor itself calls `openSerial()`, so an
     instance-level patch would leave that call armed. Where the self-tests install a
@@ -292,6 +313,49 @@ def harden_vendor() -> None:
 
     import serial
 
+    def serial_write(self, data: bytes):
+        """Write the whole buffer, or raise. Never write part of a command frame.
+
+        A CDC endpoint that has stopped draining accepts some bytes and then blocks or
+        times out. pyserial reports how many it managed; the vendor discarded that
+        number, so a half-delivered frame counted as delivered. Half a frame is worse
+        than none: the panel's parser is left mid-command and the next write lands in
+        the wrong place.
+        """
+        if self.lcd_serial is None:
+            raise serial.SerialException(
+                "PC Monitor: the port is closed, so this command was not sent")
+        sent = self.lcd_serial.write(data)
+        if sent is not None and sent != len(data):
+            raise serial.SerialException(
+                f"PC Monitor: short write, {sent} of {len(data)} bytes left the host")
+
+    def write_line(self, line: bytes):
+        """The vendor's write path, with its silence about failure removed.
+
+        The one retry the vendor performs (close, reopen, send again) is kept, because
+        a transient `SerialException` that a reconnect repairs *did* deliver the frame.
+        What is not kept is the `SerialTimeoutException` branch returning normally: a
+        timeout means the bytes did not go out, and saying nothing is how a failed push
+        became an acknowledged one (#9).
+        """
+        try:
+            self.serial_write(line)
+            if platform.system() == "Darwin":
+                self.lcd_serial.flush()
+        except serial.SerialTimeoutException:
+            # A print is not enough. This is the failure the diff cache must hear about.
+            app_log("[display] write timed out - the endpoint is not draining; the "
+                    "frame was NOT sent")
+            raise
+        except serial.SerialException as e:  # noqa: BLE001 - reconnect once, as before
+            app_log(f"[display] serial write failed ({e}); closing and reopening the "
+                    f"port, then sending this frame once more")
+            self.closeSerial()
+            time.sleep(1)
+            self.openSerial()
+            self.serial_write(line)
+
     def open_serial(self):
         for attempt in range(1, _SAFE_OPEN_ATTEMPTS + 1):
             if getattr(self, "_pcmonitor_abandoned", False):
@@ -311,6 +375,21 @@ def harden_vendor() -> None:
             try:
                 self.lcd_serial = serial.Serial(com_port, 115200, timeout=1,
                                                 rtscts=True)
+                # The retirement is re-checked *after* acquisition, not only before it
+                # (#6). `serial.Serial(...)` can take a long time against a device node
+                # that is still enumerating, and the link may have retired this driver
+                # while it was inside the constructor — at which point assigning the
+                # handle installs a live port on a driver nothing owns any more, and the
+                # next rebuild opens a second one. One owner is a property of the open,
+                # not of the attempt that asked for it.
+                if getattr(self, "_pcmonitor_abandoned", False):
+                    try:
+                        self.lcd_serial.close()
+                    except Exception:  # noqa: BLE001 - closing a late handle must not raise
+                        pass
+                    self.lcd_serial = None
+                    raise RuntimeError("this driver was retired while opening the port; "
+                                       "the handle was closed instead of installed")
                 return
             except Exception as e:  # noqa: BLE001
                 app_log(f"[display] Cannot open COM port {com_port}: {e} - retrying "
@@ -322,11 +401,14 @@ def harden_vendor() -> None:
 
     open_serial._pcmonitor = True
     base.openSerial = open_serial
+    base.serial_write = serial_write
+    base.WriteLine = write_line
     base._pcmonitor_hardened = True
     _vendor_hardened = True
-    app_log("[display] vendor openSerial hardened: bounded, raise-not-exit, "
-            "retirement-checked — ending the process is the app's call, not the "
-            "driver's")
+    app_log("[display] vendor write path hardened: openSerial is bounded, "
+            "raise-not-exit and retirement-checked after acquisition; serial_write "
+            "requires the whole buffer; WriteLine propagates a failed write so a push "
+            "is never acknowledged on a frame that did not land")
 
 
 def make_lcd(cfg: dict):
