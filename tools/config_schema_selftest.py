@@ -19,6 +19,14 @@ kind of value that used to reach the loop now stops at `load()` naming its key,
 before any thread, port or ETW child exists to be poisoned by it - `load()` is
 main.py's first act, and this test process starts nothing in order to catch it.
 
+The mirror image of a knob nobody reads is a knob the consumer *does* read while
+the schema never looked at it (#20, second half): `power.require_complete`,
+`power.max_age_s` and `night.hold_grace_s` were documented in config.yaml and
+went straight from YAML into `power.estimate`/`NightLight`, so
+`require_complete: "yes"` (a truthy string) and a negative age were accepted at
+load. They are pinned here both ways: refused by `load()` naming the key, and
+still delivered to `power.estimate`/`NightLight` when they are sane.
+
 Run against the pre-fix source and the nested-detection, heuristic, rejection
 and last-known-good cases fail; the consumer cases pass (they document the
 acceptance contract, not just the fix).
@@ -40,6 +48,8 @@ from app import config as cfgmod           # noqa: E402
 from app import gamewatch, layout, output, power       # noqa: E402
 from app.burnin import BurnIn              # noqa: E402
 from app.gamewatch import GameWatch        # noqa: E402
+from app.nightlight import NightLight      # noqa: E402
+from app.snapshot import Snapshot          # noqa: E402
 
 sys.stdout.reconfigure(errors="replace")
 
@@ -261,6 +271,50 @@ def case_render_consumers() -> None:
           False)
 
 
+def case_power_and_night_knobs_reach_consumers() -> None:
+    print("case: power.require_complete/max_age_s and night.hold_grace_s reach their consumers")
+    # A sane set of all three, through a real YAML file: the schema must accept
+    # them and the consumer must see the number the file asked for, not a default.
+    path = write_cfg({"power": {"require_complete": False, "max_age_s": 2.5},
+                      "night": {"hold_grace_s": 120}})
+    try:
+        c = cfgmod.load(path)
+    finally:
+        os.unlink(path)
+    check("sane values load() and survive the merge",
+          (c["power"]["require_complete"], c["power"]["max_age_s"],
+           c["night"]["hold_grace_s"]), (False, 2.5, 120))
+
+    # require_complete is the difference between a one-sided total and no total
+    # at all. It is read with `bool(...)`, which is exactly why the schema has to
+    # be the one to refuse a "yes" string - by the time it gets here it is True.
+    now = time.time()
+    one_sided = Snapshot(ts=now)
+    one_sided.cpu.power_w = 100.0            # the GPU never answered this tick
+    check("require_complete: false lets a one-sided total through as a floor",
+          power.estimate(one_sided, c, now=now).total_w is not None, True)
+    strict = copy.deepcopy(c)
+    strict["power"]["require_complete"] = True
+    check("require_complete: true (the shipped policy) refuses it",
+          power.estimate(one_sided, strict, now=now).total_w, None)
+
+    # max_age_s is the freshness line the strip labels "stale" against: a
+    # negative one makes every snapshot stale forever.
+    old = Snapshot(ts=now - 60.0)
+    old.cpu.power_w, old.gpu.power_w = 100.0, 200.0
+    check("max_age_s: 60 s old is past 2.5 s and reads stale",
+          power.estimate(old, c, now=now).stale, True)
+    fresh = Snapshot(ts=now - 0.5)
+    fresh.cpu.power_w, fresh.gpu.power_w = 100.0, 200.0
+    check("max_age_s: half a second old is inside it",
+          power.estimate(fresh, c, now=now).stale, False)
+
+    # night.hold_grace_s is the night object's own clock for "a read failure is
+    # not the user turning night off". It is read once, in the constructor, so a
+    # string used to raise there instead of at load() with the key named.
+    check("night.hold_grace_s reaches NightLight", NightLight(c).hold_grace_s, 120.0)
+
+
 def case_rejects_bad_values() -> None:
     print("case: values that used to reach the loop now stop at load(), naming keys")
     bad = getattr(cfgmod, "ConfigError", None)
@@ -288,8 +342,14 @@ def case_rejects_bad_values() -> None:
         ({"power": {"gradient_max_w": 50}}, "power.gradient_max_w"),
         ({"power": {"gradient_min_w": 900, "gradient_max_w": 100}}, "power.gradient_max_w"),
         ({"power": {"base_w": inf}}, "power.base_w"),
+        ({"power": {"require_complete": "yes"}}, "power.require_complete"),
+        ({"power": {"require_complete": None}}, "power.require_complete"),
+        ({"power": {"max_age_s": -1}}, "power.max_age_s"),
+        ({"power": {"max_age_s": "8s"}}, "power.max_age_s"),
         ({"night": {"mode": "sometimes"}}, "night.mode"),
         ({"night": {"strength": 1.5}}, "night.strength"),
+        ({"night": {"hold_grace_s": -1}}, "night.hold_grace_s"),
+        ({"night": {"hold_grace_s": "15min"}}, "night.hold_grace_s"),
         ({"game": "yes"}, "game:"),
         ({"game": {"detection": "yes"}}, "game.detection"),
         ({"game": {"processes": "game.exe"}}, "game.processes"),
@@ -353,6 +413,7 @@ def main() -> int:
                case_enter_time_changes_behaviour, case_gpu_score_changes_behaviour,
                case_non_game_override_changes_behaviour, case_heuristic_off,
                case_burnin_consumers, case_render_consumers,
+               case_power_and_night_knobs_reach_consumers,
                case_rejects_bad_values, case_last_known_good):
         try:
             fn()

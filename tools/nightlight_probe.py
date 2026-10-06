@@ -28,6 +28,16 @@ read) has to keep exactly one of each:
 * `NightLight.lut(strength, temp_k)` renders the *effective* temperature the
   planner resolved; it makes no temperature decision of its own (issue #53).
   `gamma_gains()` returns a `RampReading`, never a bare tuple.
+
+A third contract is about *sequence*, not one read (#68): the gamma ramp may only
+take back the appearance the ramp itself published. Warm → neutral → warm, driven
+through `_read` with `gamma_gains` replaced, must publish ON → OFF → ON; an
+unreadable ramp must hold the last confirmed look instead; and a confirmed
+Windows answer must survive a neutral ramp untouched. The defect lived in the
+order of reads — the neutral read succeeded, changed nothing, and `_hold`
+re-published the previous warm appearance — so a test of one reading at a time
+could not have seen it, and the assertions below run the real sequence the poll
+loop runs.
 """
 import argparse
 import sys
@@ -35,6 +45,7 @@ import time
 
 sys.path.insert(0, ".")          # our tree first: vendor has its own main.py
 from app import config as cfgmod                  # noqa: E402
+from app import lights as lights_mod              # noqa: E402
 from app import nightlight as nl                  # noqa: E402
 
 sys.stdout.reconfigure(errors="replace")
@@ -396,6 +407,128 @@ def selftest() -> int:
     check("a warmer effective temperature warms further",
           bare.lut(1.0, 2200)[767] < bare.lut(1.0, 2700)[767], True)
     check("no gains, no temperature → still nothing", bare.lut(1.0, None), None)
+
+    print("case: a neutral ramp clears the ramp-owned look, and only that (issue #68)")
+    # Warm and neutral are the SAME display measured twice, which is the live
+    # shape: f.lux and LightBulb write the ramp, so a neutral reading is the
+    # user having turned their warmer off. The gains below are the shape
+    # `gamma_gains()` returns (peak-normalised mid-tones).
+    warm = nl.RampReading((1.0, 0.72, 0.55), r"\\.\DISPLAY1", None)
+    neutral = nl.RampReading((1.0, 0.99, 0.98), r"\\.\DISPLAY1", None)
+    unreadable = nl.RampReading(None, None, "no active display device")
+    check("a measured neutral carries gains and no reason",
+          (neutral.gains is not None, neutral.reason), (True, None))
+    check("an unreadable ramp carries the reason and no gains",
+          (unreadable.gains, bool(unreadable.reason)), (None, True))
+
+    real_ramp = nl.gamma_gains
+
+    # `fake_night(None, None)` has no CloudStore state at all, so `on is None`
+    # on every read below and the ramp is the only voice in the room - exactly
+    # the path the defect was on. `gamma_gains` is the module global `_read`
+    # calls, so replacing it drives the real method, not a copy of its logic.
+    n = fake_night(None, None)
+
+    def read_ramp(reading, t):            # noqa: ANN001, ANN202
+        nl.gamma_gains = lambda *a, **k: reading
+        n._read(t)
+
+    # The render side, taken from the one place `night.on` becomes a brightness
+    # and a LUT (`lights.LightPlanner`): an appearance that was cleared has to
+    # change what the panel draws, or "the look went away" is only a log line.
+    panel_cfg = {"display": {"brightness_idle": 45, "brightness_game": 70,
+                             "brightness_dim": 12, "dim_after_s": 300,
+                             "screen_off_after_min": 45, "stay_lit_in_game": True},
+                 "night": {"mode": "auto", "strength": 1.0, "color_temp_k": 0,
+                           "brightness_scale": 0.55, "brightness_floor": 8},
+                 "power": {}}
+    planner = lights_mod.LightPlanner(panel_cfg, night=n)
+
+    def panel():                          # noqa: ANN202
+        plan = planner.tick("idle", 0.0, 1.0)
+        return plan.brightness, plan.lut
+
+    # The Windows side of the same question: a state blob that says ON, and a
+    # neutral ramp that must not touch it.
+    w_blobs = {nl._STATE_KEY: LIVE_STATE_ON}
+    w = nl.NightLight({"night": {"check_gamma_ramp": True}}, refresh_s=0.0)
+    w._blob = lambda key: w_blobs.get(key)
+    try:
+        read_ramp(warm, 1.0)
+        check("warm ramp: the ramp owns the look", (n.on, n.source), (True, "ramp"))
+        check("with the measured gains the night LUT renders from",
+              n.gains, warm.gains)
+        check("and the detail names the warm measurement", "warm" in n.detail, True)
+        bright, lut = panel()
+        check("panel side: night ON dims the panel and pushes a LUT",
+              (bright, lut is not None), (25, True))
+        check("... the ramp's own LUT, not a colour-temperature one",
+              lut[767], nl.gains_lut(warm.gains, 1.0)[767])
+
+        read_ramp(neutral, 2.0)
+        check("the same display measured neutral: night goes OFF",
+              (n.on, n.source), (False, "ramp"))
+        check("the detail says the ramp cleared its own look",
+              "cleared the ramp-owned appearance" in n.detail, True)
+        check("and says it was a measurement, not a failure to measure",
+              ("neutral (measured)" in n.detail, "unreadable" in n.detail),
+              (True, False))
+        check("the measured gains go with it", n.gains, None)
+        check("it is a confirmed OFF, not a hold", n.stale, False)
+        bright, lut = panel()
+        check("panel side: brightness comes back and the LUT is dropped",
+              (bright, lut is None), (45, True))
+
+        read_ramp(warm, 3.0)
+        check("turning it back on: ON again, from the ramp",
+              (n.on, n.source, n.gains), (True, "ramp", warm.gains))
+        bright, lut = panel()
+        check("panel side: dimmed and warm again",
+              (bright, lut is not None), (25, True))
+
+        read_ramp(unreadable, 4.0)
+        check("an UNREADABLE ramp still holds the warm look - never an OFF",
+              (n.on, n.source, n.stale), (True, "ramp", True))
+        check("and says it could not ask the display",
+              "ramp unreadable" in n.detail, True)
+        bright, lut = panel()
+        check("panel side: the held look keeps its brightness and its LUT",
+              (bright, lut is not None), (25, True))
+
+        read_ramp(neutral, 5.0)
+        check("a later measured neutral still clears it",
+              (n.on, n.source), (False, "ramp"))
+
+        # Startup is the fourth shape: nothing to hold yet, so a *measured*
+        # neutral and a failed read must not collapse into the same answer.
+        fresh_n = fake_night(None, None)
+        nl.gamma_gains = lambda *a, **k: neutral
+        fresh_n._read(0.5)
+        check("a neutral ramp at startup is unknown, not an OFF",
+              (fresh_n.on, fresh_n.source), (None, "unknown"))
+        check("... and its detail still reports the measurement",
+              "neutral (measured)" in fresh_n.detail, True)
+        blind_n = fake_night(None, None)
+        nl.gamma_gains = lambda *a, **k: unreadable
+        blind_n._read(0.5)
+        check("... while an unreadable ramp at startup carries the reason",
+              (blind_n.on, "neutral (measured)" in blind_n.detail,
+               "ramp unreadable" in blind_n.detail), (None, False, True))
+
+        # A confirmed Windows answer is not the ramp's to clear: the effective
+        # state says ON, and the published appearance came from Windows.
+        nl.gamma_gains = lambda *a, **k: neutral
+        w._read(1.0)
+        check("Windows' own ON is the published look",
+              (w.on, w.source), (True, "windows"))
+        check("a neutral ramp adds no warmth to it", w.gains, None)
+        check("and is not allowed to clear it", w.appearance.source, "windows")
+        w_blobs.clear()               # CloudStore goes unreadable mid-poll
+        w._read(2.0)
+        check("a windows-owned look is not the ramp's business: it holds, ON",
+              (w.on, w.source, w.stale), (True, "windows", True))
+    finally:
+        nl.gamma_gains = real_ramp
 
     print("case: the warm LUT is a colour temperature, not a hue tint")
     g65 = nl.temp_gains(6500)

@@ -68,7 +68,12 @@ class DiagMonitor(FrameMonitor):
                 echo("  " + ",".join(row))
                 echo(f"  {len(row)} columns; ProcessID at {idx['ProcessID']}")
                 continue
-            self._ingest(row, idx)
+            # The generation is passed explicitly rather than defaulted away: `_ingest`
+            # refuses to publish into a retired generation, and a diagnostic that
+            # silently opted out of that fence would be the one caller able to
+            # repopulate rings a `restart()` had just cleared — the very hole (#13)
+            # the fence exists to close.
+            self._ingest(row, idx, gen)
             if len(self.raw_rows) < 8:
                 self.raw_rows.append(line)
                 echo(f"  [row] {line[:260]}")

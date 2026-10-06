@@ -322,6 +322,11 @@ class Engine:
         self.reloaded_at: float | None = None
         self.render_ms = 0.0
         self.error: str | None = None
+        # Why the last `config.yaml` (or `--config`) edit was refused, and empty when
+        # it was accepted. Kept apart from `error` because `step()` clears that one on
+        # every successful tick, and a validity complaint that disappears a second
+        # later is one a person never reads (#20).
+        self.reload_problems: list[str] = []
         self.started = time.time()
         # watch the config that was actually requested: cfg["_root"] is always
         # the repo, so a custom --config file would otherwise load once and
@@ -387,15 +392,28 @@ class Engine:
         demo_changed = Path(demo_mod.__file__) in changed
 
         # stage the candidate config before anything is touched: invalid YAML
-        # must not churn the module chain, let alone half-apply itself
+        # must not churn the module chain, let alone half-apply itself.
+        #
+        # `load_or_keep` is what decides — the same last-known-good rule the app's
+        # own reload guard exists for (#20). It returns the candidate with no
+        # problems, or the previous good config with the reasons it refused, so a
+        # bad edit in `config.yaml` (a zeroed interval, a brightness out of range,
+        # a geometry that is not this panel) is *reported* rather than allowed to
+        # reach the layout — which is what `self.error = None` at the end of a
+        # successful `step()` used to hide. A config that walks an invalid value
+        # into the render path is the failure this branch of #20 is about, and a
+        # validity error that survives exactly one tick is barely better.
         fresh = None
+        problems: list[str] = []
         if cfg_changed:
-            try:
-                fresh = cfgmod.load(str(self._cfg_path))
-            except Exception as e:  # noqa: BLE001
-                raise RuntimeError(
-                    f"config reload failed ({e.__class__.__name__}: {e}); "
-                    f"keeping the previous config") from None
+            fresh, problems = cfgmod.load_or_keep(str(self._cfg_path))
+            if problems:
+                self.reload_problems = problems
+                print("[liveview] config edit refused: "
+                      + "; ".join(problems)
+                      + " — the previous generation keeps rendering")
+            else:
+                self.reload_problems = []
 
         # reload the whole chain in dependency order whenever anything changed:
         # each module keeps direct references to the ones before it, so a partial
@@ -586,6 +604,9 @@ class Engine:
                 "trends": bool(self.cfg["layout"].get("trend_bands", True)),
                 "frames": self.frames_info,
                 "error": self.error, "uptime_s": round(time.time() - self.started, 1),
+                # Sticky separate from `error`: see `reload_problems`. The page shows
+                # it until a valid edit lands, which is the point of keeping it.
+                "config_problems": list(self.reload_problems),
                 "watched": len(self.watch),
             }
 

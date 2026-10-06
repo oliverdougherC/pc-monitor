@@ -268,6 +268,14 @@ SCHEMA = {
         "gradient_min_w": ("num", None, None),
         "gradient_max_w": ("num", None, None),
         "gradient_gamma": ("pos",),
+        # Documented in config.yaml, read by app/power.py, and absent from this
+        # table until issue #20 — so `require_complete: "yes"` (a truthy *string*,
+        # which `bool()` happily reads as True) and a negative age both merged
+        # silently and reached `estimate()`. A negative `max_age_s` is the one
+        # that never recovers: every snapshot is older than it, so the strip is
+        # permanently "stale" and the number can never be trusted again.
+        "require_complete": ("bool",),
+        "max_age_s": ("nonneg",),
         "follow_sleep": ("bool",),
         "follow_lock": ("bool",),
         "follow_display": ("bool",),
@@ -280,6 +288,12 @@ SCHEMA = {
         "strength": ("num", 0, 1),
         "color_temp_k": ("nonneg",),
         "schedule": ("str_or_none",),
+        # Read by `NightLight.__init__` and missing from this table until issue
+        # #20: `float()` there turned a `"15min"` into a ValueError out of the
+        # constructor, and a negative value made the first blind poll look like an
+        # expired grace period. Same "nonneg" rule as every other timer (0 = the
+        # hold expires immediately, which is a legitimate choice, not a typo).
+        "hold_grace_s": ("nonneg",),
         "brightness_scale": ("num", 0, 1),
         "brightness_floor": ("int", 0, 100),
         "check_gamma_ramp": ("bool",),

@@ -486,24 +486,53 @@ class NightLight:
                 det = f"{det}; night mode unavailable"
         # Second opinion: the gamma ramp the OS is actually applying. Night light
         # does not touch it on this build, but f.lux and friends do, and the ask was
-        # to follow the user's night mode however they run it. Only ever *adds* an
-        # on — a neutral ramp never overrides a registry that says warm, because that
-        # is the normal Windows case and the registry is the better source there.
+        # to follow the user's night mode however they run it. A warm ramp may turn
+        # night on; a neutral one must never override a registry that says warm,
+        # because that is the normal Windows case and the registry is the better
+        # source there.
+        #
+        # A neutral ramp does have one job, and it is the other half of "only ever
+        # adds an on" (#68): the ramp may take back the look the ramp itself gave.
+        # Warm → neutral is the user turning f.lux or LightBulb off, and the only
+        # place that is visible is here with `on is None` — Windows has said nothing,
+        # so nothing else in this method will ever end that appearance. Before the
+        # fix the successful neutral read changed nothing and fell through to
+        # `_hold`, which re-published the previous *warm* appearance on every poll:
+        # the panel stayed dim and amber after the user had turned night mode off,
+        # and each fresh measurement renewed the hold instead of ending it.
         gains = None
+        ramp_cleared = False
         if mode == "auto" and bool(self.cfg.get("check_gamma_ramp", True)):
             ramp = gamma_gains()
             if ramp.gains is not None:
                 r, _g, b = ramp.gains
                 warm = (r - b) >= float(self.cfg.get("ramp_warm_margin", 0.12))
                 gains = ramp.gains if warm else None
-                det += f"; ramp {ramp.device} r/b={r:.2f}/{b:.2f}{' warm' if warm else ''}"
+                # "neutral (measured)" is spelled out: a bare r/b pair next to the
+                # unreadable line below was the one detail string a skim could not
+                # tell apart, and the two claims could not be further apart.
+                det += (f"; ramp {ramp.device} r/b={r:.2f}/{b:.2f} "
+                        f"{'warm' if warm else 'neutral (measured)'}")
                 if warm and not on:
                     on, src = True, "ramp"
+                elif (not warm and on is None and self.appearance is not None
+                      and self.appearance.source == "ramp"):
+                    # Ramp-owned appearance, a successful neutral measurement, and
+                    # no other source with an opinion: the ramp has withdrawn the
+                    # evidence it published, so its look goes OFF with it. A
+                    # confirmed Windows ON never reaches here (`on` is not None),
+                    # and a Windows-owned appearance fails the source test, so
+                    # neither can be cleared by a neutral ramp.
+                    on, src, ramp_cleared = False, "ramp", True
+                    det += "; the neutral ramp cleared the ramp-owned appearance"
             else:
                 # "the display is neutral" and "the display could not be asked"
                 # are different claims; only the first one is evidence. `ramp`
                 # is the ONE gamma-ramp return contract here (`RampReading`, see
                 # `gamma_gains`): nothing in this module may unpack a bare tuple.
+                # `gains is None` on this path is deliberate — an unreadable ramp
+                # carries a reason instead of a measurement, so it can never take
+                # the OFF branch above and still holds the last confirmed look.
                 det += f"; ramp unreadable ({ramp.reason})"
         if on is None:
             # Nothing this poll can say for certain: keep the last confirmed
@@ -512,11 +541,14 @@ class NightLight:
             # evening, from a store that was merely mid-rewrite.
             self._hold(now, det)
             return
-        if temp is None and self.appearance is not None and self.appearance.temp_k:
+        if (temp is None and not ramp_cleared and self.appearance is not None
+                and self.appearance.temp_k):
             # A settings-only failure: the state is fresh, the warmth is not.
             # Carry the warmth from the last appearance that had one, and say
             # where it came from - the alternative is the panel dimming with
             # no warm LUT at all, which is neither look the user asked for.
+            # A ramp-cleared OFF is excluded: it renders no warmth at all, so a
+            # sentence about held warmth would describe a look nobody gets.
             temp = self.appearance.temp_k
             det += "; warmth held from the last settings read"
         self._publish(NightAppearance(bool(on), temp, gains, src, det,

@@ -343,7 +343,10 @@ class FrameMonitor:
         self._pid_t: dict[int, float] = {}                    # pid → last event qpc-ms
         self._held: dict[int, tuple] = {}                     # pid → (last live stats, mono)
         self._last_t = 0.0                                    # newest qpc-ms seen
-        self._last_row = 0.0      # monotonic time of the last data row (liveness)
+        self._last_row = 0.0      # monotonic time of the last data row *of any kind*
+                                  # — diagnostics only. The freshness clock is
+                                  # _last_parse: rows that keep arriving but never
+                                  # parse are pipe activity, not a measurement
         self._spawned = 0.0       # monotonic time of the successful spawn
         self._streak = 0          # consecutive early exits, drives the backoff
         self._restart_req = False
@@ -779,15 +782,19 @@ class FrameMonitor:
         self._restart_req = True
         # The generation is what makes "both go" stick: the reader thread may
         # still be handing over the dead child's last buffered rows, and those
-        # belong to the capture this call just threw away.
-        self._gen += 1
+        # belong to the capture this call just threw away. The bump happens
+        # *inside* the lock, together with the clear it justifies, because `_gen`
+        # is what every other writer fences against (see _gen_live): moved
+        # outside, a query could pass the fence, lose the race to this clear and
+        # then publish its held value into the generation that replaced it.
         with self._lock:
+            self._gen += 1
             self._rings.clear()
             self._pids.clear()
             self._pid_t.clear()
+            self._held.clear()
         self.rows = self.parsed = self.bad_rows = 0
         self._bad = []
-        self._held.clear()
         self._last_t = 0.0
         self.ok = False
         proc = self._proc
@@ -799,13 +806,35 @@ class FrameMonitor:
         if reason:
             self.error = f"restarting capture after {reason}"
 
+    def _gen_live(self, gen: int | None) -> bool:
+        """Is `gen` still the current capture generation?
+
+        Call this with `self._lock` held, and that is the whole point of it: an
+        outer generation check and the mutation it guards are separated by a
+        parse (and by whatever restart() did in the meantime), so the decision
+        and the write have to be taken together (issue #13 — the pre-check
+        alone let a paused reader publish into a capture that had already been
+        retired). `None` is the replay case — see `_read_stream` — where there
+        is no capture behind the rows and therefore nothing to be stale.
+        """
+        return gen is None or gen == self._gen
+
     def _read_stream(self, proc: subprocess.Popen, gen: int | None = None) -> None:
         """Ingest one child's CSV until EOF. `gen` is the capture generation the
         child belongs to: rows from a superseded generation are dropped whole,
         because restart() has already decided that child is history. Without
         the gate, the last buffered presents of a killed child land in the
-        rings the restart just cleared, and that child's header flips `ok`
-        back on for a stream that no longer exists."""
+        rings the restart just cleared, and that child's header rewrites the
+        counters of a stream that no longer exists.
+
+        The gate is therefore checked twice per row: once here, before the
+        parse, and again *inside* the lock, beside every mutation. Once is a
+        race, not a guard — restart() can retire the generation while the row
+        is being parsed, and the row then publishes into the capture it just
+        threw away. `gen is None` means "no generation to fence against": a
+        file replayed through this same code path (tools/frames_diag.py) has no
+        capture behind it.
+        """
         stream = io.TextIOWrapper(proc.stdout, encoding="utf-8-sig",
                                   errors="replace", newline="")
         reader = csv.reader(stream)
@@ -822,22 +851,27 @@ class FrameMonitor:
                 # The header is the only thing that proves the stream is ours:
                 # keep it, because "rows arrive but the panel is --" is a
                 # column-name question and this is the evidence that answers it.
-                idx = {name: i for i, name in enumerate(row)}
-                self.header = row
-                # …but it does not prove the stream is *usable*. `ok` used to
-                # latch on seeing ProcessID alone, so a header without the
-                # millisecond clock — a stream that can never produce a number —
-                # reported as live forever. Health follows evidence of parsed
-                # frames from here on, and the supervisor restarts on the rest.
-                self._schema_bad = _TIME_COL not in idx
-                self.ok = not self._schema_bad
-                self.error = None
+                names = {name: i for i, name in enumerate(row)}
+                with self._lock:
+                    if not self._gen_live(gen):
+                        return    # a restart retired us while the row was parsed
+                    idx = names
+                    self.header = row
+                    # …but a header does not prove the stream is *usable*. `ok`
+                    # used to latch here on ProcessID alone, so a header without
+                    # the millisecond clock — a stream that can never produce a
+                    # number — reported as live forever, and so did a header
+                    # whose rows never arrive at all (issue #10: main.py reads
+                    # `ok` as "presentmon session live" / `capture=live`, so a
+                    # header with zero parsed rows read as a live session for
+                    # the whole schema/silence deadline). Health now follows
+                    # evidence of parsed frames — the first row below that
+                    # survives _ingest — and the supervisor's own deadlines
+                    # cover the no-row cases in the meantime.
+                    self._schema_bad = _TIME_COL not in idx
+                    self.error = None
                 continue
-            self.rows += 1
             now = time.monotonic()
-            if self._first_row == 0.0:
-                self._first_row = now
-            self._last_row = now
             # One bad row is a row, not a stream fault: reject it individually
             # and keep reading. An IndexError used to escape _ingest from the
             # row it had only half-validated (pid and time by, SwapChainAddress
@@ -845,19 +879,45 @@ class FrameMonitor:
             # supervisor's unbounded wait inherited the wedge - a truncated
             # line could end the capture for the rest of the session.
             try:
-                ok = self._ingest(row, idx)
+                ok = self._ingest(row, idx, gen)
                 why = None
             except Exception as e:  # noqa: BLE001 - isolate the row, keep the stream
                 ok, why = False, repr(e)
-            if ok:
-                self._last_parse = now
-                self.silent_busy_s = 0.0   # usable row: the silence window restarts
-            else:
-                self.bad_rows += 1
-                if len(self._bad) < _BAD_SAMPLES:
-                    self._bad.append(((why + " ") if why else "") + ",".join(row)[:160])
+            with self._lock:
+                # Same fence, same lock, next to the next mutation: the row
+                # counters are as much a publication as the ring _ingest wrote.
+                if not self._gen_live(gen):
+                    return
+                self.rows += 1
+                if self._first_row == 0.0:
+                    self._first_row = now
+                self._last_row = now
+                if ok:
+                    self._last_parse = now
+                    self.silent_busy_s = 0.0   # usable row: the silence window restarts
+                    self.ok = True             # health follows a parsed row, never a header
+                else:
+                    self.bad_rows += 1
+                    if len(self._bad) < _BAD_SAMPLES:
+                        self._bad.append(((why + " ") if why else "") + ",".join(row)[:160])
 
-    def _ingest(self, row: list[str], idx: dict[str, int]) -> bool:
+    def _ingest(self, row: list[str], idx: dict[str, int],
+                gen: int | None) -> bool:
+        """Ring one parsed row. `gen` is the caller's capture generation, and it
+        is re-checked under the lock below — the caller's own check happened
+        before the parse, and restart() may have retired this capture since.
+        Without the re-check the row repopulated the rings restart() had just
+        cleared; the proof in issue #13 was `m.restart("verify")` followed by a
+        direct `m._ingest(old_row, idx)`, which left rings=1, pids=1 and
+        _last_t=1000000.0.
+
+        `gen` has no default on purpose. With one, the fence was opt-out: any
+        caller that simply forgot the argument published unfenced, which is the
+        exact shape of the #13 hole. Passing `None` is still allowed and still
+        means "no generation to fence against" — but it has to be *said*, and
+        the one caller that says it (the file replay in tools/frames_diag.py)
+        passes its real generation instead.
+        """
         # Time by name, never by position: the pre-name-lookup version read
         # row[-1], which on this header is MsClickToPhotonLatency — a mostly-empty
         # unrelated column, which is how "fps never appears" survived as long as
@@ -908,6 +968,13 @@ class FrameMonitor:
             mode = 1 if m in _MODE_EXCLUSIVE else 0
         now = time.monotonic()
         with self._lock:
+            # The generation is re-checked *here*, where the mutation is, and
+            # this is the clause issue #13 was missing: the caller's outer check
+            # ran before the parse above, so a restart that landed in between
+            # used to be published over — rings, pids, _pid_t and _last_t all
+            # committed into a generation that had already been thrown away.
+            if not self._gen_live(gen):
+                return False
             self.parsed += 1
             self._last_t = max(self._last_t, t)
             name = row[idx["Application"]] if "Application" in idx else "?"
@@ -1046,7 +1113,7 @@ class FrameMonitor:
             # the warning is logged once instead of scrolling the log.
             said = self._out[0] if self._out else "printed nothing at all"
             return (f"[frames] no rows from presentmon for {_STREAM_SILENT_S:.0f}+ s of "
-                    f"rendering (header={'yes' if self.ok else 'no'}, "
+                    f"rendering (header={'yes' if self.header else 'no'}, "
                     f"args: {' '.join(self.last_args)}); child said: {said[:200]} — "
                     f"frame stats stay -- and present-based detection is off; this "
                     f"clears on a reboot when the OS graphics-telemetry path is "
@@ -1200,8 +1267,13 @@ class FrameMonitor:
             return {}
         # Nobody is presenting anything at all if the stream itself has been quiet:
         # on a desktop that has gone still, DWM stops too, and without this the last
-        # known frame rates would keep looking live forever.
-        if time.monotonic() - self._last_row > 3.0:
+        # known frame rates would keep looking live forever. The clock is
+        # `_last_parse`, not `_last_row`: a pipe that keeps delivering rows nothing
+        # can be parsed from is not a measurement, and gating on arrival kept a
+        # process listed as a presenter long after its frames stopped being
+        # measured (issue #13). "Is anything rendering" is the other question,
+        # and `observe()`/`silent_busy_s` is what answers it.
+        if time.monotonic() - self._last_parse > 3.0:
             return {}
         floor = self.min_fps if min_fps is None else float(min_fps)
         with self._lock:
@@ -1230,9 +1302,20 @@ class FrameMonitor:
         `--`. Holding is the honest middle: a game you tabbed out of has not stopped
         having a frame rate, and inventing one, or dropping to `--` the instant the
         window loses focus, are the two wrong answers here.
+
+        The freshness clock here is `_last_parse`, not `_last_row`: a stream that
+        keeps delivering rows nothing can be parsed from is pipe activity, and
+        ageing by arrival left `fps=60.0, stale=False, age=0.00s` on the panel for
+        a process that had not been measured for minutes (issue #13). `_last_row`
+        still exists, for diagnostics and for the stream-silence question.
         """
         if not self.ok or pid is None:
             return None
+        # The generation this query answers for. `_held` is a publication like any
+        # other, so it is written under the same fence as `_read_stream`'s: a query
+        # that began against a generation a restart has since retired must not hand
+        # the cleared capture a held value from the one it replaced.
+        gen = self._gen
         hold = float(self.hold_s)
         with self._lock:
             rows = self._best(pid, self.window_s)
@@ -1248,24 +1331,28 @@ class FrameMonitor:
                                   stale=True, age_s=time.monotonic() - held[1],
                                   gpu_pct=out.gpu_pct)
             with self._lock:
-                self._held.pop(pid, None)
+                if self._gen_live(gen):
+                    self._held.pop(pid, None)
             return None
         newest_t = rows[0][0]
         newest_mono = rows[0][3]
         # Two gaps, both needed, and neither alone is enough: how far this process's
         # newest frame is behind the newest frame *in the stream* (a game that went
         # quiet while everything else keeps presenting), and how long it has been
-        # since anything at all arrived (the whole stream stopped). Both are in the
-        # stream's own clock or the child's arrival time, so a replayed CSV ages the
-        # same way a live one does.
+        # since the last row we could actually parse — not since the last row that
+        # merely arrived, which a pipe full of unparseable rows keeps fresh forever.
+        # Both are in the stream's own clock or in the child's arrival time, so a
+        # replayed CSV ages the same way a live one does.
         age = max(0.0, (self._last_t - newest_t) / 1000.0) \
-            + max(0.0, time.monotonic() - self._last_row)
+            + max(0.0, time.monotonic() - self._last_parse)
         if age > hold:
             # The ring still remembers this process for `window_s`, but a number that
             # old is not a held measurement, it is a memory — and the panel has no way
             # to say "this was true 20 seconds ago" in the space it has. `--` is the
             # honest answer, and `hold_s` is the knob that decides where that line is.
-            self._held.pop(pid, None)
+            with self._lock:
+                if self._gen_live(gen):
+                    self._held.pop(pid, None)
             return None
         fps, ms, gpu, _excl = self._summarise(rows)
         between = [r[1] for r in rows if r[1] is not None]
@@ -1274,5 +1361,9 @@ class FrameMonitor:
         out = FrameStats(fps=fps if fps > 0 else None, low1_pct=low1, low01_pct=low01,
                          latency_ms=ms, stale=age > _FRESH_S, age_s=age, gpu_pct=gpu)
         if age <= _FRESH_S:
-            self._held[pid] = (out, newest_mono)   # the last thing that was live
+            # Under the lock, and only while the generation this measurement was
+            # taken from is still the current one (see `gen` above).
+            with self._lock:
+                if self._gen_live(gen):
+                    self._held[pid] = (out, newest_mono)   # the last thing that was live
         return out

@@ -21,8 +21,10 @@ window and a synthetic stream clock, and asserts what the panel would have shown
                   entry floor; a loading gap does not count against it either;
                   `present_detection: false` holds the same contract as entering;
                   a configured `game.processes` name enters and holds without any
-                  ETW at all; and a presenting pid whose identity no longer
-                  matches the lock cannot inherit it
+                  ETW at all; a configured name holds with the window heuristic
+                  *off* too, so the panel does not flip idle↔game every
+                  `exit_after_s`; and a pid whose identity no longer matches the
+                  lock cannot inherit it, whether or not a present stream exists
 
 Pids are chosen so the liveness rule can be exercised both ways: the alive game is
 this test process (guaranteed to exist), the dead one is a pid nobody can own.
@@ -452,11 +454,90 @@ def case_pid_reuse(cfg) -> None:
     check("no target left", w.game_pid, None)
 
 
+def case_configured_no_heuristic(cfg) -> None:
+    print("case: a configured game with fullscreen_heuristic off must not oscillate")
+    # Issue #21(a), measured before the fix: with the heuristic off and
+    # `present_detection: false` the *entry* rule still promoted the foreground
+    # configured process to STRONG, but the held rule counted silence and let go —
+    # transitions [(0,'idle'),(1,'game'),(26,'idle'),(28,'game'),(53,'idle'),
+    # (55,'game')], switches=3 over 80 ticks. Entry and hold disagreeing about the
+    # same fact is the boundary where the panel flickers, so the assertion has to be
+    # about the whole run: how many times it switched, and where it ended up.
+    c = dict(cfg)
+    c["game"] = dict(cfg["game"])
+    c["game"]["processes"] = ["mygame.exe"]
+    c["game"]["fullscreen_heuristic"] = False
+    c["game"]["present_detection"] = False
+    m, s, w = new_pair(c)
+    m.ok = False                       # no capture: the heuristic was the only other way
+    fg(ALIVE, "mygame.exe", covers=False, borderless=False)   # windowed, not fullscreen
+    states = [tick(w, m) for _ in range(80)]
+    entered_at = (states.index("game") + 1) if "game" in states else -1
+    check("enters on the name alone, on the strong clock", 1 <= entered_at <= 3, True)
+    check("still game mode 80 s later", states[-1], "game")
+    check("never left after entry", set(states[entered_at:]), {"game"})
+    check("locked once: no idle↔game oscillation", w.switches, 1)
+    check("and it is the configured process", w.game_pid, ALIVE)
+    check("the capture really was unavailable", m.ok, False)
+
+
+def case_pid_reuse_no_capture(cfg) -> None:
+    print("case: a reused pid cannot hold the lock without a capture")
+    # Issue #21(b): the present-stream path has always checked identity (case above);
+    # the two no-capture hold paths did not — measured, after reuse was simulated:
+    # eight further ticks still reported `game` under the old pid. Both shapes are
+    # exercised, because the no-capture path has two ways to accept a live pid.
+    # Shape 1 — the configured name, with the window heuristic off.
+    c = dict(cfg)
+    c["game"] = dict(cfg["game"])
+    c["game"]["processes"] = ["mygame.exe"]
+    c["game"]["fullscreen_heuristic"] = False
+    c["game"]["present_detection"] = False
+    m, s, w = new_pair(c)
+    m.ok = False
+    fg(ALIVE, "mygame.exe", covers=False, borderless=False)
+    for _ in range(4):
+        tick(w, m)
+    check("configured: in game mode", w.state, "game")
+    check("configured: identity recorded at lock", w._create_time is not None, True)
+    w._create_time -= 10_000.0        # Windows recycled the pid onto a stranger
+    n = 0
+    while w.state == "game" and n < 10:
+        tick(w, m)
+        n += 1
+    check("configured: released, not inherited", w.state, "idle")
+    check("configured: on the dead-exit clock", 2 <= n <= 5, True)
+    check("configured: no target left", w.game_pid, None)
+
+    # Shape 2 — the window heuristic, where `_window_holds` is the one saying yes: the
+    # target is still the foreground process and its window still covers the monitor
+    # with the GPU busy, so only the identity check can tell that the pid is a stranger.
+    c2 = dict(cfg)
+    c2["game"] = dict(cfg["game"])
+    c2["game"]["present_detection"] = False
+    m2, s2, w2 = new_pair(c2)
+    m2.ok = False
+    fg(ALIVE, "oldgame.exe")
+    for _ in range(8):
+        tick(w2, m2)
+    check("heuristic: entered on the window evidence", w2.state, "game")
+    check("heuristic: identity recorded at lock", w2._create_time is not None, True)
+    w2._create_time -= 10_000.0
+    n = 0
+    while w2.state == "game" and n < 10:
+        tick(w2, m2)
+        n += 1
+    check("heuristic: released, not inherited", w2.state, "idle")
+    check("heuristic: on the dead-exit clock", 2 <= n <= 5, True)
+    check("heuristic: no target left", w2.game_pid, None)
+
+
 def main() -> int:
     cfg = cfgmod.load(None)
     for fn in (case_enter_fast, case_alt_tab, case_quit, case_video, case_ourselves,
                case_switch, case_legacy, case_low_fps_holds, case_loading_gap,
-               case_present_detection_off, case_configured, case_pid_reuse):
+               case_present_detection_off, case_configured, case_pid_reuse,
+               case_configured_no_heuristic, case_pid_reuse_no_capture):
         fn(cfg)
         print()
     print("SELFTEST PASSED" if not fails else f"SELFTEST FAILED: {fails}")
