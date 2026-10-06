@@ -584,6 +584,90 @@ def case_nvml_reference_balance() -> None:
             sys.modules.pop("pynvml", None)
 
 
+def case_lhm_update_failure_is_not_a_healthy_scan() -> None:
+    """#17's residual clause: a driver that will not update is not an empty scan.
+
+    `LhmBackend._rescan` used to swallow `hw.Update()` with a `continue`. A driver that
+    had stopped answering therefore produced a perfectly normal return with every sensor
+    absent, `sample()`'s `else` reset the failure streak, and `_reopen_lhm()` — the only
+    repair this backend has — could never be reached for the one fault it exists for. The
+    case drives the real `LhmBackend` against a fake `Computer` whose hardware refuses to
+    update, and asserts both halves: the group is reported failed, and the rebuild is
+    reached once the streak fills.
+    """
+    print("case: a LibreHardwareMonitor driver that will not update reaches the rebuild (#17)")
+    import app.sensors.lhm as lhm_mod
+    from app.sensors.lhm import LhmBackend
+
+    class HW:
+        def __init__(self, name: str):
+            self.HardwareType = type("T", (), {"ToString": staticmethod(lambda: name)})()
+            self.SubHardware: list = []
+            self.Sensors: list = []
+
+        def Update(self):
+            raise RuntimeError("the ring0 driver stopped answering")
+
+    class Computer:
+        def __init__(self):
+            self.Hardware = [HW("Cpu"), HW("GpuNvidia")]
+
+        def Open(self): pass
+
+        def Close(self): pass
+
+    # Bypass `_open`'s DLL load entirely: what is under test is the walk and the streak,
+    # not pythonnet's ability to find a file.
+    b = LhmBackend.__new__(LhmBackend)
+    real_psutil = None
+    from app.sensors.fallback import FallbackBackend
+    b._host = FallbackBackend(cfg())
+    b._c = Computer()
+    b._sensors = []
+    b._objs = []
+    b._lhm_fails = 0
+    b._update_fails = 0
+    b._reopen_after = 3
+    b._dll = ""
+    reopened: list[int] = []
+    b._reopen_lhm = lambda: reopened.append(1)
+    b.last_error = ""
+
+    try:
+        snap = Snapshot(ts=0.0, source="lhm")
+        b._rescan()
+        check("both hardware groups are counted as refusing",
+              b._update_fails, 2)
+        raised = None
+        try:
+            b._lhm_sample(snap)
+        except BaseException as e:  # noqa: BLE001 - the raise is the finding
+            raised = e
+        check("a driver that will not update raises out of the sample",
+              raised is not None, True)
+        check("and the reason names the driver",
+              "would not update" in str(raised), True)
+
+        # Now through `sample()`: the group is named failed, and the streak climbs until
+        # the rebuild is asked for. Before the fix this loop reported a clean sample
+        # every time and `_reopen_lhm` was never called.
+        calls = {"n": 0}
+
+        def counting_reopen():
+            calls["n"] += 1
+            reopened.append(1)
+
+        b._reopen_lhm = counting_reopen
+        for i in range(3):
+            s = Snapshot(ts=float(i), source="lhm")
+            b.sample(s)
+            check(f"tick {i}: the lhm group is named failed", "lhm" in s.failed, True)
+        check("the rebuild was reached", calls["n"] >= 1, True)
+        check("and the streak is what asked for it", b._lhm_fails >= b._reopen_after, True)
+    finally:
+        b.close()
+
+
 def main() -> int:
     if not preflight():
         print()
@@ -591,7 +675,8 @@ def main() -> int:
         return 1
     for fn in (case_ok, case_hold_and_blank, case_bounded, case_partial, case_nan,
                case_reopen, case_reopen_backoff, case_recover, case_close,
-               case_fallback_backend, case_nvml_reference_balance):
+               case_fallback_backend, case_nvml_reference_balance,
+               case_lhm_update_failure_is_not_a_healthy_scan):
         fn()
         print()
     print("SELFTEST PASSED" if not fails else f"SELFTEST FAILED: {fails}")

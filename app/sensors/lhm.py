@@ -43,6 +43,11 @@ class LhmBackend:
                                  "LibreHardwareMonitorLib.dll")
         self._reopen_after = max(1, int(cfg.get("sensors", {}).get("reopen_after", 3)))
         self._lhm_fails = 0
+        # Hardware groups that refused to update on the last walk (#17). Reset by every
+        # `_rescan`, read by `_lhm_sample`, which fails the group on a non-zero count so
+        # that a driver which has stopped answering reaches the rebuild instead of
+        # looking like a healthy scan that happens to report nothing.
+        self._update_fails = 0
         self._open()
 
     def _open(self) -> None:
@@ -73,12 +78,28 @@ class LhmBackend:
 
     # ------------------------------------------------------------------ walk
     def _rescan(self) -> None:
+        """Walk the hardware tree, and *say* when the driver would not update.
+
+        The failure that matters here is quiet: `hw.Update()` raising used to be
+        swallowed with a `continue`, so a driver that had stopped answering produced a
+        perfectly normal return with every sensor simply absent. `_lhm_sample` then
+        finished normally, `sample()`'s `else` reset the failure streak, and
+        `_reopen_lhm()` — the only repair this backend has — was unreachable for the one
+        fault it exists for. So the count of hardware groups that refused to update is
+        kept, and `_lhm_sample` fails the group on it.
+
+        A *sensor* that raises while being listed is still skipped: that is one missing
+        metric, not a dead driver, and losing the whole group for it would be the
+        opposite mistake.
+        """
         self._sensors.clear()
         self._objs.clear()
+        self._update_fails = 0
         for hw in self._c.Hardware:
             try:
                 hw.Update()
-            except Exception:
+            except Exception:  # noqa: BLE001 - counted, not swallowed
+                self._update_fails += 1
                 continue
             nodes = [hw] + list(hw.SubHardware)
             for node in nodes:
@@ -165,6 +186,15 @@ class LhmBackend:
 
     def _lhm_sample(self, snap: Snapshot) -> None:
         self._rescan()
+        if self._update_fails:
+            # Every group refused to update: this is the driver, not a metric. Raising
+            # here is what lets `sample()` count it, mark the group failed, and reach the
+            # rebuild — which is the repair a driver that has stopped answering needs.
+            # Returning normally instead produced an empty-but-successful scan and reset
+            # the streak that leads there.
+            raise RuntimeError(
+                f"LibreHardwareMonitor would not update {self._update_fails} hardware "
+                f"group(s); the driver is not answering")
         c, g = snap.cpu, snap.gpu
 
         v = self._vals(("Cpu",), "Load", ("cpu total",))
