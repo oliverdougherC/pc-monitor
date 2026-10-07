@@ -43,6 +43,7 @@ import main                                    # noqa: E402
 from app import config as cfgmod               # noqa: E402
 from app.burnin import SHIFTS, BurnIn          # noqa: E402
 from app.lights import LightPlan               # noqa: E402
+from app.nightlight import warm_lut            # noqa: E402 - a real warm LUT, not a stand-in
 
 fails: list[str] = []
 
@@ -177,6 +178,92 @@ def case_game_ends_it() -> None:
     check("the tick is not owned", not_owned, True)
     check("the sweep is gone, not waiting for the game to end",
           burn.exercise_progress(clock()), None)
+
+
+def case_wake_keeps_the_budget() -> None:
+    print("case: a wake mid-sweep keeps the one-frame-per-tick budget")
+    # #22 names a wake among the changes to inject mid-sweep, and a wake is the
+    # dark → lit edge: the displays time out (or the machine sleeps) and the next lit
+    # plan comes back *lit* with `repaint` set, because after dark the panel has to be
+    # re-told everything. The dark half is in `case_dark_ends_it` above — the exercise
+    # is abandoned, not paused half-rainbow'd. The wake half is the one that used to
+    # be able to push twice: the sweep's frame and the recovered telemetry frame
+    # underneath it. So the budget asserted here is the same one the normal tick pays.
+    burn, layout, pusher, g = _burn(), FakeLayout(), FakePusher(), _quiet_guard()
+    clock = _clock()
+    main.sweep_step(burn, layout, pusher, LIT, "idle", True, False, g, now=clock())
+    main.sweep_step(burn, layout, pusher, LIT, "idle", True, False, g, now=clock())
+    frames = len(pusher.pushed)
+    check("mid-sweep: two frames in", frames, 2)
+    for _ in range(2):
+        main.sweep_step(burn, layout, pusher, dark("monitor-off"), "idle", True, False, g,
+                        now=clock())
+    check("the dark tick took the sweep away, exactly as above",
+          burn.exercise_progress(clock()), None)
+    # The wake, as `LightPlanner.tick` produces it on the first lit tick after dark:
+    # lit, and `repaint` — which main.py turns into `pusher.invalidate`, a whole frame.
+    wake = LightPlan(dark=False, reason="lit", repaint=True)
+    per_tick, owned = [], []
+    for i in range(4):
+        before = len(pusher.pushed)
+        owned.append(main.sweep_step(burn, layout, pusher, wake if i == 0 else LIT,
+                                     "idle", True, False, g, now=clock()))
+        per_tick.append(len(pusher.pushed) - before)
+    check("the wake pushes no frame of its own", per_tick, [0, 0, 0, 0])
+    check("so it owns no tick it did not advance", owned, [False] * 4)
+    check("no bright catch-up frame after dark", len(pusher.pushed), frames)
+    check("and nothing further drawn for one", len(layout.sweeps), frames)
+    # The wake does not skip the interval, and an hour later the round is up again on
+    # the same lit panel: the wake restored the light, not a burst of animation, so
+    # the sweep resumes at exactly one frame per tick and owns exactly those ticks.
+    burn._last_exercise_end -= 3605.0
+    per_tick, owned = [], []
+    for _ in range(8):
+        before = len(pusher.pushed)
+        owned.append(main.sweep_step(burn, layout, pusher, LIT, "idle", True, False, g,
+                                     now=clock()))
+        per_tick.append(len(pusher.pushed) - before)
+    check("resumes at exactly one frame per call", per_tick[:6], [1] * 6)
+    check("owns exactly the ticks it advances on", owned[:6], [True] * 6)
+    check("never more than the normal per-tick budget", max(per_tick), 1)
+    check("and the resumed sweep still finishes", burn.exercise_progress(clock()), None)
+
+
+def case_night_change_keeps_the_sweep() -> None:
+    print("case: a night-mode change mid-sweep neither cancels nor duplicates it")
+    # The other mid-sweep change #22 names is night mode, and it is *not* a dark plan:
+    # `lights.tick` keeps the panel lit and rewrites how it looks — a warm LUT, capped
+    # brightness, `+night` on the reason — with `repaint` set because the colours
+    # changed. A lit plan must therefore never be read as "stop", and the LUT swap may
+    # not make the same tick push twice: the sweep's frame, then the re-warmed
+    # telemetry frame. Both halves are asserted on the same per-tick budget.
+    burn, layout, pusher, g = _burn(exercise_s=8.0), FakeLayout(), FakePusher(), _quiet_guard()
+    clock = _clock()
+    main.sweep_step(burn, layout, pusher, LIT, "idle", True, False, g, now=clock())
+    main.sweep_step(burn, layout, pusher, LIT, "idle", True, False, g, now=clock())
+    frames = len(pusher.pushed)
+    check("mid-sweep: two frames in", frames, 2)
+    lut = warm_lut(2700.0)
+    # The exact shape `lights.tick` returns for a lit night-mode tick: the daytime
+    # level capped by `brightness_scale`, `+night` appended to the reason, a resolved
+    # temperature and its LUT, and `repaint` because the colours moved.
+    night = LightPlan(dark=False, reason="lit+night", brightness=25, temp_k=2700,
+                      lut=lut, night=True, repaint=True)
+    check("the injected plan is lit, warm, and says so (+night)",
+          (night.dark, "+night" in night.reason, night.lut is not None), (False, True, True))
+    per_tick, owned = [], []
+    for i in range(6):
+        before = len(pusher.pushed)
+        owned.append(main.sweep_step(burn, layout, pusher, night if i == 0 else LIT,
+                                     "idle", True, False, g, now=clock()))
+        per_tick.append(len(pusher.pushed) - before)
+    check("one frame per call through the night change", per_tick, [1] * 6)
+    check("owned exactly on the ticks it advanced", owned, [True] * 6)
+    check("not cancelled: nothing was postponed", burn.postponed, 0)
+    check("no duplicate frame in the night tick itself", per_tick[0], 1)
+    check("one draw per push, so nothing is rendered twice",
+          len(layout.sweeps) - len(pusher.pushed), 0)
+    check("and the sweep runs to its planned end", burn.exercise_progress(clock()), None)
 
 
 def case_dead_link_is_not_pushed_into() -> None:
@@ -323,6 +410,7 @@ def main_run() -> int:
     print()
     if have:
         for fn in (case_one_frame_per_tick, case_dark_ends_it, case_game_ends_it,
+                   case_wake_keeps_the_budget, case_night_change_keeps_the_sweep,
                    case_dead_link_is_not_pushed_into,
                    case_recovery_hold_defers_the_sweep,
                    case_undrawable_is_not_retried,

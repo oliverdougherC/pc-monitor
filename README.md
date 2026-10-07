@@ -73,6 +73,7 @@ library reports SKIP, which is never counted as coverage):
 .venv\Scripts\python tools\sweep_selftest.py          # burn-in sweep: one frame per tick, and outranked
 .venv\Scripts\python tools\recovery_selftest.py       # bad morning: start-up, death, hang, budget
 .venv\Scripts\python tools\owned_process_selftest.py  # install/remove stops only what this install owns
+.venv\Scripts\python tools\control_plane_selftest.py   # a real --dump child leaves the app's owner record, stop request, heartbeat and stop marker byte-identical
 .venv\Scripts\python tools\env_check_selftest.py      # the dependency pin verifies; it does not bless what it finds
 .venv\Scripts\python tools\layout_check.py            # geometry at the value extremes, both states
 .venv\Scripts\python tools\liveview_selftest.py       # hot reload is transactional: bad edits roll back

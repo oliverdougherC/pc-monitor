@@ -245,6 +245,13 @@ def case_b_header_only_busy():
             c1 = h.child(0)
             c1.feed(header_line(V2_HEADER))
             check_true("header parsed", wait_for(lambda: bool(m.header), 3.0))
+            # A header is not health. `ok` used to latch the moment ProcessID was
+            # seen, and main.py reads it as "presentmon session live" /
+            # `capture=live` — so a capture that went on to parse nothing at all
+            # reported as a live session for the whole schema/silence deadline
+            # (issue #10). It is the first *parsed* row that proves measurement.
+            check_true("a header with no parsed row is not ok", not m.ok)
+            check("no rows parsed yet", m.parsed, 0)
             for _ in range(40):                     # feed rendering evidence
                 m.observe(busy=True, dt=5.0)
                 if c1.terminated:
@@ -290,6 +297,19 @@ def case_d_idle_desktop():
             c1 = h.child(0)
             c1.feed(header_line(V2_HEADER))
             check_true("header parsed", wait_for(lambda: bool(m.header), 3.0))
+            # One valid row, because health is now evidence of *measurement*, not
+            # of a header (issue #10). A desktop that has rendered nothing at all
+            # is covered by A and B — its deadlines own that case. This case is
+            # the other quiet desktop: one that measured something and then went
+            # still, which must be left alone and must still read as live.
+            c1.feed(one_row(V2_HEADER, V2_TIME))
+            check_true("one row parsed", wait_for(lambda: m.parsed >= 1, 3.0))
+            check("a measured capture is live", m.ok, True)
+            # The quiet stretch below is the wall clock's in a live system and
+            # microseconds in a replay, so age the parse clock by hand past the
+            # silence window: same predicate, same field, and `idle` vs `stale`
+            # is exactly the decision that must not change.
+            m._last_parse -= frames_mod._STREAM_SILENT_S + 1.0
             t0 = time.monotonic()
             while time.monotonic() - t0 < 2.0:      # ≫ every patched deadline
                 m.observe(busy=False, dt=0.2)

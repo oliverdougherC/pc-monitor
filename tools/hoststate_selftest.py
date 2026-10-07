@@ -125,6 +125,20 @@ class FakeInputClock:
     def read(self) -> float | None:
         return None if not self.known else max(0.0, self.t - self.last_input)
 
+    def read_now(self) -> float:
+        """The state's *own* clock: the same scripted instant its input ages against.
+
+        `HostState` reads wall time to measure its tick gap and the interval between
+        two input readings (`now=`), so that has to be this clock - the one the fake
+        input ages against - or the two halves of one input reading belong to two
+        different desks and the arithmetic under test is not being tested at all. A
+        live `time.monotonic()` beside a scripted `idle_seconds()` is exactly what the
+        #43 cases need made impossible: the request lands at a scripted instant, and
+        the loop's reading has to be placed on that same timeline for `now - prev_at`
+        to mean anything.
+        """
+        return self.t
+
     def quiet(self, s: float) -> None:
         self.last_input = self.t - float(s)
 
@@ -144,24 +158,40 @@ def new_state() -> HostState:
 
     Each one starts on a desk nobody has touched for an hour; a case that wants
     fresher input says so, which is the whole point of pinning it.
+
+    The state's own clock is the scripted one (`now=CLOCK.read_now`), for the same
+    reason its input clock is: since #43 an input reading is stored with the instant
+    it was taken, and the interval the rule compares against is the distance between
+    two such instants. A scripted age paired with `time.monotonic()` would be two
+    different desks, and the mid-interval request below could not be written.
     """
     CLOCK.reset()
-    return HostState(gap_s=1.0, poll_s=3600.0, events=False)
+    return HostState(gap_s=1.0, poll_s=3600.0, events=False, now=CLOCK.read_now)
 
 
 def tick(h: HostState, dt: float = 1.0, gap: float | None = None) -> None:
     """Age the scripted desk and tick the state over the same interval.
 
-    The state's only measure of elapsed time is the `dt` the loop hands it, so a desk
-    that did not age along with it would be reporting input that never happened.
+    The state reads *both* of its clocks from the script (`now=CLOCK.read_now`), so
+    advancing `CLOCK.t` is what makes time pass for it; `dt` is only what the loop
+    *says* elapsed.
 
-    `gap` scripts the interval the state *measures* between its own readings, which
-    production couples to the loop's cadence; the input-rule cases pass it because
-    that interval - not `dt` - is what the input rule compares against (#43).
+    `gap` is the interval the state *will measure* on this tick, and it is scripted
+    by placing the previous tick exactly that far back - `dt` is the clock advance
+    that follows, so the placement subtracts it. The number a case asks for is
+    therefore the number the state reports (`gap=60.0` is `gap 60s`), which is what
+    makes these cases assertable at all: the committed versions moved a live
+    `time.monotonic()` back by 400 s and then measured whatever the next two
+    `monotonic()` calls happened to span, so `gap:400s` was really `gap:400.003s`
+    rounded down and the case read as a statement about the desk's timer.
+    It stays separate from `dt` because the input rule's whole history is those two
+    being different numbers: it used to be handed the loop's `dt` or the measured
+    gap, and the #43 cases below pass a `gap` that deliberately disagrees with `dt`
+    to prove the rule borrows neither.
     """
-    CLOCK.t += dt
     if gap is not None:
-        h._tick_now -= gap
+        h._tick_now = CLOCK.t + dt - gap
+    CLOCK.t += dt
     h.tick(dt)
 
 
@@ -278,8 +308,7 @@ def case_gap_without_events() -> None:
     h = new_state()
     h._ev.error = "no window station"
     tick(h)                                     # the loop's first tick: primes
-    h._tick_now = time.monotonic() - 400.0
-    tick(h)
+    tick(h, gap=400.0)                          # the loop's own gap: 400 s unaccounted
     check("gap raises an edge", h.take_resume(), "gap:400s")
     check("and clears the sleep flag", h.asleep, False)
     tick(h)
@@ -294,12 +323,10 @@ def case_slow_start_is_not_a_suspend() -> None:
     # `[resume] gap:36s` before anything had been built — and a spurious resume
     # relinks the panel and restarts the ETW capture for no reason.
     h = new_state()
-    h._tick_now = time.monotonic() - 36.0
-    tick(h)
+    tick(h, gap=36.0)
     check("no edge on the first tick", h.resume, None)
     check("state untouched", h.asleep, False)
-    h._tick_now = time.monotonic() - 36.0
-    tick(h)
+    tick(h, gap=36.0)
     check("but the next tick does see a freeze", bool(h.take_resume()), True)
     h.close()
 
@@ -309,8 +336,7 @@ def case_gap_after_event_suspend() -> None:
     h = new_state()
     tick(h)                                     # prime, like the real loop
     h._on_event(WM_POWERBROADCAST, PBT_APMQUERYSUSPEND, 0)
-    h._tick_now = time.monotonic() - 60.0
-    tick(h)
+    tick(h, gap=60.0)
     check("asleep flag gone", h.asleep, False)
     check("gap reason recorded", h.last_event, "gap 60s")
     edge = h.take_resume()
@@ -417,7 +443,8 @@ def case_stale_sample_does_not_answer() -> None:
     h = new_state()
     CLOCK.typing(0.0)                       # t=0: the click itself
     h._on_event(WM_POWERBROADCAST, PBT_APMQUERYSUSPEND, 0)
-    check("the request anchors on the click", h._input_age, 0.0)
+    check("the request anchors on the click", h._input_pair[0], 0.0)
+    check("and on the instant it was read", h._input_pair[1], CLOCK.t)
     tick(h, 0.91, gap=0.90)                 # reads .90: age .20; interval .90: no input
     check("still pending after the .90 reading", h.suspend_pending, True)
     tick(h, 0.91, gap=0.01)                 # reads .91: age .21, .01 later; dt .91

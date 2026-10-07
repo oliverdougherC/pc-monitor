@@ -58,11 +58,29 @@ def _runs(indices: np.ndarray) -> list[tuple[int, int]]:
 
 
 class DiffPusher:
-    def __init__(self, lcd, merge_gap: int = 6, full_fraction: float = 0.35):
+    """Send what changed, and know when that is no longer the cheaper answer.
+
+    The cap on how many bands are worth sending used to be a literal 6 in the middle of
+    `push`, while `tools/liveview.py` treated the same decision as a parameter — so the
+    preview and the panel could disagree about what "a partial update" is, and the panel
+    was the one that was wrong. Measured on this desk with the psutil/NVML backend, a
+    real tick changes a median of **7-8 bands** (the CPU and GPU digits, the strip, the
+    trend bands, the clock): over the cap, so every tick fell through to a full frame,
+    and a full frame is ~0.77 s of the link. That is what silently pinned the loop near
+    2 Hz no matter what `sensors.interval_s` asked for.
+
+    The cap is a *trade*, not a limit: bands cost their own pixels and the link sustains
+    ~1 MB/s, so 12 bands of the worst tick measured (~185 ms) still fits inside a 250 ms
+    interval, while a full frame does not. Hence 12, and hence a parameter with a name.
+    """
+
+    def __init__(self, lcd, merge_gap: int = 6, full_fraction: float = 0.35,
+                 max_bands: int = 12):
         self.lcd = lcd
         self.prev: np.ndarray | None = None
         self.merge_gap = merge_gap
         self.full_fraction = full_fraction
+        self.max_bands = max_bands
         # Guards the two fields that together form the transaction: the shadow
         # frame and the invalidation counter. A relink runs `invalidate()` on a
         # background thread while a push is in flight; whichever order the two
@@ -112,7 +130,7 @@ class DiffPusher:
                         merged[-1][1] = e
                     else:
                         merged.append([s, e])
-                if len(merged) <= 6:
+                if len(merged) <= self.max_bands:
                     for y0, y1 in merged:
                         col_idx = np.flatnonzero(changed[y0:y1].any(axis=0))
                         x0, x1 = int(col_idx[0]), int(col_idx[-1]) + 1

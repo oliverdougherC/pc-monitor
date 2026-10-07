@@ -26,6 +26,14 @@ half-written beat and call it fresh):
   `.heartbeat`  `<epoch> <pid> <tick> <state>`   one line, once per control-loop tick
   `.stopped`    `<epoch> <reason>`               written only on a deliberate shutdown
   `.restarts`   `<epoch>` per line, capped       the budget's memory
+
+**A diagnostic role beats under its own name** (#67). `main.py --dump` runs a real
+control loop beside the running app on purpose, and when it wrote the shared
+`.heartbeat` it refreshed the one file the outside observer reads: a preview could
+make a stalled app look healthy, and its exit could write `.stopped` and talk the
+watchdog out of recovering the app it had nothing to do with. A non-production role
+therefore writes `<file>-<role>` instead. The observer is unchanged and still reads
+the unsuffixed names, so the only thing a preview can now move is its own file.
 """
 from __future__ import annotations
 
@@ -36,9 +44,41 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-HEARTBEAT = ROOT / ".heartbeat"
-STOPPED = ROOT / ".stopped"
-RESTARTS = ROOT / ".restarts"
+
+
+def control_dir() -> Path:
+    """Where the beat, the stop marker and the budget live.
+
+    The tree itself by default. The environment override lets a test hand a child
+    process a scratch control plane so it can prove, from outside, that the child
+    touched nothing in the real one — the #67 contract, which is otherwise only
+    assertable by racing two real processes on somebody's desk.
+    """
+    override = os.environ.get("PCMON_CONTROL_DIR", "").strip()
+    return Path(override) if override else ROOT
+
+
+def _scoped(name: str, role: str) -> Path:
+    """`name` for the production role, `name-<role>` for any other.
+
+    Production is the unsuffixed name because that is the contract the observer
+    (`tools/watchdog_autostart.ps1`) already implements, and a watchdog has to keep
+    working against an app installed before this distinction existed.
+    """
+    clean = "".join(c for c in role if c.isalnum() or c in "-_") or "main"
+    return control_dir() / (name if clean == "main" else f"{name}-{clean}")
+
+
+def beat_path(role: str = "main") -> Path:
+    return _scoped(".heartbeat", role)
+
+
+def stopped_path(role: str = "main") -> Path:
+    return _scoped(".stopped", role)
+
+
+def restarts_path(role: str = "main") -> Path:
+    return _scoped(".restarts", role)
 
 # A tick is 1 s; six hundred seconds of silence is not a slow tick, it is a loop that
 # is not running. It has to be comfortably longer than the app's own start-up (a
@@ -55,16 +95,19 @@ _QUERY_LIMITED = 0x1000   # PROCESS_QUERY_LIMITED_INFORMATION
 
 # ------------------------------------------------------------------ the beat
 def beat(now: float | None = None, tick: int = 0, state: str = "",
-         path: Path | str | None = None) -> bool:
+         path: Path | str | None = None, role: str = "main") -> bool:
     """Say "the loop finished a tick". True if the sentence landed.
 
     Written through a temporary file and `os.replace`, which is atomic on the same
     volume: the observer reads this file while the loop is writing it, and a truncated
-    read would look exactly like a hang.
+    read would look exactly like a hang. `role` picks the file (see `_scoped`): a
+    `--dump` preview beats into `.heartbeat-dump`, so the observer's view of the app
+    is not something a diagnostic can refresh or silence (#67).
     """
-    p = HEARTBEAT if path is None else Path(path)
+    p = beat_path(role) if path is None else Path(path)
     tmp = p.with_name(p.name + ".tmp")
     try:
+        p.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(f"{time.time() if now is None else now:.3f} {os.getpid()} "
                        f"{tick} {state}\n", encoding="utf-8")
         os.replace(tmp, p)
@@ -76,7 +119,7 @@ def beat(now: float | None = None, tick: int = 0, state: str = "",
 def read_beat(path: Path | str | None = None) -> dict | None:
     """The last beat, or None when there is no readable one. Never raises."""
     try:
-        parts = Path(HEARTBEAT if path is None else path).read_text(
+        parts = Path(beat_path() if path is None else path).read_text(
             encoding="utf-8", errors="replace").split()
         return {"epoch": float(parts[0]), "pid": int(parts[1]),
                 "tick": int(parts[2]), "state": parts[3] if len(parts) > 3 else ""}
@@ -92,16 +135,21 @@ def age(now: float | None = None, path: Path | str | None = None) -> float | Non
 
 
 # ------------------------------------------------- deliberate shutdown marker
-def mark_stopped(reason: str = "shutdown", path: Path | str | None = None) -> bool:
+def mark_stopped(reason: str = "shutdown", path: Path | str | None = None,
+                 role: str = "main") -> bool:
     """Record that this instance was stopped on purpose.
 
     Recovery that undoes a deliberate shutdown is not recovery. The marker is only
     written by the paths that mean it — Ctrl-C, and the installer's own stop — and not
     by `atexit`, because an unhandled exception also unwinds to `atexit` and would
-    otherwise silence the observer on the one occasion it is needed.
+    otherwise silence the observer on the one occasion it is needed. `role` scopes the
+    file for the same reason `beat` does (#67): a Ctrl-C on a headless preview is not
+    a statement that the app was stopped on purpose, and writing the shared marker
+    would hold the observer back from recovering the app the preview never owned.
     """
-    p = STOPPED if path is None else Path(path)
+    p = stopped_path(role) if path is None else Path(path)
     try:
+        p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(f"{time.time():.3f} {reason}\n", encoding="utf-8")
         return True
     except OSError:
@@ -110,7 +158,7 @@ def mark_stopped(reason: str = "shutdown", path: Path | str | None = None) -> bo
 
 def stopped_epoch(path: Path | str | None = None) -> float | None:
     try:
-        return float(Path(STOPPED if path is None else path).read_text(
+        return float(Path(stopped_path() if path is None else path).read_text(
             encoding="utf-8", errors="replace").split()[0])
     except (OSError, ValueError, IndexError):
         return None
@@ -151,7 +199,7 @@ def pid_alive(pid: int) -> bool:
 # ------------------------------------------------------------------ budget
 def _read_restarts(path: Path | str | None = None) -> list[float]:
     try:
-        return [float(ln) for ln in Path(RESTARTS if path is None else path)
+        return [float(ln) for ln in Path(restarts_path() if path is None else path)
                 .read_text(encoding="utf-8", errors="replace").splitlines()
                 if ln.strip()]
     except (OSError, ValueError):
@@ -160,9 +208,10 @@ def _read_restarts(path: Path | str | None = None) -> list[float]:
 
 def _record_restart(now: float, path: Path | str | None = None) -> None:
     """Remember this restart, keeping only what the window can still see."""
-    p = RESTARTS if path is None else Path(path)
+    p = restarts_path() if path is None else Path(path)
     kept = [t for t in _read_restarts(p) + [now] if now - t <= WINDOW_S][-BUDGET:]
     try:
+        p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("".join(f"{t:.3f}\n" for t in kept), encoding="utf-8")
     except OSError:
         pass

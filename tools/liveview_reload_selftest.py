@@ -104,6 +104,48 @@ def case_invalid_config(engine, custom: Path) -> None:
     check("and the repaired value is live", engine.cfg["power"]["base_w"], 7)
 
 
+def case_unsafe_values_are_refused_not_applied(engine, custom: Path) -> None:
+    """#20's reload clause: a *parseable* config with an unsafe value must be refused.
+
+    The case above covers YAML that will not parse. This one covers the failure that
+    is easier to miss and more dangerous: a config that parses perfectly and carries a
+    value the loop cannot run — a zeroed interval, a brightness out of range, a
+    geometry that is not this panel. Such an edit used to reach `Layout`/`BurnIn` and
+    surface as a divide-by-zero or a nonsense render; `cfgmod.load_or_keep` now keeps
+    the last-known-good generation and hands back the reasons, and the preview keeps
+    rendering with values it knows are safe.
+    """
+    print("case: a parseable but unsafe config edit is refused, and stays refused")
+    # The baseline is whatever the previous case left live, captured rather than
+    # assumed: this case is about the *refusal* keeping it, not about its value.
+    baseline = engine.cfg["display"]["brightness_idle"]
+    check("a safe value is live first", 0 <= baseline <= 100, True)
+    # 9999 is in range for YAML and out of range for a backlight.
+    custom.write_text("display:\n  brightness_idle: 9999\n", encoding="utf-8")
+    err = attempt(engine)
+    # The refusal is not an exception: the page stays up and the reason is reported,
+    # because a preview that dies on a typo cannot tell you what the typo was.
+    check("the unsafe edit did not stop the preview", err, None)
+    check("and the unsafe value did not reach the config",
+          engine.cfg["display"]["brightness_idle"], baseline)
+    check("the reason is reported", bool(engine.reload_problems), True)
+    check("and it names the offending key",
+          any("brightness_idle" in p for p in engine.reload_problems), True)
+    seen = list(engine.reload_problems)
+    # A second tick must not lose it: `step()` clears `error` on every successful
+    # tick, and a validity complaint that survives one tick is one nobody reads.
+    engine._maybe_reload()
+    check("the complaint is still there on the next tick", engine.reload_problems, seen)
+    check("the layouts kept the safe value too",
+          engine.layouts["idle"].cfg["display"]["brightness_idle"], baseline)
+    # And a valid edit clears it, so the page is not stuck complaining.
+    custom.write_text("display:\n  brightness_idle: 55\n", encoding="utf-8")
+    err = attempt(engine)
+    check("a valid edit is accepted", err, None)
+    check("it is live", engine.cfg["display"]["brightness_idle"], 55)
+    check("and the complaint is gone", engine.reload_problems, [])
+
+
 def case_demo_touch(engine) -> None:
     print("case: saving demo.py rebuilds the streams against the current class")
     cls = lv.demo_mod.DemoBackend
@@ -183,6 +225,8 @@ def main_run() -> int:
         case_custom_config(engine, custom.resolve())
         print()
         case_invalid_config(engine, custom.resolve())
+        print()
+        case_unsafe_values_are_refused_not_applied(engine, custom.resolve())
         print()
         case_demo_touch(engine)
         print()

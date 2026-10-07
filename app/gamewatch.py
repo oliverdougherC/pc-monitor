@@ -39,6 +39,13 @@ oscillated the panel on a healthy low-fps title — so while it is alive, the
 fallback evidence that qualifies it for entry (its own window fullscreen with the
 GPU busy, or a name from `game.processes` in the foreground) is what holds it. The
 two states must agree, or the boundary between them is where the panel flickers.
+That has to include the rule the *entry* rule used for an explicitly configured
+name: `game.processes` is the user's own answer and it never waited for a capture
+or for `fullscreen_heuristic`, so the hold path may not either (#21a).
+
+No lock is ever held on a live *pid* alone, with or without a capture: Windows
+recycles pids, and the present-stream path checked identity while the no-capture
+paths did not, so a recycled pid kept the lock forever (#21b).
 
 SteamAppId/SteamGameId (app/steamid.py) is identity and enrichment — it names the
 game and keys per-game profiles — and a tiebreaker here, never the core signal:
@@ -304,28 +311,56 @@ class GameWatch:
         one already locked. Reading it as absence of rendering released a healthy
         20 fps game every `exit_after_s` and let it re-enter seconds later, forever.
         Liveness for the locked game is: it is presenting under its own identity,
-        or — alive — its window still carries the fallback evidence (`_window_holds`).
+        or — alive — its window still carries the fallback evidence (`_window_holds`),
+        or it is the configured process still in the foreground. `_alive` is asked
+        *first* on every path that would accept a live pid, present stream or not:
+        Windows recycles pids, and a hold path that trusted the number alone held a
+        stranger forever (#21b).
         """
         fg_pid, fg_name, covers, borderless, snap = ctx
         if presenters is None:
+            # Identity before liveness here too (#21b). The present-stream path always
+            # checked it; these paths trusted the pid, so a recycled pid kept the lock
+            # forever — measured, after reuse was simulated: eight further ticks still
+            # reporting `game` under the old pid. A pid that is not the process we
+            # locked onto is not evidence of anything, and it has to be rejected
+            # *before* `_window_holds` can say otherwise.
+            if not _alive(self.game_pid, self._create_time):
+                return self._dead(dt)
+            # Explicit configured identity holds whatever `fullscreen_heuristic` says
+            # (#21a): `tick` promotes a foreground process named in `game.processes`
+            # to STRONG with no capture and no heuristic at all, so the hold path has
+            # to accept the same fact on the same clock. It did not, and a configured
+            # game with the heuristic off released every `exit_after_s` and re-entered
+            # on the strong clock, forever — measured [(0,'idle'),(1,'game'),
+            # (26,'idle'),(28,'game'),(53,'idle'),(55,'game')], switches=3 over 80
+            # ticks. Entry and hold disagreeing about one fact is exactly where the
+            # panel flickers.
+            if self._configured_holds(fg_pid):
+                self._quiet_s = 0.0
+                self.evidence = (f"held {self.game_name}({self.game_pid}) configured "
+                                 f"and in the foreground")
+                return True
+            if self.fullscreen_heuristic and self._window_holds(fg_pid, covers,
+                                                                borderless, snap):
+                # Liveness of the locked game, not a re-detection: below the present
+                # floor a healthy 20 fps title looks exactly like an absent one, so the
+                # window evidence - not the floor that ranks *new* candidates - decides
+                # whether to keep the lock (#21).
+                self._quiet_s = 0.0
+                self.evidence = f"held {self.game_name}({self.game_pid}) on window heuristic"
+                return True
             if not self.fullscreen_heuristic:
-                # No present stream, and the user turned off the one other way to
-                # infer a game: nothing can be seen, so count the silence honestly
-                # and let go - never hold a lock on evidence we were told not to use.
+                # No present stream, no configured name in the foreground, and the user
+                # turned off the one other way to infer a game: nothing can be seen, so
+                # count the silence honestly and let go — never hold a lock on evidence
+                # we were told not to use.
                 self._quiet_s += dt
                 self.evidence = (f"no present stream and fullscreen_heuristic is off "
                                  f"({self._quiet_s:.0f}s)")
                 if self._quiet_s >= self.exit_after_s:
                     self._release("no present stream and the window heuristic is off")
                     return False
-                return True
-            # Liveness of the locked game, not a re-detection: below the present
-            # floor a healthy 20 fps title looks exactly like an absent one, so the
-            # window evidence - not the floor that ranks *new* candidates - decides
-            # whether to keep the lock (#21).
-            if self._window_holds(fg_pid, covers, borderless, snap):
-                self._quiet_s = 0.0
-                self.evidence = f"held {self.game_name}({self.game_pid}) on window heuristic"
                 return True
             self._quiet_s += dt
             self.evidence = (f"window heuristic lost {self.game_name}({self.game_pid}) "
@@ -357,14 +392,7 @@ class GameWatch:
         # Alive? Then this is an alt-tab, a loading screen or a paused game:
         # stay, and let app/frames.py hold the last measurement.
         if not _alive(self.game_pid, self._create_time):
-            self._dead_s += dt
-            self._quiet_s += dt
-            self.evidence = f"target {self.game_name}({self.game_pid}) gone " \
-                            f"{self._dead_s:.0f}s"
-            if self._dead_s >= self.dead_exit_s:
-                self._release("target process exited")
-                return False
-            return True
+            return self._dead(dt)
 
         # Alive and not in `presenters`: for a locked game, under the fps floor is
         # not absent. The fallback that qualifies a below-threshold game on the way
@@ -397,6 +425,40 @@ class GameWatch:
             self._quiet_s = 0.0
         return True
 
+    def _dead(self, dt: float) -> bool:
+        """The lock's process is not there any more: count the death clock.
+
+        Shared by every hold path on purpose. "The present stream does not list it"
+        and "there is no present stream" are the same question about the process, and
+        having one of the two check identity while the other trusted the pid is how a
+        recycled pid kept the lock forever (#21b). Returns what the caller must
+        return: True while `dead_exit_s` is still running, False once released.
+        """
+        self._dead_s += dt
+        self._quiet_s += dt
+        self.evidence = f"target {self.game_name}({self.game_pid}) gone " \
+                        f"{self._dead_s:.0f}s"
+        if self._dead_s >= self.dead_exit_s:
+            self._release("target process exited")
+            return False
+        return True
+
+    def _configured_holds(self, fg_pid: int | None) -> bool:
+        """Is the locked target the configured process, still in the foreground?
+
+        `game.processes` is the user's own statement of identity, and the entry rule
+        takes it without waiting for a present stream or for the window heuristic
+        (`tick`). Holding on the same fact — and only on that fact, `fullscreen_heuristic`
+        has nothing to say about a name the user typed — is what keeps entry and hold
+        from disagreeing at the boundary where the panel flickers (#21a). The
+        foreground half is not optional: tabbing away from a configured game still
+        releases it on the ordinary `exit_after_s` clock, because the name qualifies
+        the *foreground* process and nothing else.
+        """
+        if fg_pid is None or fg_pid != self.game_pid:
+            return False
+        return (self.game_name or "").lower() in [p.lower() for p in self.cfg["processes"]]
+
     def _window_holds(self, fg_pid: int | None, covers: bool, borderless: bool,
                       snap) -> bool:
         """The fallback liveness evidence, shared by both held paths (no capture
@@ -405,10 +467,17 @@ class GameWatch:
         same shape that qualifies it for entry — or, for a name in
         `game.processes`, simply still being the foreground process the user named.
         Only the locked pid can answer this, so the browser/non-game vetoes cannot
-        be smuggled back in here; they were applied when the lock was taken."""
+        be smuggled back in here; they were applied when the lock was taken.
+
+        The pid has to be *the same process* as well as the same number: identity is
+        checked here rather than left to the caller, so no caller can make this
+        answer "holds" for a recycled pid (#21b).
+        """
         if fg_pid is None or fg_pid != self.game_pid:
             return False
-        if (self.game_name or "").lower() in [p.lower() for p in self.cfg["processes"]]:
+        if not _alive(self.game_pid, self._create_time):
+            return False
+        if self._configured_holds(fg_pid):
             return True
         return (covers and borderless
                 and snap.gpu.load_pct is not None

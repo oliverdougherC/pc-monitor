@@ -193,6 +193,18 @@ class FallbackBackend:
         self._pynvml = None
         self._gpu = None
         self._nvml_next = 0.0
+        # Successful `nvmlInit()` calls this backend still owns, as a count (#69).
+        # NVML's init/shutdown contract is reference-counted: every successful init
+        # takes a reference and only the matching `nvmlShutdown()` gives it back, with
+        # the library unloading when the count reaches zero. So the *initialization*
+        # and the *device handle* are two different pieces of state, and owning the
+        # first while failing to find the second is the exact case the old code leaked:
+        # `nvmlDeviceGetCount() < 1` returned before `self._pynvml` was ever assigned,
+        # which meant `close()` could not even see the reference it had taken. Tracking
+        # the count separately is what makes every early return balancable, and it is
+        # also what lets a later attempt *reuse* an initialization instead of stacking
+        # a second one on top of it.
+        self._nvml_inits = 0
         self.last_error = ""
 
     # ------------------------------------------------------------------ sample
@@ -257,28 +269,71 @@ class FallbackBackend:
             snap.disk_read_bps, snap.disk_write_bps = rates
 
     # --------------------------------------------------------------------- gpu
+    def _nvml_release(self, p) -> None:
+        """Give back one initialization, and only one. Never raises.
+
+        Called on every path that stops owning a reference — an early return after a
+        successful init, a handle that could not be fetched, and `close()`. It is
+        deliberately separate from `close()` because the leak in #69 was not a bad
+        close: it was an *early return* that abandoned a reference `close()` then had
+        no way to know about.
+        """
+        if p is None or self._nvml_inits <= 0:
+            return
+        self._nvml_inits -= 1
+        try:
+            p.nvmlShutdown()
+        except Exception:  # noqa: BLE001 - a release that raises is still a release
+            pass
+
     def _nvml_open(self, now: float) -> None:
         """Open NVML if it is not open and the retry window has passed.
 
         Failure here is deliberately quiet: a machine without NVIDIA (or with
-        a driver still loading) is unavailable, not failing - the group
+        a driver still loading) is *unavailable*, not failing - the group
         answers None, and the retry window asks again later.
+
+        The lifetime rule (#69) is one sentence: **this backend owns at most one
+        initialization, and `close()` gives it back.** Everything else follows from it,
+        and each clause answers a specific way the old code unbalanced the reference
+        count NVML keeps:
+
+        * `nvmlInit()` is only reached when we own nothing. A query error drops the
+          *handle* and reopens the retry window; it does not drop the initialization, so
+          the next attempt reuses it instead of stacking a second reference on top. That
+          is what turned a persistent driver error into one outstanding init per second,
+          all of which `close()` — which shut down at most once — could never unwind.
+        * the "driver up, no device yet" and "handle lookup failed" paths **keep** the
+          initialization and back off on the window. Releasing it there was tempting and
+          wrong twice over: it unloads and reloads the whole library for a device that is
+          merely late, and it made the reference count flicker, which is exactly the
+          ambiguity this tracking exists to remove.
+        * so the only release path outside `close()` is a driver reset (`_sample_gpu`),
+          where the library itself is suspect.
         """
         if self._gpu is not None or now < self._nvml_next:
             return
         self._nvml_next = now + self._nvml_retry_s
-        try:
-            import pynvml
-        except ImportError:
-            return                      # not an NVIDIA box: nothing to re-acquire
-        try:
-            pynvml.nvmlInit()
-            if pynvml.nvmlDeviceGetCount() < 1:
-                return                  # driver up, no device yet: ask again later
+        if self._pynvml is None:
+            try:
+                import pynvml
+            except ImportError:
+                return                  # not an NVIDIA box: nothing to re-acquire
+            try:
+                pynvml.nvmlInit()
+            except Exception:  # noqa: BLE001 - driver not ready: retry on the window
+                return
             self._pynvml = pynvml
-            self._gpu = pynvml.nvmlDeviceGetHandleByIndex(0)
+            self._nvml_inits += 1
+        p = self._pynvml
+        try:
+            if p.nvmlDeviceGetCount() < 1:
+                # Driver up, no device yet. The initialization stays ours (see the
+                # docstring): the next window asks again, and `close()` releases it.
+                return
+            self._gpu = p.nvmlDeviceGetHandleByIndex(0)
             self._nvml_next = 0.0
-        except Exception:  # noqa: BLE001 - driver not ready: retry on the window
+        except Exception:  # noqa: BLE001 - handle not ready: retry on the window
             self._gpu = None
 
     def _sample_gpu(self, snap: Snapshot) -> None:
@@ -302,19 +357,33 @@ class FallbackBackend:
             g.vram_used_mb = mem.used / 1e6
             g.vram_total_mb = mem.total / 1e6
         except p.NVMLError:
-            # A driver reset shows up as errors on every call: drop the handle
-            # so the next tick re-acquires it (the reset itself already failed
-            # this group, so no retry window - the failure answer *is* the
-            # retry), and let the group fail so the hub counts it.
+            # A driver reset shows up as errors on every call: drop the handle so the
+            # next tick re-acquires it, and let the group fail so the hub counts it.
+            #
+            # The *initialization* is deliberately kept (#69). Dropping it here as well
+            # is what produced an init-per-tick: this window was reset to zero, so the
+            # next tick called `nvmlInit()` again while the reference from this tick was
+            # still outstanding. The handle is what a reset invalidates; re-fetching one
+            # against the initialization we already own is exactly what NVML expects, and
+            # it means a persistent query failure costs one owned reference, not one per
+            # second. The retry window stays as the backoff instead of being zeroed.
             self._gpu = None
-            self._nvml_next = 0.0
+            self._nvml_next = time.monotonic() + self._nvml_retry_s
             raise
 
     # ------------------------------------------------------------------ close
     def close(self) -> None:
-        p, self._pynvml, self._gpu = self._pynvml, None, None
-        if p is not None:
-            try:
-                p.nvmlShutdown()
-            except Exception:  # noqa: BLE001 - closing must never raise
-                pass
+        """Release every NVML initialization this backend owns. Never raises.
+
+        `close()` used to call `nvmlShutdown()` at most once, which silently discarded
+        any reference the early-return paths had leaked and left the library loaded on
+        the count. It now gives back exactly as many references as were taken — the
+        count is authoritative, so a repeated `close()` is a no-op rather than a second
+        shutdown, and a backend replaced while it still owned two references releases
+        both (#69).
+        """
+        p = self._pynvml
+        self._gpu = None
+        while self._nvml_inits > 0:
+            self._nvml_release(p)
+        self._pynvml = None

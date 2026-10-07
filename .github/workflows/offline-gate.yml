@@ -1,4 +1,4 @@
-﻿name: offline gate
+name: offline gate
 
 # The app is Windows-only in practice (ctypes/win32 power & session calls, a
 # COM-port panel, an ETW capture), so the gate runs on a Windows runner: on
@@ -6,10 +6,19 @@
 # nothing about the code that ships.
 #
 # What this gate covers is what can be proven without the hardware: the
-# selftests under tools/. What it cannot cover is said out loud — the runner
-# reports the vendored-library cases as SKIP, not as passing (see the job
-# summary). Physical panel, USB, ETW and admin behaviour stay a documented
+# selftests under tools/. What it cannot cover is said out loud (see the job
+# summary): physical panel, USB, ETW and admin behaviour stay a documented
 # manual step; the case list lives with the "Run now" section of the README.
+#
+# The gate is only representative if the vendor-boundary cases actually run.
+# On a bare checkout seven of them used to SKIP — panel_link, open_serial,
+# usb_reset, diff_cache, lights, units, layout — precisely the
+# transport/appearance boundaries where the reliability reviews found their
+# residual defects (issue #9's swallowed write timeout lives in the pinned
+# vendor's WriteLine). So this workflow *fetches the pinned tree first* and
+# runs the suite with `--strict`, where a case that needs an absent asset is
+# a FAIL, not a SKIP (issue #30): a green bar can no longer mean the pinned
+# transport adapter was never installed.
 
 on:
   push:
@@ -50,5 +59,20 @@ jobs:
       - name: Byte-compile
         run: python -m compileall -q app tools main.py
 
-      - name: Offline selftests
-        run: python tools\run_offline_tests.py
+      # Install exactly the revision vendor/LOCK.txt names — staged, hashed
+      # against the committed lock, and only then moved into place — and
+      # re-verify it from disk. The fetch never rewrites the lock, so CI
+      # cannot bless a moving upstream branch: if the commit the lock names
+      # no longer hashes the same, this fails the job rather than the review.
+      - name: Fetch and verify the pinned vendor tree
+        shell: pwsh
+        run: |
+          ./tools/vendor_lock.ps1 -Fetch
+          ./tools/vendor_lock.ps1 -Verify
+
+      # `--strict`: a case that needs the vendored tree or the theme fonts and
+      # cannot run is a FAIL. Native/hardware behaviour (real USB, ETW, sleep,
+      # driver resets) still is not proven here — that stays the documented
+      # soak in docs/reliability-plan.md, not an implied pass.
+      - name: Offline selftests (strict)
+        run: python tools\run_offline_tests.py --strict

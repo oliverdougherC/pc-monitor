@@ -43,6 +43,15 @@ class LhmBackend:
                                  "LibreHardwareMonitorLib.dll")
         self._reopen_after = max(1, int(cfg.get("sensors", {}).get("reopen_after", 3)))
         self._lhm_fails = 0
+        # Hardware groups that refused to update on the last walk (#17), how many were
+        # walked, and which ones refused (#5). Reset by every `_rescan`, read by
+        # `_lhm_sample`, which fails the group only when *every* group refused or when
+        # nothing readable came back - so a driver which has stopped answering still
+        # reaches the rebuild instead of looking like a healthy scan that happens to
+        # report nothing, while one dead controller cannot blank the CPU beside it.
+        self._update_fails = 0
+        self._update_total = 0
+        self._update_fail_nodes: list[str] = []
         self._open()
 
     def _open(self) -> None:
@@ -73,12 +82,43 @@ class LhmBackend:
 
     # ------------------------------------------------------------------ walk
     def _rescan(self) -> None:
+        """Walk the hardware tree, and *say* when the driver would not update.
+
+        The failure that matters here is quiet: `hw.Update()` raising used to be
+        swallowed with a `continue`, so a driver that had stopped answering produced a
+        perfectly normal return with every sensor simply absent. `_lhm_sample` then
+        finished normally, `sample()`'s `else` reset the failure streak, and
+        `_reopen_lhm()` — the only repair this backend has — was unreachable for the one
+        fault it exists for. So the count of hardware groups that refused to update is
+        kept, together with which nodes they were and how many were walked, and
+        `_lhm_sample` fails the group when *all* of them refused.
+
+        A node that refuses is still only *one node* (#5). CPU, GPU, motherboard,
+        storage and controller monitoring are all enabled, so one failing controller
+        used to take every reading with it: the healthy 65 °C CPU sensor was collected
+        into `_sensors` and then never copied, because `_lhm_sample` rejected the whole
+        walk. The failing nodes are recorded and skipped, and the healthy ones are
+        sampled as usual — the group only fails when there is nothing left to read.
+
+        A *sensor* that raises while being listed is still skipped: that is one missing
+        metric, not a dead driver, and losing the whole group for it would be the
+        opposite mistake.
+        """
         self._sensors.clear()
         self._objs.clear()
+        self._update_fails = 0
+        self._update_total = 0
+        self._update_fail_nodes = []
         for hw in self._c.Hardware:
+            self._update_total += 1
             try:
                 hw.Update()
-            except Exception:
+            except Exception:  # noqa: BLE001 - counted, not swallowed
+                self._update_fails += 1
+                try:
+                    self._update_fail_nodes.append(hw.HardwareType.ToString())
+                except Exception:  # noqa: BLE001 - a name is diagnostics, not the walk
+                    self._update_fail_nodes.append("?")
                 continue
             nodes = [hw] + list(hw.SubHardware)
             for node in nodes:
@@ -165,37 +205,87 @@ class LhmBackend:
 
     def _lhm_sample(self, snap: Snapshot) -> None:
         self._rescan()
+        if self._update_fails and self._update_fails >= self._update_total:
+            # Every group refused to update: this is the driver, not a metric. Raising
+            # here is what lets `sample()` count it, mark the group failed, and reach the
+            # rebuild — which is the repair a driver that has stopped answering needs.
+            # Returning normally instead produced an empty-but-successful scan and reset
+            # the streak that leads there.
+            raise RuntimeError(
+                f"LibreHardwareMonitor would not update any of its "
+                f"{self._update_total} hardware group(s) "
+                f"({self._node_names()}); the driver is not answering")
         c, g = snap.cpu, snap.gpu
 
+        # How many LHM readings actually landed on the snapshot. This, and not the
+        # update-failure count, is what decides whether the walk was usable (#5): the
+        # healthy nodes below are still sampled when a sibling node refused.
+        read = 0
         v = self._vals(("Cpu",), "Load", ("cpu total",))
         if v:
             c.load_pct = v[0]
+            read += 1
         v = self._vals(("Cpu",), "Temperature",
                        ("core (tctl/tdie)", "core (tctl)", "cpu package"))
         if v:
             c.temp_c = max(v)
+            read += 1
         clocks = self._vals(("Cpu",), "Clock", ("core #",), exclude=("effective",))
         if clocks:
             c.clock_max_mhz = max(clocks)
             c.clock_avg_mhz = sum(clocks) / len(clocks)
+            read += 1
         pw = self._first(("Cpu",), "Power",
                          ("total power", "cpu package", "processor", "package"))
         if pw is not None:
             c.power_w = pw
+            read += 1
 
         gpu_types = next((t for t in _GPU_PRIORITY
                           if any(hwt == t for hwt, _, _, _ in self._sensors)), ())
         if gpu_types:
             gt = ("GpuNvidia",) if gpu_types == "GpuNvidia" else (gpu_types,)
             v = self._vals(gt, "Temperature", ("gpu core",))
-            if v: g.temp_c = v[0]
+            if v:
+                g.temp_c = v[0]
+                read += 1
             v = self._vals(gt, "Load", ("gpu core",))
-            if v: g.load_pct = v[0]
+            if v:
+                g.load_pct = v[0]
+                read += 1
             v = self._vals(gt, "Clock", ("gpu core",), exclude=("effective",))
-            if v: g.core_mhz = v[0]
+            if v:
+                g.core_mhz = v[0]
+                read += 1
             pw = self._first(gt, "Power", ("gpu package", "gpu board power", "gpu power"))
-            if pw is not None: g.power_w = pw
+            if pw is not None:
+                g.power_w = pw
+                read += 1
             v = self._vals(gt, "SmallData", ("gpu memory used",))
-            if v: g.vram_used_mb = v[0]          # already MB
+            if v:
+                g.vram_used_mb = v[0]            # already MB
+                read += 1
             v = self._vals(gt, "SmallData", ("gpu memory total",))
-            if v: g.vram_total_mb = v[0]
+            if v:
+                g.vram_total_mb = v[0]
+                read += 1
+
+        if read == 0:
+            # A walk that produced nothing readable is not a healthy sample, and it is
+            # the shape the inverse bug hid behind: an empty scan used to reset the
+            # streak that leads to `_reopen_lhm()`. Whether the nodes updated and had
+            # no metric this backend uses, or updated and lost their sensors, the group
+            # is named failed so the streak climbs — the host readings `sample()` took
+            # before this call still stand, because only "lhm" is reported failed.
+            raise RuntimeError(
+                f"LibreHardwareMonitor answered nothing readable: "
+                f"{self._update_fails} of {self._update_total} hardware group(s) "
+                f"would not update ({self._node_names()}); the driver is not answering")
+
+    def _node_names(self) -> str:
+        """The nodes that refused to update, for the log line — never a raise."""
+        try:
+            names = ", ".join(self._update_fail_nodes)
+        except Exception:  # noqa: BLE001 - diagnostics must not cost the sample
+            return "unnamed"
+        return names or "unnamed"

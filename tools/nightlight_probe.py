@@ -23,18 +23,37 @@ Two integration contracts are pinned here, because this file is where the merge
 of #14 (manual override), #15 (hold the last confirmed look) and #16 (gamma-ramp
 read) has to keep exactly one of each:
 
-* `NightLight._read_windows` returns exactly five values —
-  ``(on, temp_k, source, detail, state_mtime)`` (see `read_at`).
+* `NightLight._read_windows` returns exactly six values —
+  ``(on, temp_k, source, detail, state_mtime, status)`` (see `read_at`). The
+  sixth is the `StateRead` status of the state-key read, and it is what lets
+  `_read` tell *nothing was ever stored* (a first run, where the schedule is
+  allowed to answer) apart from *this poll could not read the state* (unreadable
+  or merely missing after a confirmed answer, where it is not). A five-value
+  reader cannot express that, which is how a confirmed manual OFF at 23:00 came
+  back as ON/windows-schedule from a torn blob.
 * `NightLight.lut(strength, temp_k)` renders the *effective* temperature the
   planner resolved; it makes no temperature decision of its own (issue #53).
   `gamma_gains()` returns a `RampReading`, never a bare tuple.
+
+A third contract is about *sequence*, not one read (#68): the gamma ramp may only
+take back the appearance the ramp itself published. Warm → neutral → warm, driven
+through `_read` with `gamma_gains` replaced, must publish ON → OFF → ON; an
+unreadable ramp must hold the last confirmed look instead; and a confirmed
+Windows answer must survive a neutral ramp untouched. The defect lived in the
+order of reads — the neutral read succeeded, changed nothing, and `_hold`
+re-published the previous warm appearance — so a test of one reading at a time
+could not have seen it, and the assertions below run the real sequence the poll
+loop runs.
 """
 import argparse
+import contextlib
 import sys
 import time
+import types
 
 sys.path.insert(0, ".")          # our tree first: vendor has its own main.py
 from app import config as cfgmod                  # noqa: E402
+from app import lights as lights_mod              # noqa: E402
 from app import nightlight as nl                  # noqa: E402
 
 sys.stdout.reconfigure(errors="replace")
@@ -138,14 +157,120 @@ def fake_night(state_inner: bytes | None = None, settings_inner: bytes | None = 
     return n
 
 
+# ------------------------------------------------- real registry-handler fakes
+# Everything below drives the *production* `_blob` rather than replacing it.
+# The reviewer's note on #15 was specific: the existing cases mock an exception
+# at the outer read boundary and disable the ramp, so the branch that decides
+# "absent vs unreadable vs malformed" was never executed by a test — the fakes
+# returned whatever made the assertion pass, including a bare `None` for a
+# torn blob. These fixtures return raw CloudStore bytes (or raise the way
+# winreg does), so `_blob`'s own `FileNotFoundError`/`OSError` handling, the
+# CB decoder and the schedule-merge branch all run for real.
+
+_MISSING = object()          # "this key is not in the store at all"
+
+
+class _StubKey:
+    """What `winreg.OpenKey` returns: a handle that knows its own key and value."""
+
+    def __init__(self, key: str, values: dict):
+        self.key, self.values = key, values
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        # `_blob` opens every key with `with`; a handle that cannot close would
+        # be a fixture bug that looks like a production one.
+        return False
+
+
+def fake_winreg(values: dict, raises: dict | None = None):
+    """A `winreg` whose *values* are bytes and whose failures are real exceptions.
+
+    `values` maps a CloudStore key to the bytes `QueryValueEx` would hand back;
+    a key mapped to `_MISSING` is not in the store (a genuine first run), and a
+    key left out entirely makes `OpenKey` raise `FileNotFoundError` — the same
+    exception the real key-not-there path produces, so `_blob` reaches its own
+    `return None` line instead of being handed a fixture's `None`.
+
+    `raises` maps a key to the exception `QueryValueEx` raises while the handle
+    is open: `PermissionError` for the access-denied half of #2. It is consulted
+    whether or not the key has a value, because "the value is there but this
+    read was refused" is the shape that matters. `_blob` re-raises whatever is
+    put here, so the only thing the fixture decides is how the read failed.
+    """
+    raises = raises or {}
+    module = types.ModuleType("winreg")
+    module.HKEY_CURRENT_USER = 0x80000001
+
+    def OpenKey(_hive, key, *_a):
+        if key not in values:
+            raise FileNotFoundError(f"[fake winreg] no key {key}")
+        return _StubKey(key, values)
+
+    def QueryValueEx(k, name):
+        if k.key in raises:
+            raise raises[k.key]
+        v = k.values.get(k.key, _MISSING)
+        if v is _MISSING:
+            raise FileNotFoundError(f"[fake winreg] {k.key} has no {name} value")
+        return v, 3                       # REG_BINARY
+
+    module.OpenKey, module.QueryValueEx = OpenKey, QueryValueEx
+    return module
+
+
+def use_winreg(values: dict, raises: dict | None = None):
+    """Point the module's registry reads at `fake_winreg(values, raises)`.
+
+    `_blob` imports `winreg` inside the function, so the module has to be on
+    `sys.modules` for the read to reach it. The previous value is returned so a
+    caller can put the real module back; on this machine that is the live hive.
+    """
+    prev = sys.modules.get("winreg")
+    sys.modules["winreg"] = fake_winreg(values, raises)
+    return prev
+
+
+def pinned_night(cfg: dict | None = None):      # noqa: ANN001
+    """A `NightLight` whose reads go through the real `_blob` and a fake hive."""
+    return nl.NightLight(cfg if cfg is not None else
+                         {"night": {"hold_grace_s": 300, "check_gamma_ramp": False}},
+                         refresh_s=0.0)
+
+
+@contextlib.contextmanager
+def clock_at(hhmm: str):
+    """Pin the *wall* clock `_read_windows` falls back to when no `now` is given.
+
+    `_read(now)` takes a monotonic clock for the hold grace period, but the
+    schedule it evaluates against comes from `time.localtime()` inside
+    `_read_windows`, which is why the cases below pin both. Without this the
+    assertion "the schedule answers 23:00" would depend on when the test suite
+    was run, and a schedule guess at 15:00 is legitimately "outside the window" —
+    a passing or failing suite by wall clock is exactly the kind of test that
+    stops being run. The monkeypatch is on the `time` module the *test* passes
+    through, so it is restored even when an assertion raises.
+    """
+    fixed = time.strptime(hhmm, "%H:%M")
+    real = time.localtime
+    nl.time.localtime = lambda *_a, **_k: fixed
+    try:
+        yield fixed
+    finally:
+        nl.time.localtime = real
+
+
 def read_at(n, hhmm: str):        # noqa: ANN001
     """`_read_windows` with a pinned clock, returning its ONE documented contract.
 
-    ``(on, temp_k, source, detail, state_mtime)`` — five values, because the
-    merged `_read_windows` publishes the CloudStore write time alongside the
-    state (#15) *and* keeps the manual override authoritative (#14). The unpack
-    here is the whole contract: a four-value reader no longer exists, so a
-    regression that drops the timestamp fails loudly rather than silently.
+    ``(on, temp_k, source, detail, state_mtime, status)`` — six values, because
+    the merged `_read_windows` publishes the CloudStore write time alongside the
+    state (#15) *and* keeps the manual override authoritative (#14) *and*
+    reports how the state key was read (`StateRead`). The unpack here is the
+    whole contract: a five-value reader no longer exists, so a regression that
+    drops the timestamp or the status fails loudly rather than silently.
 
     Before the #14 fix the method read the wall clock and took no clock
     argument, so the TypeError *is* the result: the contradiction the issue
@@ -154,7 +279,7 @@ def read_at(n, hhmm: str):        # noqa: ANN001
     try:
         return n._read_windows(now=time.strptime(hhmm, "%H:%M"))
     except TypeError:
-        return None, None, "no pinned clock", "TypeError", 0.0
+        return None, None, "no pinned clock", "TypeError", 0.0, None
 
 
 def selftest() -> int:
@@ -333,28 +458,28 @@ def selftest() -> int:
     # off by hand for the rest of the window) while the schedule is open. The
     # OFF is the effective state and must win; OR-ing the window back in is
     # what kept the panel amber after the user had turned the light off.
-    on, temp, src, det, _mtime = read_at(fake_night(state_off, INNER_SETTINGS_SCHED), "22:00")
+    on, temp, src, det, _status, _st = read_at(fake_night(state_off, INNER_SETTINGS_SCHED), "22:00")
     check("OFF inside an open window stays OFF", on, False)
     check("answer came from the effective state", src, "windows")
     check("detail names the honoured override", "override" in det, True)
     check("warmth still comes from settings", temp, 2525)
     # …and turning it back on by hand inside the same window must go warm again.
-    on, temp, src, det, _mtime = read_at(fake_night(state_on, INNER_SETTINGS_SCHED), "22:00")
+    on, temp, src, det, _status, _st = read_at(fake_night(state_on, INNER_SETTINGS_SCHED), "22:00")
     check("manual ON inside the window is ON", on, True)
     check("still from the effective state", src, "windows")
     # Windows rewrites the state blob at each scheduled transition, so the
     # boundary crossings follow it, not a re-derived window.
     for hhmm, enabled in (("20:59", False), ("21:00", True), ("06:59", True), ("07:00", False)):
-        on, temp, src, det, _mtime = read_at(
+        on, temp, src, det, _status, _st = read_at(
             fake_night(state_on if enabled else state_off, INNER_SETTINGS_SCHED), hhmm)
         check(f"{hhmm}: follows the transition state", on, enabled)
         check(f"{hhmm}: provenance is the state", src, "windows")
 
     print("case: with no state blob, the schedule is the honest source — and says so")
-    on, temp, src, det, _mtime = read_at(fake_night(None, INNER_SETTINGS_SCHED), "22:00")
+    on, temp, src, det, _status, _st = read_at(fake_night(None, INNER_SETTINGS_SCHED), "22:00")
     check("inside window → on", on, True)
     check("provenance says schedule inference", src, "windows-schedule")
-    on, temp, src, det, _mtime = read_at(fake_night(None, INNER_SETTINGS_SCHED), "12:00")
+    on, temp, src, det, _status, _st = read_at(fake_night(None, INNER_SETTINGS_SCHED), "12:00")
     check("outside window → off", on, False)
     check("provenance still says schedule inference", src, "windows-schedule")
 
@@ -363,25 +488,265 @@ def selftest() -> int:
           nl._in_window(22 * 60, nl.parse_settings(INNER_SETTINGS_NO_HOURS)), None)
     check("sunset mode without sunset/sunrise",
           nl._in_window(22 * 60, nl.parse_settings(INNER_SETTINGS_NO_SUN)), None)
-    on, temp, src, det, _mtime = read_at(fake_night(None, INNER_SETTINGS_NO_HOURS), "22:00")
+    on, temp, src, det, _status, _st = read_at(fake_night(None, INNER_SETTINGS_NO_HOURS), "22:00")
     check("no guess is made", on, None)
     check("provenance is unknown", src, "unknown")
     check("detail admits it did not guess", "not guessing" in det, True)
-    on, temp, src, det, _mtime = read_at(fake_night(None, None), "22:00")
+    on, temp, src, det, _status, _st = read_at(fake_night(None, None), "22:00")
     check("nothing readable → unknown", (on, src), (None, "unknown"))
 
     print("case: warmth follows the settings blob whatever the state says")
     check("2200 K decodes", nl.parse_settings(INNER_SETTINGS_WARM_2200).get("temp_k"), 2200)
-    on, temp, src, det, _mtime = read_at(fake_night(state_off, INNER_SETTINGS_WARM_2200), "22:00")
+    on, temp, src, det, _status, _st = read_at(
+        fake_night(state_off, INNER_SETTINGS_WARM_2200), "22:00")
     check("temperature reported alongside an OFF state", temp, 2200)
     check("state still decides on/off", on, False)
 
-    print("case: _read_windows publishes exactly ONE contract (5 values)")
+    print("case: _read_windows publishes exactly ONE contract (6 values)")
     got = read_at(fake_night(state_on, INNER_SETTINGS_SCHED), "22:00")
-    check("five values, in the documented order", len(got), 5)
-    check("the last one is the CloudStore write time", 1760000000 < got[4] < 1900000000, True)
-    check("and the first four are still on/temp/source/detail",
+    check("six values, in the documented order", len(got), 6)
+    check("the fifth is the CloudStore write time", 1760000000 < got[4] < 1900000000, True)
+    check("and the sixth is how the state key was read",
+          got[5], nl.StateRead.READING)
+    check("the first four are still on/temp/source/detail",
           (got[0], got[1], got[2], isinstance(got[3], str)), (True, 2525, "windows", True))
+    check("a decoded payload never reports the absence status",
+          read_at(fake_night(state_off, INNER_SETTINGS_SCHED), "22:00")[5],
+          nl.StateRead.READING)
+
+    print("case: _leaf names the failing key, so the detail is actionable")
+    # #2's second half: `_leaf` was referenced before it existed, and the call
+    # that means "this failure is about the settings key" raised NameError
+    # instead. Asserting the text is the point — the production code calls it
+    # on this exact string.
+    check("the settings key reduces to its leaf",
+          nl._leaf(nl._SETTINGS_KEY), "windows.data.bluelightreduction.settings")
+    check("the state key reduces to its leaf",
+          nl._leaf(nl._STATE_KEY), "windows.data.bluelightreduction.bluelightreductionstate")
+    check("the leaves are distinguishable",
+          nl._leaf(nl._STATE_KEY) == nl._leaf(nl._SETTINGS_KEY), False)
+    check("a trailing separator does not change the answer",
+          nl._leaf(nl._SETTINGS_KEY + "\\"), "windows.data.bluelightreduction.settings")
+    try:
+        nl._leaf(nl._SETTINGS_KEY)
+        check("calling _leaf is not a NameError", "returned", "returned")
+    except NameError as e:
+        check("calling _leaf is not a NameError", f"NameError: {e}", "returned")
+
+    # ---------------------------------------------------------------------
+    # The real-registry cases (#15's failed comment + #2). `_blob` runs for
+    # real against `fake_winreg`, so `FileNotFoundError`, `PermissionError`,
+    # the CB decoder and the schedule merge are all on the tested path — and
+    # the schedule configured here is deliberately CONTRADICTORY (21:00→07:00
+    # while the clock says 23:00), so a schedule guess would visibly differ
+    # from holding. Every case below reads at 23:00.
+    print("case: a state read that fails is not an absence — schedule fallback is refused")
+    pinned = pinned_night()
+    with clock_at("23:00"):
+        # A first run with the contradictory schedule configured really is the
+        # honest fallback: nothing has been confirmed, so the schedule may answer.
+        use_winreg({nl._STATE_KEY: _MISSING, nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+        pinned._read(100.0)
+        check("first run, no state key: the schedule answers (23:00 is inside)",
+              (pinned.on, pinned.source, pinned.stale), (True, "windows-schedule", False))
+        use_winreg({nl._STATE_KEY: wrap(state_off), nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+        pinned._read(103.0)
+        check("then Windows says OFF (manual override at 23:00)",
+              (pinned.on, pinned.temp_k, pinned.source, pinned.stale),
+              (False, 2525, "windows", False))
+        check("and the override is named in the detail", "override" in pinned.detail, True)
+
+        # (a) a truncated/malformed payload. The blob is *there*, so this is an
+        # unreadable poll, not an absent key, whatever `state=None` looks like.
+        use_winreg({nl._STATE_KEY: wrap(state_off)[:24],
+                    nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+        pinned._read(106.0)
+        check("a truncated state payload holds the confirmed OFF, stale",
+              (pinned.on, pinned.temp_k, pinned.source, pinned.stale),
+              (False, 2525, "windows", True))
+        check("... and the status says MALFORMED, not absent",
+              nl.StateRead.MALFORMED.value in pinned.detail, True)
+        check("... and no schedule guess was made",
+              ("windows-schedule" in pinned.detail,
+               "holding last confirmed" in pinned.detail), (False, True))
+
+        # The inverse, which the comment on #15 spells out: a confirmed manual ON
+        # must not be turned OFF by a day-brightness schedule guess either (23:00
+        # is *inside* the window, so an OFF could only have come from a guess).
+        use_winreg({nl._STATE_KEY: wrap(state_on), nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+        pinned._read(109.0)
+        check("a confirmed manual ON is established",
+              (pinned.on, pinned.source), (True, "windows"))
+        use_winreg({nl._STATE_KEY: wrap(state_on)[:24],
+                    nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+        pinned._read(112.0)
+        check("a malformed payload keeps the confirmed ON too",
+              (pinned.on, pinned.source, pinned.stale), (True, "windows", True))
+
+        # (b) a single-poll key disappearance: CloudStore unlinks the value while
+        # it rewrites it, which `FileNotFoundError` reports exactly like a first
+        # run. `_MISSING` is that shape, one poll wide.
+        use_winreg({nl._STATE_KEY: _MISSING, nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+        pinned._read(115.0)
+        check("a one-poll disappearance holds the confirmed ON",
+              (pinned.on, pinned.source, pinned.stale), (True, "windows", True))
+        check("... and says the key was missing rather than never stored",
+              ("state-absent" in pinned.detail, "appearance" in pinned.detail),
+              (True, True))
+        use_winreg({nl._STATE_KEY: wrap(state_off), nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+        pinned._read(118.0)
+        check("the key coming back still applies immediately",
+              (pinned.on, pinned.source, pinned.stale), (False, "windows", False))
+
+        use_winreg({nl._STATE_KEY: wrap(state_off), nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+        pinned._read(121.0)
+        check("periodic missing keys never flip the confirmed OFF",
+              (pinned.on, pinned.stale), (False, False))
+        use_winreg({nl._STATE_KEY: _MISSING, nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+        pinned._read(124.0)
+        check("(the disappearance holds it again)",
+              (pinned.on, pinned.source, pinned.stale), (False, "windows", True))
+
+        # An access-denied read while the settings decode fine must behave exactly
+        # like the missing key: holding, never a schedule guess.
+        use_winreg({nl._STATE_KEY: wrap(state_off), nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+        pinned._read(127.0)
+        check("the OFF is re-established first", pinned.stale, False)
+        use_winreg({nl._STATE_KEY: wrap(state_off), nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)},
+                   {nl._STATE_KEY: PermissionError(5, "Access is denied")})
+        pinned._read(130.0)
+        check("an access-denied state read holds the confirmed OFF",
+              (pinned.on, pinned.source, pinned.stale), (False, "windows", True))
+        check("... naming the failure and the key",
+              ("state-unreadable" in pinned.detail, "PermissionError" in pinned.detail),
+              (True, True))
+
+    # The status a caller may infer from, on the same contradictory schedule:
+    # absent *and* nothing established. The distinction the old five-value
+    # contract could not carry, asserted directly on the sixth value — and the
+    # `established` argument is the caller's half of it, so both halves are
+    # asserted against the same hive.
+    probe = pinned_night()
+    use_winreg({nl._STATE_KEY: _MISSING, nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+    _on, _t, _s, _d, _m, status = probe._read_windows(now=time.strptime("23:00", "%H:%M"))
+    check("an absent key alone reports ABSENT", status, nl.StateRead.ABSENT)
+    check("so the schedule may answer it", _on, True)
+    _on, _t, _s, _d, _m, status = probe._read_windows(
+        now=time.strptime("23:00", "%H:%M"), established=True)
+    check("... but not once something has been established", _on, None)
+    check("... while still reporting the key as ABSENT",
+          status, nl.StateRead.ABSENT)
+    check("... and refusing the schedule in as many words",
+          "windows-schedule" in _d, False)
+    use_winreg({nl._STATE_KEY: wrap(state_off)[:24], nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+    _on, _t, _s, _d, _m, status = probe._read_windows(now=time.strptime("23:00", "%H:%M"))
+    check("a malformed payload reports MALFORMED, never ABSENT",
+          status, nl.StateRead.MALFORMED)
+    check("and therefore answers nothing", _on, None)
+    use_winreg({nl._STATE_KEY: wrap(state_off)[:24], nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+    _on, _t, _s, _d, _m, status = probe._read_windows(
+        now=time.strptime("23:00", "%H:%M"), established=True)
+    check("a malformed payload is refused whether or not anything is established",
+          (_on, status), (None, nl.StateRead.MALFORMED))
+
+    print("case: a confirmed OFF survives a settings-only read failure (independent reads)")
+    # #2: the old code let a settings read error escape `_read_windows` into
+    # `refresh()`, which held the previous ON — a confirmed OFF wasted because a
+    # *warmth* setting could not be read. State and settings are read apart now.
+    sj = pinned_night()
+    with clock_at("23:00"):
+        use_winreg({nl._STATE_KEY: wrap(state_on),
+                    nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)})
+        sj._read(100.0)
+        check("established ON with warmth and a schedule",
+              (sj.on, sj.temp_k, sj.source, sj.stale), (True, 2525, "windows", False))
+        check("the neutral ramp is off for this case, so nothing else has a vote",
+              sj.cfg.get("check_gamma_ramp"), False)
+        use_winreg({nl._STATE_KEY: wrap(state_off), nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)},
+                   {nl._SETTINGS_KEY: PermissionError(5, "Access is denied")})
+        sj._read(103.0)
+        check("a valid OFF with an unreadable settings key is APPLIED, not held",
+              (sj.on, sj.stale), (False, False))
+        check("the state still comes from Windows", sj.source, "windows")
+        check("the warmth is carried from the last settings read", sj.temp_k, 2525)
+        check("the detail names the settings failure",
+              ("settings unavailable" in sj.detail, "settings" in sj.detail), (True, True))
+        check("... by its leaf, which is the only distinguishing part of the path",
+              nl._leaf(nl._SETTINGS_KEY) in sj.detail, True)
+        check("... and says the state was applied anyway",
+              "state still applied" in sj.detail, True)
+        check("no exception escaped to refresh(): refresh would have held",
+              sj.stale, False)
+        line = sj.changed_to_log()
+        check("the transition is logged once",
+              line is not None and "night=off" in line, True)
+        check("with nothing to repeat", sj.changed_to_log(), None)
+
+        # The contrast that proves the settings read is what failed: with the key
+        # genuinely ABSENT the same OFF is applied with no failure named, so the
+        # sentence above is about the failure rather than a fixed string.
+        use_winreg({nl._STATE_KEY: wrap(state_off), nl._SETTINGS_KEY: _MISSING})
+        sj._read(106.0)
+        check("an absent settings key applies the OFF with no error named",
+              (sj.on, sj.temp_k, sj.stale, "unavailable" in sj.detail),
+              (False, 2525, False, False))
+
+        # A malformed settings payload is the same failure down a different road:
+        # `_blob` returns bytes, the CB decoder refuses them, and only warmth is
+        # lost. Before the fix this shape escaped as a CBError, not a hold.
+        use_winreg({nl._STATE_KEY: wrap(state_off),
+                    nl._SETTINGS_KEY: wrap(INNER_SETTINGS_SCHED)[:24]})
+        sj._read(109.0)
+        check("an undecodable settings payload is also only a warmth loss",
+              (sj.on, sj.stale), (False, False))
+        check("... and is reported against the settings key",
+              (nl._leaf(nl._SETTINGS_KEY) in sj.detail, "settings unavailable" in sj.detail),
+              (True, True))
+
+        # The inverse, for completeness: a *state* failure around a good settings
+        # read must not be mistaken for an unreadable settings blob. The state
+        # holds; the warmth is still freshly read and never reported as failed.
+        use_winreg({nl._STATE_KEY: wrap(state_on),
+                    nl._SETTINGS_KEY: wrap(INNER_SETTINGS_WARM_2200)})
+        sj._read(112.0)
+        check("warmth 2200 K is read while the state says ON",
+              (sj.on, sj.temp_k), (True, 2200))
+        use_winreg({nl._STATE_KEY: wrap(state_on),
+                    nl._SETTINGS_KEY: wrap(INNER_SETTINGS_WARM_2200)},
+                   {nl._STATE_KEY: PermissionError(5, "Access is denied")})
+        sj._read(115.0)
+        # "settings unavailable" is the *settings* failure's own signature, not
+        # the generic "night mode unavailable" every hold carries — asserting on
+        # the bare word would pass here for the wrong reason.
+        check("a state failure holds and leaves the settings alone",
+              (sj.on, sj.temp_k, sj.stale, "settings unavailable" in sj.detail,
+               "state-unreadable" in sj.detail),
+              (True, 2200, True, False, True))
+
+    # A Python whose registry module has no HKEY_CURRENT_USER: the AttributeError
+    # is not an OSError, so it reaches `_blob`'s `except OSError` only through
+    # whatever the read raises — assert the call chain names the key rather than
+    # dying on a NameError in `_leaf`, which is #2's second half.
+    bogus = types.ModuleType("winreg")
+    bogus.OpenKey = lambda *_a, **_k: (_ for _ in ()).throw(
+        PermissionError(5, "Access is denied"))
+    bogus.HKEY_CURRENT_USER = 0x80000001
+    bogus.QueryValueEx = lambda *_a, **_k: (b"", 3)
+    sys.modules["winreg"] = bogus
+    try:
+        nl.NightLight({}, refresh_s=0.0)._blob(nl._SETTINGS_KEY)
+        check("a failing registry read raises StateUnreadable", "no raise", "StateUnreadable")
+    except nl.StateUnreadable as e:
+        check("a failing registry read raises StateUnreadable", True, True)
+        check("... and the message names the key's leaf, not the whole path",
+              nl._leaf(nl._SETTINGS_KEY) in str(e), True)
+        check("... and does not leak the CloudStore path",
+              "CloudStore" in str(e), False)
+    except NameError as e:                   # the live bug `_leaf` fixed
+        check("a failing registry read raises StateUnreadable", f"NameError: {e}",
+              "StateUnreadable")
+    finally:
+        sys.modules.pop("winreg", None)
 
     print("case: lut() renders the temperature it is handed (issue #53)")
     # The defect: the planner resolved 2700 K for *reporting* while `lut()` asked
@@ -396,6 +761,128 @@ def selftest() -> int:
     check("a warmer effective temperature warms further",
           bare.lut(1.0, 2200)[767] < bare.lut(1.0, 2700)[767], True)
     check("no gains, no temperature → still nothing", bare.lut(1.0, None), None)
+
+    print("case: a neutral ramp clears the ramp-owned look, and only that (issue #68)")
+    # Warm and neutral are the SAME display measured twice, which is the live
+    # shape: f.lux and LightBulb write the ramp, so a neutral reading is the
+    # user having turned their warmer off. The gains below are the shape
+    # `gamma_gains()` returns (peak-normalised mid-tones).
+    warm = nl.RampReading((1.0, 0.72, 0.55), r"\\.\DISPLAY1", None)
+    neutral = nl.RampReading((1.0, 0.99, 0.98), r"\\.\DISPLAY1", None)
+    unreadable = nl.RampReading(None, None, "no active display device")
+    check("a measured neutral carries gains and no reason",
+          (neutral.gains is not None, neutral.reason), (True, None))
+    check("an unreadable ramp carries the reason and no gains",
+          (unreadable.gains, bool(unreadable.reason)), (None, True))
+
+    real_ramp = nl.gamma_gains
+
+    # `fake_night(None, None)` has no CloudStore state at all, so `on is None`
+    # on every read below and the ramp is the only voice in the room - exactly
+    # the path the defect was on. `gamma_gains` is the module global `_read`
+    # calls, so replacing it drives the real method, not a copy of its logic.
+    n = fake_night(None, None)
+
+    def read_ramp(reading, t):            # noqa: ANN001, ANN202
+        nl.gamma_gains = lambda *a, **k: reading
+        n._read(t)
+
+    # The render side, taken from the one place `night.on` becomes a brightness
+    # and a LUT (`lights.LightPlanner`): an appearance that was cleared has to
+    # change what the panel draws, or "the look went away" is only a log line.
+    panel_cfg = {"display": {"brightness_idle": 45, "brightness_game": 70,
+                             "brightness_dim": 12, "dim_after_s": 300,
+                             "screen_off_after_min": 45, "stay_lit_in_game": True},
+                 "night": {"mode": "auto", "strength": 1.0, "color_temp_k": 0,
+                           "brightness_scale": 0.55, "brightness_floor": 8},
+                 "power": {}}
+    planner = lights_mod.LightPlanner(panel_cfg, night=n)
+
+    def panel():                          # noqa: ANN202
+        plan = planner.tick("idle", 0.0, 1.0)
+        return plan.brightness, plan.lut
+
+    # The Windows side of the same question: a state blob that says ON, and a
+    # neutral ramp that must not touch it.
+    w_blobs = {nl._STATE_KEY: LIVE_STATE_ON}
+    w = nl.NightLight({"night": {"check_gamma_ramp": True}}, refresh_s=0.0)
+    w._blob = lambda key: w_blobs.get(key)
+    try:
+        read_ramp(warm, 1.0)
+        check("warm ramp: the ramp owns the look", (n.on, n.source), (True, "ramp"))
+        check("with the measured gains the night LUT renders from",
+              n.gains, warm.gains)
+        check("and the detail names the warm measurement", "warm" in n.detail, True)
+        bright, lut = panel()
+        check("panel side: night ON dims the panel and pushes a LUT",
+              (bright, lut is not None), (25, True))
+        check("... the ramp's own LUT, not a colour-temperature one",
+              lut[767], nl.gains_lut(warm.gains, 1.0)[767])
+
+        read_ramp(neutral, 2.0)
+        check("the same display measured neutral: night goes OFF",
+              (n.on, n.source), (False, "ramp"))
+        check("the detail says the ramp cleared its own look",
+              "cleared the ramp-owned appearance" in n.detail, True)
+        check("and says it was a measurement, not a failure to measure",
+              ("neutral (measured)" in n.detail, "unreadable" in n.detail),
+              (True, False))
+        check("the measured gains go with it", n.gains, None)
+        check("it is a confirmed OFF, not a hold", n.stale, False)
+        bright, lut = panel()
+        check("panel side: brightness comes back and the LUT is dropped",
+              (bright, lut is None), (45, True))
+
+        read_ramp(warm, 3.0)
+        check("turning it back on: ON again, from the ramp",
+              (n.on, n.source, n.gains), (True, "ramp", warm.gains))
+        bright, lut = panel()
+        check("panel side: dimmed and warm again",
+              (bright, lut is not None), (25, True))
+
+        read_ramp(unreadable, 4.0)
+        check("an UNREADABLE ramp still holds the warm look - never an OFF",
+              (n.on, n.source, n.stale), (True, "ramp", True))
+        check("and says it could not ask the display",
+              "ramp unreadable" in n.detail, True)
+        bright, lut = panel()
+        check("panel side: the held look keeps its brightness and its LUT",
+              (bright, lut is not None), (25, True))
+
+        read_ramp(neutral, 5.0)
+        check("a later measured neutral still clears it",
+              (n.on, n.source), (False, "ramp"))
+
+        # Startup is the fourth shape: nothing to hold yet, so a *measured*
+        # neutral and a failed read must not collapse into the same answer.
+        fresh_n = fake_night(None, None)
+        nl.gamma_gains = lambda *a, **k: neutral
+        fresh_n._read(0.5)
+        check("a neutral ramp at startup is unknown, not an OFF",
+              (fresh_n.on, fresh_n.source), (None, "unknown"))
+        check("... and its detail still reports the measurement",
+              "neutral (measured)" in fresh_n.detail, True)
+        blind_n = fake_night(None, None)
+        nl.gamma_gains = lambda *a, **k: unreadable
+        blind_n._read(0.5)
+        check("... while an unreadable ramp at startup carries the reason",
+              (blind_n.on, "neutral (measured)" in blind_n.detail,
+               "ramp unreadable" in blind_n.detail), (None, False, True))
+
+        # A confirmed Windows answer is not the ramp's to clear: the effective
+        # state says ON, and the published appearance came from Windows.
+        nl.gamma_gains = lambda *a, **k: neutral
+        w._read(1.0)
+        check("Windows' own ON is the published look",
+              (w.on, w.source), (True, "windows"))
+        check("a neutral ramp adds no warmth to it", w.gains, None)
+        check("and is not allowed to clear it", w.appearance.source, "windows")
+        w_blobs.clear()               # CloudStore goes unreadable mid-poll
+        w._read(2.0)
+        check("a windows-owned look is not the ramp's business: it holds, ON",
+              (w.on, w.source, w.stale), (True, "windows", True))
+    finally:
+        nl.gamma_gains = real_ramp
 
     print("case: the warm LUT is a colour temperature, not a hue tint")
     g65 = nl.temp_gains(6500)

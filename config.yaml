@@ -1,4 +1,4 @@
-﻿# PC Monitor - desk display config
+# PC Monitor - desk display config
 # NOTE: keys are consumed by app/config.py; missing keys fall back to defaults there.
 # Values are checked against that file's schema when the app starts: a wrong type,
 # range or enum stops the app with every bad key named, instead of failing later
@@ -57,7 +57,15 @@ display:
 sensors:
   # auto: LHM if pythonnet+dll available, else psutil+NVML. Or force: lhm | fallback | demo
   backend: auto
-  interval_s: 1.0
+  # Seconds between data points — the panel's only notion of a refresh rate (it is a
+  # framebuffer with no scan-out of its own, so it lights whatever arrives, whenever).
+  # 0.25 is 4 Hz, measured on this desk: a tick costs ~4 ms to render and ~67 ms to send
+  # (the diff transport pushes only the changed bands, median 4 bands / 124 KB), so the
+  # loop still sleeps ~180 ms of every 250 and uses about a quarter of the link. At 1 Hz
+  # it was idle 93% of the time. See the bandwidth table in README.md before lowering it
+  # further: a whole frame is ~0.42-0.82 s of the link, and those are what the burn-in
+  # shift, the mode-switch wipe and the first frame after a relink pay.
+  interval_s: 0.25
   # Supervisor numbers - see the comments in app/config.py for the full story.
   # A blind tick re-presents the last good sample for stale_grace_s (marked
   # held: rendered, never pushed into history), then every metric shows "--"

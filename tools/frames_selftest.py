@@ -14,6 +14,14 @@ Two jobs:
      parser used to look for a column name the pinned binary never prints, and
      this test passed anyway because the test's header was invented too.
 
+Later cases pin the two ways a capture can look alive while measuring nothing
+(issues #10 and #13): a header with no *parsed* row must not report `ok`
+(main.py reads that as "session live" / `capture=live`), a pipe busy with rows
+nothing can be parsed from must not keep a process looking freshly measured
+(freshness is `_last_parse`, not `_last_row`), and a reader that was retired by
+`restart()` must not be able to publish into the generation it left behind —
+not even through a direct `_ingest`.
+
 The 2.x header below is copied verbatim from a live capture (see V2_HEADER), so
 the test is pinned to the real stream shape. To check the real thing again, run
 the app once with `frames.output_file` set and point this at that file:
@@ -22,6 +30,7 @@ the app once with `frames.output_file` set and point this at that file:
 """
 import io
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -108,6 +117,25 @@ def synth(header: str, time_col: str, n: int = 180, fps: float = 60.0,
     return (header + "\r\n" + "\r\n".join(rows) + "\r\n").encode("utf-8-sig")
 
 
+def junk_only(header: str, time_col: str, n: int = 400, **kw) -> bytes:
+    """`n` rows in the real header's shape whose clock cannot be read.
+
+    The stream shape is right, the pipe is busy, and not one row carries a
+    number: a renamed column, a truncated writer, a driver emitting junk. This
+    is the input that separates "rows are arriving" from "we are measuring" —
+    `_last_row` stays fresh on it while `_last_parse` does not move at all.
+    """
+    blob = synth(header, time_col, n=n, **kw).decode("utf-8-sig")
+    lines = blob.splitlines()
+    i = header.split(",").index(time_col)
+    out = [lines[0]]
+    for line in lines[1:]:
+        field = line.split(",")
+        field[i] = "not-a-number"
+        out.append(",".join(field))
+    return ("\r\n".join(out) + "\r\n").encode()
+
+
 class _Stub:
     """Just enough Popen for _read_stream."""
 
@@ -148,7 +176,7 @@ def main() -> int:
 
     print("case 1: 2.x stream, 180 presents at 60 Hz with one 30 ms hitch")
     m = replay(synth(V2_HEADER, V2_TIME))
-    check("ok (header seen)", m.ok, True)
+    check("ok (after a parsed row)", m.ok, True)
     check("rows", m.rows, 180)
     check("parsed", m.parsed, 180)
     pres = m.presenters()
@@ -192,6 +220,12 @@ def main() -> int:
 
     print("\ncase 3: silent stream while the machine renders")
     q = replay(synth(V2_HEADER, V2_TIME, n=0))
+    # A header on its own is not a live capture: main.py reports "presentmon
+    # session live" / `capture=live` straight off `ok`, and the old latch on
+    # header receipt made a capture that parsed nothing report as live for the
+    # whole schema/silence deadline (issue #10). Health is a parsed row.
+    check("a header with no parsed row is not ok", q.ok, False)
+    check("…and nothing was measured", q.parsed, 0)
     q.observe(busy=True, dt=25.0)
     w2 = q.stream_warning()
     caught2 = bool(w2) and "no rows from presentmon" in w2
@@ -369,9 +403,103 @@ def main() -> int:
     m11.presenters()
     check("never-queried held entries are swept", 7 in m11._held, False)
 
+    print("\ncase 12: malformed-only rows — a busy pipe is not a measurement")
+    # The issue's second clause: a valid 60 fps stream, then rows that keep
+    # arriving and never parse (a renamed clock column, a half-written row, a
+    # driver emitting junk). `_last_row` stays fresh because rows *are* arriving,
+    # and stats()/presenters() used to age by exactly that — so the panel kept
+    # reporting fps=60.0, stale=False, age=0.00s and the process stayed listed as
+    # a presenter while nothing had been measured for minutes. Freshness has to
+    # come from `_last_parse`: the pipe's activity is a fact about the pipe.
+    m12 = replay(synth(V2_HEADER, V2_TIME, n=120, fps=60.0, hitch_at=-1))
+    check("valid stream parses", m12.parsed, 120)
+    m12._read_stream(_Stub(junk_only(V2_HEADER, V2_TIME, n=400,
+                                     base_ms=1_010_000.0)))
+    check("the malformed rows were all counted as rows", m12.rows, 520)
+    check("…and none of them parsed", m12.parsed, 120)
+    check("rows are arriving right now (the old freshness clock)",
+          time.monotonic() - m12._last_row < 1.0, True)
+    # In a live system the wall clock ages `_last_parse` by itself; a replay runs
+    # in microseconds, so age it by hand. Same predicate, same field either way.
+    m12._last_parse -= 5.0
+    st12 = m12.stats(4242)
+    if st12 is None:
+        fails.append("stats() returned None inside hold_s")
+        print("  FAIL stats() returned None inside hold_s")
+    else:
+        check("aged, not fresh", st12.stale, True)
+        ok = 4.5 <= st12.age_s <= 5.5
+        print(f"  {'ok  ' if ok else 'FAIL'} age follows the parse clock: "
+              f"{st12.age_s:.2f}s (5 s of rows nothing could be parsed from)")
+        if not ok:
+            fails.append("aged by _last_parse")
+    check("presenters drops the process nothing is measuring",
+          sorted(m12.presenters()), [])
+
+    print("\ncase 13: a retired generation cannot be published into — not even by _ingest")
+    # Issue #13's own proof: restart() bumps the generation and clears the
+    # capture, and a reader that had already passed its outer generation check
+    # handed its row to _ingest, which committed under the lock without
+    # re-checking. The cleared capture came back — rings=1, pids=1,
+    # _last_t=1000000.0 — and the panel answered from a capture that had been
+    # thrown away. The check belongs where the mutation is.
+    m13 = replay(synth(V2_HEADER, V2_TIME, n=1, fps=60.0, hitch_at=-1,
+                       base_ms=1_000_000.0))
+    stale_gen = m13._gen
+    stale_row = synth(V2_HEADER, V2_TIME, n=1, fps=60.0, hitch_at=-1,
+                      base_ms=1_000_000.0).decode("utf-8-sig").splitlines()[1].split(",")
+    stale_idx = {name: i for i, name in enumerate(V2_HEADER.split(","))}
+    m13.restart("verify")
+    check("restart cleared the capture",
+          (len(m13._rings), dict(m13._pids), m13._last_t), (0, {}, 0.0))
+    check("a retired generation's row is refused",
+          m13._ingest(stale_row, stale_idx, stale_gen), False)
+    check("…and it published nothing",
+          (m13.parsed, len(m13._rings), dict(m13._pids), m13._last_t), (0, 0, {}, 0.0))
+    # The positive control: the same row carrying the *current* generation lands.
+    # A fence that refused everything would satisfy the check above for the wrong
+    # reason.
+    check("the current generation still ingests",
+          m13._ingest(stale_row, stale_idx, m13._gen), True)
+    check("…and that one landed",
+          (m13.parsed, len(m13._rings), sorted(m13._pids), m13._last_t),
+          (1, 1, [4242], 1_000_000.0))
+    # The other half of atomicity: the *retirement* has to be taken under the
+    # same lock the publications fence against. Bumping `_gen` outside it left a
+    # window in which a query passed the fence, lost the race to restart()'s
+    # clear, and then wrote its held value into the generation that replaced it.
+    # Deterministic here: this thread holds the lock, so the restart thread is
+    # parked at the bump until it is released.
+    m13._read_stream(_Stub(synth(V2_HEADER, V2_TIME, n=60, fps=60.0, hitch_at=-1)))
+    check("a capture to retire", len(m13._rings), 1)
+    top = m13._gen
+    started, done = threading.Event(), threading.Event()
+
+    def retire() -> None:
+        started.set()
+        m13.restart("test")
+        done.set()
+
+    with m13._lock:
+        worker = threading.Thread(target=retire, daemon=True)
+        worker.start()
+        started.wait(2.0)
+        # Long enough for the worker to get as far as it can while this thread
+        # holds the lock: it cannot finish (the clear needs the lock), but with
+        # the bump outside the lock it would be visible here at once, and that is
+        # exactly the window a late query used to slip a held value through.
+        check("retirement is still in flight", done.wait(0.5), False)
+        check("retirement waits for the lock", m13._gen, top)
+        check("…and clears nothing behind its back", len(m13._rings), 1)
+    check("retired once the lock is free", done.wait(2.0), True)
+    worker.join(2.0)
+    check("and the generation moved on", m13._gen, top + 1)
+    check("the retired capture is gone",
+          (len(m13._rings), dict(m13._pids), dict(m13._held)), (0, {}, {}))
+
     if len(sys.argv) > 1:
         p = Path(sys.argv[1])
-        print(f"\ncase 12: recorded stream {p}")
+        print(f"\ncase 14: recorded stream {p}")
         blob = p.read_bytes()
         r = replay(blob)
         print(f"  header : {','.join(r.header[:14])}…")

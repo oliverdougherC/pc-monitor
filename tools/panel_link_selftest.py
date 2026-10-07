@@ -318,7 +318,14 @@ def case_exhausted_notice() -> None:
     seen: list[str] = []
     link = PanelLink(simu_cfg(), log=seen.append)
     link.ok = False
-    now = time.monotonic()
+    # An absolute instant, not the live monotonic clock. `_exhausted_notice` gates on
+    # `now - self._last_giveup_log < _GIVEUP_LOG_S`, and `_last_giveup_log` starts at 0.0
+    # — so with a *live* clock the case silently depends on how long the machine has been
+    # up. It passed on a desk at ~1e6 seconds of uptime and failed on a freshly booted CI
+    # runner, where the subtraction lands inside the window and the notice is correctly
+    # suppressed. Pinning the instant removes the machine from the assertion.
+    now = 1_000_000.0
+    link._last_giveup_log = 0.0
     link._restart_attempts = 0
     link._restart_touched = 0
     link._exhausted_notice(now)
@@ -355,7 +362,8 @@ def case_backoff_when_all_is_lost() -> None:
     seen: list[str] = []
     link = PanelLink(simu_cfg(), log=seen.append)
 
-    def fail_build(first: bool = False, reason: str = "") -> bool:
+    def fail_build(first: bool = False, reason: str = "",
+                   wait_s: float = 0.0, adopt: bool = False) -> bool:
         link.down_reason = "no port present"
         return False
 
@@ -368,6 +376,13 @@ def case_backoff_when_all_is_lost() -> None:
     link._restart_attempts = 3          # every rung of the ladder has now been spent
     link._retry_at = 0.0
     link._last_down_log = 0.0
+    # The first attempt runs on the background worker, so wait for it to hand the build
+    # lease back before timing the next one: this case is about the retry clock, and a
+    # tick that lands while a build is still in flight returns early without logging.
+    deadline = time.monotonic() + 10.0
+    while link.building and time.monotonic() < deadline:
+        time.sleep(0.05)
+    seen.clear()                        # the assertion below is about *this* tick's line
     link.tick()
     gap = link._retry_at - time.monotonic()
     check("attempts slow down after the ladder", 50.0 < gap <= 62.0, True)

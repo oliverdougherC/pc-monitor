@@ -37,6 +37,15 @@ Nothing in this module stops a process at import time or by accident: stopping h
 only inside `apply()`, with a pid list that came from `plan()`, a graceful request
 (`.stop`, which the app itself watches so it can close the COM port and its own child
 properly), a bounded wait, and force only for a pid still proven to be ours.
+
+**The record belongs to the instance that wrote it** (#67). The record used to be a
+plain shared file with an unconditional `unlink()` on the way out, so any second
+writer — a `main.py --dump` headless preview is the one that actually happens —
+replaced the running app's identity while it ran and then deleted it on exit. The
+installer's whole stop path reads that file, so a preview could make "stop the app"
+name a process that had already gone. A record now carries an `instance` token and
+`clear_record` removes it only when the token on disk is still this process's; the
+other writers register nothing at all.
 """
 from __future__ import annotations
 
@@ -45,6 +54,7 @@ import ctypes
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -52,8 +62,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-OWNER = ROOT / ".owner"
-STOP = ROOT / ".stop"
+
+
+def control_dir() -> Path:
+    """Where the owner record and the stop request live.
+
+    `main.py` runs from this tree, and so does the installer, so the default is the
+    tree itself. The environment override exists so a test can give a child process a
+    scratch control plane and then assert, from outside, that the child wrote nothing
+    into the real one — which is the only way to prove #67 without stopping the app on
+    somebody's desk. It is read on every call rather than cached at import, because a
+    child that is handed the variable after this module is imported must still see it.
+    """
+    override = os.environ.get("PCMON_CONTROL_DIR", "").strip()
+    return Path(override) if override else ROOT
+
+
+def owner_path(path: Path | str | None = None) -> Path:
+    return Path(path) if path is not None else control_dir() / ".owner"
+
+
+def stop_path(path: Path | str | None = None) -> Path:
+    return Path(path) if path is not None else control_dir() / ".stop"
 
 APP_NAMES = {"python.exe", "pythonw.exe"}
 COLLECTOR = "presentmon.exe"
@@ -118,6 +148,34 @@ def script_of(command_line: str | None) -> str | None:
     return None
 
 
+# `--session_name <value>` / `--session_name=<value>`, quoted or bare. The collector is
+# told its ETW session name on the command line, and the name is what identifies it as
+# ours when its parent is already gone.
+_SESSION_ARG = re.compile(
+    r'--session_name(?:=|\s+)(?:"([^"]*)"|(\S+))', re.IGNORECASE)
+# The same option in PowerShell's spelling, which the installer may use.
+_SESSION_PS_ARG = re.compile(r'-Session(?:\s+)(?:"([^"]*)"|(\S+))', re.IGNORECASE)
+
+
+def session_of(command_line: str | None) -> str | None:
+    """The ETW session name this collector was told to own, or None.
+
+    Exact, not a substring. `session in cmdline` matched `PCMonitor-main-diagnostic`
+    against `PCMonitor-main` — a preview's collector would have been classified as the
+    app's and stopped, which is the same class of mistake as matching a filename: the
+    check has to name the value the process was given, not a fragment of text somewhere
+    on its command line. Argument order is not assumed either; both `--session_name x`
+    and `--session_name=x` are read, and the first match wins.
+    """
+    if not command_line:
+        return None
+    for rx in (_SESSION_ARG, _SESSION_PS_ARG):
+        m = rx.search(command_line)
+        if m:
+            return m.group(1) if m.group(1) is not None else m.group(2)
+    return None
+
+
 # ------------------------------------------------------------------- identity
 def process_start_time(pid: int) -> float | None:
     """When this process instance began, as a unix timestamp. None if unaskable.
@@ -173,32 +231,53 @@ def pid_alive(pid: int) -> bool:
         k32.CloseHandle(h)
 
 
+def new_token() -> str:
+    """A token that belongs to one process *start*, not to one pid and not to a name.
+
+    `os.getpid()` alone is not an identity — a diagnostic run and the app it runs
+    beside can both be alive and a pid can be recycled — so the token is random and
+    is only ever compared against the file it was written into. It is not a secret
+    and it is not a security boundary: it is the difference between "the record on
+    disk is the one I wrote" and "the record on disk is somebody else's", which is
+    exactly what an unconditional `unlink()` could not tell apart (#67).
+    """
+    return secrets.token_hex(16)
+
+
 def write_record(main_py: Path | None = None, interpreter: str | None = None,
-                 session: str = "", collector: str = "",
-                 path: Path | str | None = None) -> bool:
+                 session: str = "", collector: str = "", role: str = "main",
+                 token: str = "", path: Path | str | None = None) -> str:
     """Say who this process is, for whoever has to stop it later.
 
     Written by the app about itself, which is what makes it evidence rather than a
-    guess: an unrelated `main.py` has no reason to claim this install's root.
+    guess: an unrelated `main.py` has no reason to claim this install's root. Returns
+    the instance token it wrote (the caller's, or a fresh one), which is what
+    `clear_record` and `owns_record` require before they will believe the file is ours.
+
+    `role` is recorded but never used to *match*: a record names one process, and a
+    second writer replacing it is the failure this token exists to catch, whatever
+    role it claims.
     """
     rec = {"pid": os.getpid(), "ppid": os.getppid(),
            "started": process_start_time(os.getpid()),
            "main": canon(main_py or (ROOT / "main.py")),
            "root": canon(ROOT),
            "interpreter": canon(interpreter or sys.executable),
-           "session": session, "collector": canon(collector or "")}
-    p = OWNER if path is None else Path(path)
+           "session": session, "collector": canon(collector or ""),
+           "role": role, "instance": token or new_token()}
+    p = owner_path(path)
     tmp = p.with_name(p.name + ".tmp")
     try:
+        p.parent.mkdir(parents=True, exist_ok=True)
         tmp.write_text(json.dumps(rec, indent=1), encoding="utf-8")
         os.replace(tmp, p)
-        return True
     except OSError:
-        return False
+        return ""
+    return str(rec["instance"])
 
 
 def read_record(path: Path | str | None = None) -> dict | None:
-    p = OWNER if path is None else Path(path)
+    p = owner_path(path)
     try:
         rec = json.loads(p.read_text(encoding="utf-8"))
         return rec if isinstance(rec, dict) else None
@@ -206,11 +285,36 @@ def read_record(path: Path | str | None = None) -> dict | None:
         return None
 
 
-def clear_record(path: Path | str | None = None) -> None:
+def owns_record(token: str, path: Path | str | None = None) -> bool:
+    """Is the record on disk still the one this token wrote?
+
+    False is the safe answer for every uncertainty — no token, no file, an unreadable
+    file, a file another instance has since replaced — because the caller uses this to
+    decide whether it may delete shared state and whether a stop request on disk is
+    addressed to it. Deleting somebody else's record is the bug (#67); declining to
+    delete our own costs one stale file that the next start overwrites anyway.
+    """
+    if not token:
+        return False
+    rec = read_record(path)
+    return bool(rec) and rec.get("instance") == token
+
+
+def clear_record(token: str = "", path: Path | str | None = None) -> bool:
+    """Remove the owner record, but only if we are still the instance that wrote it.
+
+    Returns whether the record was removed. With no token this refuses rather than
+    clearing the shared file: every caller that legitimately owns a record has a token
+    from `write_record`, so the tokenless form is the old unconditional unlink, and
+    that is precisely what a concurrent `main.py --dump` used to call on its way out.
+    """
+    if not owns_record(token, path):
+        return False
     try:
-        (OWNER if path is None else Path(path)).unlink()
+        owner_path(path).unlink()
+        return True
     except OSError:
-        pass
+        return False
 
 
 # ------------------------------------------------------------------- the plan
@@ -237,12 +341,24 @@ class Decision:
 
 
 def _record_matches(rec: dict | None, p: Proc) -> bool:
+    """Does the record name *this* process instance, by pid and creation time?
+
+    Both timestamps are required. The previous form treated an unreadable creation time
+    as agreement ("nothing to contradict it"), which made ignorance into positive
+    identity — and identity is what licenses a terminate. When either side cannot be
+    read the record proves nothing, and the caller falls through to the canonical-path
+    checks, which do not depend on a clock. That is the difference between an installer
+    that stops the app and one that stops whatever holds the pid now.
+    """
     if not rec or p.pid != rec.get("pid"):
         return False
     started, created = rec.get("started"), p.created
     if started is None or created is None:
-        return True             # nothing to contradict it; the record named this pid
-    return abs(float(started) - float(created)) <= 2.0
+        return False            # unreadable creation time is not evidence of identity
+    try:
+        return abs(float(started) - float(created)) <= 2.0
+    except (TypeError, ValueError):
+        return False
 
 
 def _app_verdict(p: Proc, rec: dict | None, root: str, main_py: str,
@@ -311,7 +427,7 @@ def classify(procs: list[Proc], rec: dict | None, root: Path | str | None = None
         # this rule exists to close; with the app already gone, the collector has to be
         # recognised by the session it was told to own.
         parent_is_ours = p.ppid in app_pids
-        carries_session = bool(session) and session in (p.cmd or "")
+        carries_session = bool(session) and session_of(p.cmd) == session
         if not parent_is_ours and not carries_session:
             d.report.append(f"pid {p.pid}: our collector binary, but it carries no "
                             f"session {session or '(none given)'} and its parent "
@@ -396,17 +512,24 @@ def request_stop(path: Path | str | None = None) -> bool:
     """Ask the app to shut itself down. It watches for this file so its own `atexit`
     can close the COM port and stop its collector — which a `Stop-Process -Force` never
     lets it do, and which is why orphaned ETW sessions existed at all."""
+    p = stop_path(path)
     try:
-        Path(STOP if path is None else path).write_text(
-            f"{time.time():.3f} requested\n", encoding="utf-8")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"{time.time():.3f} requested\n", encoding="utf-8")
         return True
     except OSError:
         return False
 
 
 def stop_requested(path: Path | str | None = None) -> bool:
-    """Consume a stop request: True once, then the file is gone."""
-    p = STOP if path is None else Path(path)
+    """Consume a stop request: True once, then the file is gone.
+
+    Consumption is destructive, so only the production instance may call this (#67):
+    a stop request is addressed to the process that owns the installation, and a
+    headless preview that consumed one would leave the installer waiting for an app
+    that is still running.
+    """
+    p = stop_path(path)
     try:
         p.unlink()
         return True
@@ -417,13 +540,22 @@ def stop_requested(path: Path | str | None = None) -> bool:
 def apply(decision: Decision, alive=pid_alive, kill=None, sleep=time.sleep,
           graceful_s: float = GRACEFUL_S, collector_grace_s: float = COLLECTOR_GRACE_S,
           stop_path: Path | str | None = None,
-          report: list[str] | None = None) -> list[str]:
+          report: list[str] | None = None,
+          still_ours=None) -> list[str]:
     """Stop what was planned, gently first. Returns the log of what happened.
 
-    `alive`, `kill` and `sleep` are parameters so the whole sequence can be proven
-    against a scripted process list instead of by stopping something real.
+    `alive`, `kill`, `sleep` and `still_ours` are parameters so the whole sequence can be
+    proven against a scripted process list instead of by stopping something real.
+
+    `still_ours` is re-asked immediately before every forced terminate, because the
+    decision was made *before* the graceful wait and up to `GRACEFUL_S` of wall clock
+    passes inside it. A pid can die and be recycled in that window, and `TerminateProcess`
+    on a bare pid kills whoever holds the number now — the same pid-reuse mistake the
+    record's creation time exists to prevent, committed twelve seconds after checking for
+    it. A process that cannot be re-confirmed is reported and left running.
     """
     kill = kill or _terminate
+    still_ours = still_ours or _still_ours
     log = report if report is not None else []
     for p in decision.graceful:
         request_stop(stop_path)
@@ -434,8 +566,12 @@ def apply(decision: Decision, alive=pid_alive, kill=None, sleep=time.sleep,
         if not alive(p.pid):
             log.append(f"pid {p.pid}: stopped itself cleanly after {waited:.1f}s")
             continue
+        if not still_ours(p):
+            log.append(f"pid {p.pid}: still running, but it is no longer the process "
+                       f"we identified (pid reuse during the wait) - left alone")
+            continue
         log.append(f"pid {p.pid}: still running after {waited:.1f}s - forcing (owned "
-                   f"process, identity proven)")
+                   f"process, identity re-proven)")
         kill(p.pid)
         sleep(FORCE_WAIT_S)
     if decision.collector and decision.graceful:
@@ -450,10 +586,29 @@ def apply(decision: Decision, alive=pid_alive, kill=None, sleep=time.sleep,
         if not alive(p.pid):
             log.append(f"pid {p.pid}: collector already gone with its parent")
             continue
+        if not still_ours(p):
+            log.append(f"pid {p.pid}: collector pid was recycled during the wait - "
+                       f"left alone")
+            continue
         log.append(f"pid {p.pid}: our collector, still owning an ETW session - stopping")
         kill(p.pid)
         sleep(FORCE_WAIT_S)
     return log
+
+
+def _still_ours(p: Proc) -> bool:
+    """Is pid `p.pid` still the process instance `classify` identified?
+
+    Re-reads the creation time and compares it against the one the scan observed. A pid
+    that cannot be asked at all is *not* re-confirmed: an unanswered question is never
+    permission to terminate.
+    """
+    if p.created is None:
+        return False
+    now = process_start_time(p.pid)
+    if now is None:
+        return False
+    return abs(now - float(p.created)) <= 2.0
 
 
 def _terminate(pid: int) -> None:
