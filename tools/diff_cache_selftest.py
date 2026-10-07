@@ -102,6 +102,47 @@ def case_failed_full_frame() -> None:
     check("retry sent a FULL frame, not nothing", t.full_pushes(), 2)
 
 
+def case_real_telemetry_is_a_partial_update() -> None:
+    """The cap that decides "bands or a full frame" must fit real telemetry.
+
+    This shipped as a literal `6` inside `push`, while `tools/liveview.py` treated the
+    same decision as a parameter — so the preview and the panel could disagree, and the
+    panel was the one that was wrong. Measured here with the psutil/NVML backend, a real
+    tick changes a median of 7-8 bands (CPU digits, GPU digits, the strip, the trend
+    bands, the clock). Over a cap of 6, so *every* tick fell through to a full frame at
+    ~0.77 s of link, which silently pinned the loop near 2 Hz no matter what
+    `sensors.interval_s` asked for.
+
+    The assertion is deliberately about the shape real telemetry produces rather than
+    about the number: eight separated change rows must still be sent as eight bands.
+    """
+    print("case: real telemetry stays a partial update, not a full frame per tick")
+    import numpy as np
+    from PIL import Image
+
+    # Eight separate change rows, the way digits + strip + trend bands actually land.
+    rows = [(20, 34), (60, 74), (100, 114), (150, 164),
+            (200, 214), (250, 264), (300, 314), (350, 364)]
+    base = Image.new("RGB", (800, 480), (10, 10, 10))
+    changed = base.copy()
+    px = changed.load()
+    for y0, _ in rows:
+        for y in range(y0, y0 + 10):
+            for x in range(40, 60):
+                px[x, y] = (200, 200, 200)
+
+    t = FakeTransport()
+    p = DiffPusher(t)
+    check("baseline acknowledged", p.push(base), True)
+    before = t.full_pushes()
+    sent_before = len(t.sent)
+    check("eight separate change rows acknowledged", p.push(changed), True)
+    check("it was sent as bands, not one full frame", t.full_pushes(), before)
+    check("and it really was eight bands", len(t.sent) - sent_before, 8)
+    check("the cap is a named parameter, not a literal in the middle of push",
+          p.max_bands >= 8, True)
+
+
 def case_failed_mid_band() -> None:
     print("case: a multi-band update dies on the second band - partial is not displayed")
     t = FakeTransport()
@@ -482,7 +523,8 @@ def case_vendor_boundary_does_not_resent_a_short_write() -> None:
 
 
 def main() -> int:
-    for fn in (case_healthy_diff, case_failed_full_frame, case_failed_mid_band,
+    for fn in (case_healthy_diff, case_failed_full_frame,
+               case_real_telemetry_is_a_partial_update, case_failed_mid_band,
                case_relink_during_push, case_invalidate_during_push,
                case_late_old_generation_completion, case_link_acks_and_counts,
                case_vendor_boundary_does_not_swallow_a_timeout,
