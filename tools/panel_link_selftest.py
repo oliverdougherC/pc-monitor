@@ -363,7 +363,7 @@ def case_backoff_when_all_is_lost() -> None:
     link = PanelLink(simu_cfg(), log=seen.append)
 
     def fail_build(first: bool = False, reason: str = "",
-                   wait_s: float = 0.0) -> bool:
+                   wait_s: float = 0.0, adopt: bool = False) -> bool:
         link.down_reason = "no port present"
         return False
 

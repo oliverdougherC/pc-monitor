@@ -632,12 +632,14 @@ class PanelLink:
 
         `wait_s` is for the callers that are supposed to queue: `relink` is a resume
         asking for the link to be re-made, and its contract has always been to wait for a
-        background attempt rather than refuse. A negative value waits until it is free.
-        Waiting here rather than on `_gate` is deliberate — the gate is released a moment
-        before the lease, so a waiter that only watched the gate could claim it while the
-        previous lease was still up.
+        background attempt rather than refuse. A negative value waits until it is free,
+        but never without a bound: an unbounded wait here is a loop that cannot exit, and
+        the thing it would be waiting for is a rebuild that may itself be wedged. The cap
+        is one build window, the same one `relink` documents.
         """
-        deadline = None if wait_s < 0 else time.monotonic() + wait_s
+        if wait_s < 0:
+            wait_s = float(_BUILD_WAIT_S)
+        deadline = time.monotonic() + max(0.0, wait_s)
         while True:
             with self._lock:
                 if adopt and self._building:
@@ -654,9 +656,7 @@ class PanelLink:
                     return self._lease_seq
             # Somebody else owns the link's rebuild. Wait only if this caller was told
             # to; `start_build` and the loop's own paths must answer immediately.
-            if deadline is None and wait_s >= 0:
-                return None
-            if deadline is not None and time.monotonic() >= deadline:
+            if time.monotonic() >= deadline:
                 return None
             time.sleep(0.05)
 
@@ -794,6 +794,11 @@ class PanelLink:
         try:
             if rev == "SIMU":
                 from library.lcd.lcd_simulated import LcdSimulated
+
+                # Before the first one exists: the vendor's browser-preview thread is
+                # non-daemon and is not joined by `closeSerial`, which can abort the
+                # interpreter at shutdown (see `display.harden_simulated`).
+                disp.harden_simulated()
 
                 def make() -> object:
                     sim = LcdSimulated(display_width=w, display_height=h)

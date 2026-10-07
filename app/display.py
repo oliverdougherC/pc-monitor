@@ -22,6 +22,7 @@ from __future__ import annotations
 import importlib
 import platform
 import sys
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -293,6 +294,94 @@ class _ShortWrite(NotImplementedError):
     boundary), and reopening a host COM handle is neither a rollback of the prefix the
     endpoint already took nor a replay of the transaction. So this fails, loudly.
     """
+
+
+def harden_simulated() -> None:
+    """Stop the simulated panel from holding the process open, or aborting it.
+
+    The vendored `LcdSimulated` exists so a preview can run with no hardware, and it
+    starts an `HTTPServer.serve_forever` thread to show the fake screen in a browser.
+    Two things about that thread are wrong for any process that intends to end:
+
+      * it is started **non-daemon and without keeping the handle**:
+        `threading.Thread(target=self.webServer.serve_forever).start()`. Nobody can join
+        it, and `closeSerial()` only calls `server.shutdown()`, which sets the loop's stop
+        flag but is never read by a `serve_forever` that is inside `get_request` and does
+        not return to the top of its loop. The interpreter then waits on a non-daemon
+        thread forever: the run prints its verdict and simply **hangs**;
+      * that same thread writing through the vendor's logger while the interpreter
+        finalises produces a native abort instead of a Python exception: `Fatal Python
+        error: _enter_buffered_busy: could not acquire lock for <_io.BufferedWriter
+        name='<stderr>'> at interpreter shutdown`, which surfaces as exit code
+        `0xC0000409` on Windows.
+
+    Both were observed — the abort on this desk in 2 runs of 12, and CI turned red on
+    `panel_link` because of it; the hang then reproduced in 10 runs of 10 once the abort
+    was avoided. Both look like a mystery at the end of a run whose every assertion had
+    already passed.
+
+    So the constructor is *replaced*, not wrapped: it performs the same setup the vendor
+    does, but starts the loop itself as a **daemon** and keeps the handle. There is then
+    no unhandleable thread to wait for, and `closeSerial` — which the vendor's `__del__`
+    and `PanelLink.close` both call — stops the server, joins that thread with a bound,
+    and is idempotent. Applied to the class in the running process; the hash-verified
+    `vendor/` tree on disk stays byte-identical.
+    """
+    ensure_vendor_path()
+    try:
+        from library.lcd import lcd_simulated
+    except ImportError:                     # no vendored tree: nothing to harden
+        return
+    cls = getattr(lcd_simulated, "LcdSimulated", None)
+    base = getattr(lcd_simulated, "LcdComm", None)
+    if cls is None or base is None or getattr(cls, "_pcmonitor_sim_hardened", False):
+        return
+
+    def __init__(self, com_port="AUTO", display_width=320, display_height=480,
+                 update_queue=None):
+        # The vendor's body, with the one change that matters: the server loop is a
+        # daemon and its thread is kept.
+        base.__init__(self, com_port, display_width, display_height, update_queue)
+        self.screen_image = lcd_simulated.Image.new(
+            "RGB", (self.get_width(), self.get_height()), (255, 255, 255))
+        self.screen_image.save("tmp", "PNG")
+        shutil.copyfile("tmp", lcd_simulated.SCREENSHOT_FILE)
+        self.orientation = lcd_simulated.Orientation.PORTRAIT
+        self._pcmonitor_server_closed = False
+        self._pcmonitor_sim_thread = None
+        try:
+            self.webServer = lcd_simulated.HTTPServer(
+                ("localhost", lcd_simulated.WEBSERVER_PORT),
+                lcd_simulated.SimulatedLcdWebServer)
+            lcd_simulated.logger.debug(
+                "To see your simulated screen, open http://%s:%d in a browser"
+                % ("localhost", lcd_simulated.WEBSERVER_PORT))
+            thread = threading.Thread(target=self.webServer.serve_forever,
+                                      name="pcmonitor-sim-web", daemon=True)
+            thread.start()
+            self._pcmonitor_sim_thread = thread
+        except OSError:
+            lcd_simulated.logger.error(
+                "Error starting webserver! An instance might already be running on "
+                "port %d." % lcd_simulated.WEBSERVER_PORT)
+
+    def closeSerial(self):
+        """Stop this driver's browser preview, once, without raising."""
+        server = getattr(self, "webServer", None)
+        if server is not None and not getattr(self, "_pcmonitor_server_closed", True):
+            self._pcmonitor_server_closed = True
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:               # noqa: BLE001 - teardown must not raise
+                pass
+        thread = getattr(self, "_pcmonitor_sim_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+    cls.__init__ = __init__
+    cls.closeSerial = closeSerial
+    cls._pcmonitor_sim_hardened = True
 
 
 def harden_vendor() -> None:
