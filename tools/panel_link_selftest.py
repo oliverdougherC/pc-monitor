@@ -318,7 +318,14 @@ def case_exhausted_notice() -> None:
     seen: list[str] = []
     link = PanelLink(simu_cfg(), log=seen.append)
     link.ok = False
-    now = time.monotonic()
+    # An absolute instant, not the live monotonic clock. `_exhausted_notice` gates on
+    # `now - self._last_giveup_log < _GIVEUP_LOG_S`, and `_last_giveup_log` starts at 0.0
+    # — so with a *live* clock the case silently depends on how long the machine has been
+    # up. It passed on a desk at ~1e6 seconds of uptime and failed on a freshly booted CI
+    # runner, where the subtraction lands inside the window and the notice is correctly
+    # suppressed. Pinning the instant removes the machine from the assertion.
+    now = 1_000_000.0
+    link._last_giveup_log = 0.0
     link._restart_attempts = 0
     link._restart_touched = 0
     link._exhausted_notice(now)
