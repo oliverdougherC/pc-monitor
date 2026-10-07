@@ -174,6 +174,18 @@ This is the part the reviews said out loud, and nothing here changes it.
     live threads rather than owned handles — now an honest proxy, since a
     generation releases its ledger before its thread exits, but the cap
     semantics were left alone.
+* **The data rate is one number, and it was quietly capped by the transport.**
+  `sensors.interval_s` is the panel's whole notion of a refresh rate — it is a
+  framebuffer with no scan-out, so it lights whatever arrives. Raising it from
+  1 s to 0.25 s exposed a latent defect rather than a hardware limit: measured
+  against this panel a full frame is 0.77 s and bands run at ~24 MB/s bursts,
+  but a real tick changes a median of **7–8 bands** while `DiffPusher` gave up
+  at **6**, so every tick fell through to a full frame and the loop sat near
+  2 Hz whatever the config said. With the cap as a named parameter (12) the
+  same desk measures **3.52 Hz** at 0.284 s/tick, ~133 ms of that on the link,
+  and 7% of one core. The numbers here are from this desk's panel; a different
+  revision's transport changes them, which is what the README's bandwidth table
+  is for.
 
 When the hardware run and the soak have been executed and recorded — response
 latency, maximum outage, missed recoveries, process/thread/handle counts, memory,
