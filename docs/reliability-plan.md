@@ -174,6 +174,20 @@ This is the part the reviews said out loud, and nothing here changes it.
     live threads rather than owned handles — now an honest proxy, since a
     generation releases its ledger before its thread exits, but the cap
     semantics were left alone.
+* **The simulated panel could hang or abort any process that used it** (#-less, found
+  by CI on this branch). The vendored `LcdSimulated` starts its browser-preview
+  `serve_forever` thread non-daemon and drops the handle, while `closeSerial()`
+  only calls `server.shutdown()` — a stop flag a `serve_forever` inside
+  `get_request` never reads. So the interpreter waits on a thread nobody can
+  join: the run prints its verdict and never exits. The same thread logging
+  during finalisation aborts instead (`_enter_buffered_busy`, exit `0xC0000409`).
+  Measured here: abort in 2 runs of 12, then the hang in 10 of 10 once the abort
+  was avoided; `panel_link` took 40 s or never finished. `display.harden_simulated`
+  replaces the constructor so the loop is a daemon with a kept handle, and
+  `closeSerial` shuts down, closes the socket and joins with a bound. That is a
+  live defect, not a test artefact: `main.py --backend demo` had it too. Not
+  hardware-relevant (a real panel takes the serial path), which is why only the
+  simulated runs ever showed it.
 * **The data rate is one number, and it was quietly capped by the transport.**
   `sensors.interval_s` is the panel's whole notion of a refresh rate — it is a
   framebuffer with no scan-out, so it lights whatever arrives. Raising it from
