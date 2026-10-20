@@ -78,7 +78,7 @@ public sealed class Worker
                 try
                 {
                     if (sensors is null && began >= sensorRetry) { sensors = new Telemetry(); sensorRetry = began + 30000; }
-                    if (hardwareSample is null || began - hardwareReadAt >= 1000)
+                    if (hardwareSample is null || began - hardwareReadAt >= config.SensorIntervalSeconds * 1000)
                     {
                         hardwareSample = sensors?.Read() ?? new Sample { SensorState = "unavailable" }; hardwareReadAt = began; hardwareFresh = true;
                     }

@@ -79,7 +79,11 @@ It preserves the installed files, configuration and logs for inspection/rollback
 ## Configuration
 
 The first run creates settings with the previous brightness/power-model values.
-`IdleIntervalSeconds` defaults to 1; `GameIntervalSeconds` defaults to 0.25.
+`IdleIntervalSeconds` and `SensorIntervalSeconds` default to 0.5: normal display
+and hardware polling target two updates per second. `GameIntervalSeconds`
+defaults to 0.25. Sensor reads are reused between polls; collection and rendering
+pause while blanked. Actual display rate is limited by transfer time: the
+complete-frame compatibility fallback can take around 0.5–0.6 seconds per image.
 Dark screens suspend sensor/frame collection and rendering. Idle timers set to
 zero are disabled. `GameProcesses` can explicitly list executable names.
 `Trends`, `PixelShift`, lock/display following, brightness and night warmth are

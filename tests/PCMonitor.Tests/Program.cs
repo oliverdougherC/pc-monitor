@@ -12,6 +12,8 @@ void Throws(string title, Action action) { try { action(); } catch (Exception e)
 new Settings().Validate();
 Throws("rotation is explicit", () => new Settings { Rotation = 90 }.Validate());
 Throws("NaN interval refused", () => new Settings { IdleIntervalSeconds = double.NaN }.Validate());
+Throws("NaN sensor interval refused", () => new Settings { SensorIntervalSeconds = double.NaN }.Validate());
+Throws("unbounded sensor polling refused", () => new Settings { SensorIntervalSeconds = 0 }.Validate());
 Throws("invalid port refused", () => new Settings { Port = "COM4;evil" }.Validate());
 Throws("bad brightness refused", () => new Settings { BlankBrightness = -1 }.Validate());
 Throws("unknown settings refused", () => JsonSerializer.Deserialize<Settings>("{\"Unknown\":1}", Settings.Json));

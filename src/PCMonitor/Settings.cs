@@ -11,8 +11,9 @@ public sealed record Settings
     public int GameBrightness { get; init; } = 70;
     public int DimBrightness { get; init; } = 12;
     public int BlankBrightness { get; init; } = 1;
-    public double IdleIntervalSeconds { get; init; } = 1;
+    public double IdleIntervalSeconds { get; init; } = 0.5;
     public double GameIntervalSeconds { get; init; } = 0.25;
+    public double SensorIntervalSeconds { get; init; } = 0.5;
     public int DimAfterSeconds { get; init; } = 300;
     public int BlankAfterMinutes { get; init; } = 45;
     public bool FollowLock { get; init; } = true;
@@ -37,7 +38,7 @@ public sealed record Settings
         if (string.IsNullOrWhiteSpace(Port) || (Port != "AUTO" && !System.Text.RegularExpressions.Regex.IsMatch(Port, "^COM[0-9]+$"))) throw new InvalidDataException("Port must be AUTO or COM followed by digits.");
         foreach (var n in new[] { IdleBrightness, GameBrightness, DimBrightness, BlankBrightness, NightBrightnessFloor })
             if (n is < 0 or > 100) throw new InvalidDataException("Brightness must be between 0 and 100.");
-        if (!double.IsFinite(IdleIntervalSeconds) || IdleIntervalSeconds is < 0.25 or > 60 || !double.IsFinite(GameIntervalSeconds) || GameIntervalSeconds is < 0.25 or > 60)
+        if (!double.IsFinite(IdleIntervalSeconds) || IdleIntervalSeconds is < 0.25 or > 60 || !double.IsFinite(GameIntervalSeconds) || GameIntervalSeconds is < 0.25 or > 60 || !double.IsFinite(SensorIntervalSeconds) || SensorIntervalSeconds is < 0.25 or > 60)
             throw new InvalidDataException("Refresh intervals must be between 0.25 and 60 seconds.");
         if (DimAfterSeconds < 0 || BlankAfterMinutes < 0 || NightMode is not ("auto" or "on" or "off") || (NightTemperature != 0 && NightTemperature is < 1000 or > 10000))
             throw new InvalidDataException("Invalid idle timer or night mode.");
