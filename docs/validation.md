@@ -10,7 +10,7 @@ Turing 5-inch revision C, ROM 88, internal USB header. Configuration uses
   120 simulated fault cycles. Retired sources and notes were archived outside
   the checkout; their history remains on `fix/airtight-all-open-issues`.
 - Native Release build: zero warnings and errors; self-contained win-x64 publish.
-- Native regression harness: **74 assertions passed**. Full-frame and partial
+- Native regression harness: **76 assertions passed**. Full-frame and partial
   packet hashes match the pinned Python driver for ROM 88 and 89, including
   edge coordinates, payload escaping and packet padding.
 - Tests cover reversible rotation, diff regions, missing acknowledgements,
@@ -86,6 +86,14 @@ over that sample was **0.198% of the machine** (6.347% of one logical core); thi
 is a short idle sample, not a long-term performance guarantee.
 
 ## Remaining normal-use acceptance
+
+Normal display and hardware polling now target **2 updates per second** via
+`IdleIntervalSeconds: 0.5` and `SensorIntervalSeconds: 0.5`. Game rendering retains
+its 0.25-second target and reuses hardware samples between polls. The worker
+performs sensor acquisition and panel writes sequentially, so the complete-frame
+compatibility fallback may limit actual cadence below the configured target.
+Blanking still pauses collection and rendering. Sensor interval validation
+rejects nonfinite values and intervals below 0.25 seconds.
 
 A 48–72 hour soak, a full OS reboot/sign-in cycle, physical unplug/replug, repeated
 hibernation, and gameplay across multiple graphics APIs have not been completed
