@@ -76,7 +76,7 @@ public sealed class TrayApp : ApplicationContext
         {
             sending = true;
             try { await writer.WriteLineAsync(JsonSerializer.Serialize(new WorkerMessage("host", h))).WaitAsync(TimeSpan.FromSeconds(1)); lastHost = h; }
-            catch (Exception e) when (e is IOException or TimeoutException or ObjectDisposedException) { Log.Write("Host delivery failed: " + e.Message); }
+            catch (Exception e) when (e is IOException or TimeoutException or ObjectDisposedException or InvalidOperationException) { Log.Write("Host delivery failed: " + e.Message); }
             finally { sending = false; }
         }
         string state = !desired ? "Stopped" : status is null || worker is null ? "Starting" : status.Panel.StartsWith("connected") ? "Running" : "Reconnecting";
@@ -150,7 +150,7 @@ public sealed class TrayApp : ApplicationContext
             catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception or TimeoutException) { Log.Write("Worker shutdown: " + e.Message); }
             finally { old.Dispose(); }
         }
-        try { oldWriter?.Dispose(); } catch (IOException) { }
+        try { oldWriter?.Dispose(); } catch (Exception e) when (e is IOException or InvalidOperationException) { }
         pipe?.Dispose(); pipe = null; status = null; lastHost = null;
     }
     private void StartMonitoring() { desired = true; nextStart = 0; failures = 0; _ = Tick(); }
