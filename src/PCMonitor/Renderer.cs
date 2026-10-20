@@ -127,7 +127,9 @@ public sealed class Renderer : IDisposable
         Row(left, right, y + 104, "FRAME TIME", f.Milliseconds.HasValue ? Number(f.Milliseconds, "0.0") + " ms" : "--", 20, color);
         Graph("frames", left, y + 112, right - left, 30, Tan, c.Trends, spanMin: 2);
         Text(left, y + 168, "1% LOW", 13, Dimmer); Text(left + 57, y + 168, Number(f.Low1), 22, color, true);
-        Text(right, y + 168, Number(f.Low01), 22, color, true, "right"); Text(right - 40, y + 168, "0.1% LOW", 13, Dimmer, align: "right");
+        string low01 = Number(f.Low01);
+        float lowWidth = g.MeasureString(low01, Font(22, true), 2000, format).Width;
+        Text(right, y + 168, low01, 22, color, true, "right"); Text(right - lowWidth - 7, y + 168, "0.1% LOW", 13, Dimmer, align: "right");
     }
     public Bitmap Render(Sample s, Settings c, bool demo = false)
     {
