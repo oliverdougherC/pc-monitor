@@ -10,7 +10,7 @@ Turing 5-inch revision C, ROM 88, internal USB header. Configuration uses
   120 simulated fault cycles. Retired sources and notes were archived outside
   the checkout; their history remains on `fix/airtight-all-open-issues`.
 - Native Release build: zero warnings and errors; self-contained win-x64 publish.
-- Native regression harness: **64 assertions passed**. Full-frame and partial
+- Native regression harness: **74 assertions passed**. Full-frame and partial
   packet hashes match the pinned Python driver for ROM 88 and 89, including
   edge coordinates, payload escaping and packet padding.
 - Tests cover reversible rotation, diff regions, missing acknowledgements,
@@ -54,6 +54,36 @@ Ordinary monitor blanking performs none of that USB recovery: it retains the
 connection, sends black once, and restores a complete current frame before normal
 brightness. Firmware boot following actual electrical USB power loss remains a
 hardware constraint.
+
+## Frozen-display follow-up
+
+After initial installation the user reported frozen statistics despite connected,
+live status. A direct serial trace reproduced partial-update replies with an
+unchanging `renderCnt:0`; the old code accepted any nonempty reply and advanced
+its diff cache. The user confirmed that both full and partial diagnostic counters
+could visibly advance, so the static firmware counter alone does **not** establish
+the original freeze's cause. The initial checks were insufficient evidence of
+sustained physical statistics updates. Complete uploads returned `full_png_sucess`.
+
+The driver now checks the actual full-frame reply, parses `needReSend` and
+`renderCnt`, and repaints the current complete image if a partial update requests
+a resend or reports the wrong counter. It keeps complete uploads for that
+connection, still skips unchanged frames and sends black only once. This is a
+conservative compatibility fallback and uses more USB bandwidth; its game refresh
+rate is limited by complete-frame transfer time. Padded device identities are also
+trimmed before reading the firmware version. Status exposes confirmed frame
+counts and frame/sample timestamps; the installed check now requires display
+progress, fresh samples, and a new confirmed frame after unblanking.
+
+Regression coverage includes captured reply bytes, silently ignored partial
+updates, explicit resend requests, nonempty failure replies, fallback retention,
+and refusing to cache failed uploads. A hardware probe exercised the fallback
+and received successful complete-frame replies. After installing the fallback,
+the user confirmed that real statistics were updating. The installed 30-second
+check recorded 31 additional frames, fresh sensor samples, no repeated uploads
+while blank, and a current frame after unblanking in **0.842 s**. Combined CPU use
+over that sample was **0.198% of the machine** (6.347% of one logical core); this
+is a short idle sample, not a long-term performance guarantee.
 
 ## Remaining normal-use acceptance
 

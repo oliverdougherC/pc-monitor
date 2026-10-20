@@ -42,6 +42,10 @@ Check("one changed pixel sends its region", PanelProtocol.Changes(frame, one).Se
 Check("first frame is full", PanelProtocol.Changes(null, frame).Single() == new Rectangle(0, 0, 800, 480));
 Throws("out-of-bounds update refused", () => PanelProtocol.Partial(frame, new(799, 479, 2, 1), 88, 0));
 Check("249-byte escape boundary", PanelProtocol.Escape(new byte[249]).Length == 249 && PanelProtocol.Escape(new byte[250]).Length == 251);
+Check("padded identity preserves firmware version", PanelProtocol.Reply(System.Text.Encoding.ASCII.GetBytes("chs_5inch.dev1_rom1.89\0")).EndsWith(".89"));
+Check("captured firmware status decoded", PanelProtocol.Status(Convert.FromHexString("6E656564526553656E643A307C72656E646572436E743A3000000000000000000000")) == (false, 0u));
+Check("firmware resend request decoded", PanelProtocol.Status(System.Text.Encoding.ASCII.GetBytes("needResend:1|renderCnt:0")) == (true, 0u));
+try { PanelProtocol.Status([0, 0, 0]); throw new Exception("Malformed status accepted"); } catch (IOException) { Check("nonempty garbage is not an acknowledgement", true); }
 Check("panel composite parent accepted", PCMonitor.Panel.VerifiedComposite(@"USB\VID_1D6B&PID_0106&MI_00\node", @"USB\VID_1D6B&PID_0106\20080411") is not null);
 Check("shared USB hub is never a restart target", PCMonitor.Panel.VerifiedComposite(@"USB\VID_1D6B&PID_0106&MI_00\node", @"USB\VID_1A40&PID_0101\hub") is null);
 Check("unrelated parent is never a restart target", PCMonitor.Panel.VerifiedComposite(@"USB\VID_1D6B&PID_0106&MI_00\node", @"USB\VID_0525&PID_A4A7\other") is null);
@@ -88,10 +92,29 @@ using (var panel = new PCMonitor.Panel(fake))
     Check("wake restores current image then brightness", fake.Writes[^1][0] == 0x7b && fake.Writes[^1][10] == 114);
     int before = fake.Writes.Count; panel.Present(frame, new(false, 45, "lit"));
     Check("unchanged image and brightness send no bytes", fake.Writes.Count == before);
+    Check("only confirmed changed frames counted", panel.FramesPresented == 2 && panel.LastFrame.HasValue);
     fake.EmptyQueries = 1; panel.Present(one, new(false, 45, "lit"));
     Check("missed status query is retried without resending pixels", panel.Connected && fake.Writes[^1][0] == 0xcf && fake.Writes[^2][0] == 0xcf);
     fake.FailRead = true; panel.Present(frame, new(false, 45, "lit"));
     Check("failed acknowledgement retires connection", !panel.Connected && fake.Disposed);
+}
+foreach (bool resend in new[] { false, true })
+{
+    var rejected = new FakeWire { IgnorePartials = !resend, ResendPartials = resend };
+    using var panel = new PCMonitor.Panel(rejected);
+    panel.Present(frame, new(false, 45, "lit"));
+    panel.Present(one, new(false, 45, "lit"));
+    panel.Present(frame, new(false, 45, "lit"));
+    Check(resend ? "resend request recovers current full frame" : "stalled firmware counter recovers current full frame", panel.Connected && panel.UpdateMode.StartsWith("full") && rejected.FullFrames >= 2 && panel.FramesPresented == 3);
+    int partials = rejected.PartialFrames;
+    panel.Present(one, new(false, 45, "lit"));
+    Check("rejected partial path stays disabled on connection", rejected.PartialFrames == partials && rejected.FullFrames >= 3);
+}
+var badFull = new FakeWire { RejectFull = true };
+using (var panel = new PCMonitor.Panel(badFull))
+{
+    panel.Present(frame, new(false, 45, "lit"));
+    Check("nonempty full-frame failure is never cached as success", !panel.Connected && panel.FramesPresented == 0 && panel.LastFrame is null);
 }
 Console.WriteLine($"Final: {passed} assertions passed.");
 
@@ -101,8 +124,29 @@ sealed class FakeWire : IPanelWire
     public bool FailRead { get; set; }
     public bool Disposed { get; private set; }
     public int EmptyQueries { get; set; }
-    public void Write(byte[] bytes) { if (Disposed) throw new IOException("closed"); Writes.Add(bytes); }
-    public byte[] Read(int count) { if (FailRead) throw new IOException("ack lost"); if (EmptyQueries > 0 && Writes[^1][0] == 0xcf) { EmptyQueries--; return []; } return new byte[count]; }
+    public bool IgnorePartials { get; init; }
+    public bool ResendPartials { get; init; }
+    public bool RejectFull { get; init; }
+    public int FullFrames { get; private set; }
+    public int PartialFrames { get; private set; }
+    private uint rendered;
+    private bool partial;
+    public void Write(byte[] bytes)
+    {
+        if (Disposed) throw new IOException("closed"); Writes.Add(bytes);
+        if (bytes.Length == 250 && bytes[0] == 0x86 && bytes[1] == 0xef) { FullFrames++; rendered = 0; partial = false; }
+        if (bytes.Length == 250 && bytes[0] == 0xcc && bytes[1] == 0xef) { PartialFrames++; partial = true; if (!IgnorePartials && !ResendPartials) rendered = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(bytes.AsSpan(10)); }
+    }
+    public byte[] Read(int count)
+    {
+        if (FailRead) throw new IOException("ack lost");
+        if (Writes[^1][0] == 0xcf)
+        {
+            if (EmptyQueries > 0) { EmptyQueries--; return []; }
+            return System.Text.Encoding.ASCII.GetBytes($"needResend:{(partial && ResendPartials ? 1 : 0)}|renderCnt:{rendered}\0");
+        }
+        return System.Text.Encoding.ASCII.GetBytes(RejectFull ? "full_png_failed\0" : "full_png_sucess\0");
+    }
     public void FlushInput() { }
     public void Dispose() => Disposed = true;
 }

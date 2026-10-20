@@ -37,15 +37,22 @@ function Measure-NativeRuntime([int]$Seconds) {
 }
 $report = [ordered]@{ Time = (Get-Date).ToString('o'); Initial = Read-NativeStatus }
 try {
+    $expected = if ($report.Initial.LastProgress.Light -eq 'night') { 'night' } else { 'lit' }
+    $report.LitStart = Wait-NativeLight $expected
     $report.LitMetrics = Measure-NativeRuntime 30
+    $report.LitAfter = Read-NativeStatus
+    if ($report.LitAfter.WorkerPid -ne $report.LitStart.WorkerPid -or $report.LitAfter.LastProgress.FramesPresented -le $report.LitStart.LastProgress.FramesPresented) { throw 'No confirmed display progress during lit sampling.' }
+    if (-not $report.LitAfter.LastProgress.SampleTime -or ((Get-Date).ToUniversalTime() - ([datetime]$report.LitAfter.LastProgress.SampleTime).ToUniversalTime()).TotalSeconds -gt 5) { throw 'Hardware sample is stale.' }
     if ($ExerciseControls) {
         & $Executable --command blank | Out-Null
         $report.BlankStatus = Wait-NativeLight 'manual'
         $report.BlankMetrics = Measure-NativeRuntime 10
+        $report.BlankAfter = Read-NativeStatus
+        if ($report.BlankAfter.LastProgress.FramesPresented -ne $report.BlankStatus.LastProgress.FramesPresented) { throw 'Repeated image uploads while blanked.' }
         $clock = [Diagnostics.Stopwatch]::StartNew()
         & $Executable --command unblank | Out-Null
-        $expected = if ($report.Initial.LastProgress.Light -eq 'night') { 'night' } else { 'lit' }
         $report.After = Wait-NativeLight $expected
+        if ($report.After.LastProgress.FramesPresented -le $report.BlankAfter.LastProgress.FramesPresented) { throw 'Unblank did not confirm a current frame.' }
         $report.WarmWakeSeconds = [math]::Round($clock.Elapsed.TotalSeconds, 3)
     }
     $report.Passed = $true

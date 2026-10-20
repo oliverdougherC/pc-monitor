@@ -126,7 +126,7 @@ public sealed class Worker
         }
         async Task Report(string light, Sample? sample = null, double tick = 0)
         {
-            var status = new WorkerStatus(DateTimeOffset.UtcNow, panel.State, sample?.SensorState ?? sensors?.State ?? "paused", capture.State, light, sample?.Game == true ? "game" : "idle", TickMilliseconds: tick, Night: night.State);
+            var status = new WorkerStatus(DateTimeOffset.UtcNow, panel.State, sample?.SensorState ?? sensors?.State ?? "paused", capture.State, light, sample?.Game == true ? "game" : "idle", TickMilliseconds: tick, Night: night.State, FramesPresented: panel.FramesPresented, LastFrame: panel.LastFrame, UpdateMode: panel.UpdateMode, SampleTime: sample?.Time);
             await writer.WriteLineAsync(JsonSerializer.Serialize(status).AsMemory(), stop.Token);
         }
     }

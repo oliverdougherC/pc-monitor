@@ -38,6 +38,16 @@ public sealed class SerialWire : IPanelWire
 public static class PanelProtocol
 {
     public const int Width = 800, Height = 480;
+    public static string Reply(byte[] bytes) => Encoding.ASCII.GetString(bytes).TrimEnd('\0', '\r', '\n', ' ');
+    public static (bool Resend, uint RenderCount) Status(byte[] bytes)
+    {
+        string reply = Reply(bytes);
+        var fields = reply.Split('|');
+        if (fields.Length != 2 || !fields[0].StartsWith("needReSend:", StringComparison.OrdinalIgnoreCase) || !fields[1].StartsWith("renderCnt:", StringComparison.Ordinal)
+            || !uint.TryParse(fields[0].AsSpan(11), out uint resend) || resend > 1 || !uint.TryParse(fields[1].AsSpan(10), out uint rendered))
+            throw new IOException("Unrecognized panel status: " + reply);
+        return (resend != 0, rendered);
+    }
     public static byte[] Pad(ReadOnlySpan<byte> bytes, byte padding = 0)
     {
         var data = new byte[((bytes.Length + 249) / 250) * 250];
@@ -109,6 +119,10 @@ public sealed class Panel : IDisposable
     private string? confirmedInstance;
     private bool wakeBeforeRetry;
     private bool resumeRecovery;
+    private bool partialUpdates = true;
+    public long FramesPresented { get; private set; }
+    public DateTimeOffset? LastFrame { get; private set; }
+    public string UpdateMode => partialUpdates ? "partial" : "full (partial updates unverified)";
     public string State { get; private set; } = "disconnected";
     public bool Connected => wire != null;
     public Panel()
@@ -179,14 +193,14 @@ public sealed class Panel : IDisposable
             }
             wire = new SerialWire(port); wire.FlushInput();
             Command([0x01, 0xef, 0x69, 0, 0, 0, 1, 0, 0, 0, 0xc5, 0xd3]);
-            var identity = Encoding.ASCII.GetString(wire.Read(23));
+            var identity = PanelProtocol.Reply(wire.Read(23));
             if (!identity.StartsWith("chs_5inch")) throw new IOException("Panel identity was not recognized: " + identity.Replace('\0', ' '));
             if (int.TryParse(identity.Split('.').LastOrDefault(), out var version) && version is >= 80 and <= 100) rom = version;
             wire.FlushInput();
             Command([0x79, 0xef, 0x69, 0, 0, 0, 1]);
             Command([0x96, 0xef, 0x69, 0, 0, 0, 1], read: true);
             Command([0x7d, 0xef, 0x69, 0, 0, 0, 5, 0, 0, 0, 0x2d, 0, 0, 0, 0]);
-            previous = null; brightness = -1; blanked = false; failedSince = 0; resumeRecovery = false;
+            previous = null; brightness = -1; blanked = false; failedSince = 0; resumeRecovery = false; sequence = 0; partialUpdates = true;
             confirmedInstance = devices.FirstOrDefault(d => d.Port == port && d.Awake).InstanceId;
             if (confirmedInstance is not null)
             {
@@ -197,17 +211,21 @@ public sealed class Panel : IDisposable
         catch (Exception e) when (e is IOException or TimeoutException or UnauthorizedAccessException or InvalidOperationException)
         { Fail(e); return false; }
     }
-    private void Command(byte[] command, bool read = false, byte padding = 0)
+    private byte[] Command(byte[] command, bool read = false, byte padding = 0)
     {
         wire!.Write(PanelProtocol.Pad(command, padding));
-        if (read && wire.Read(1024).Length == 0)
+        if (!read) return [];
+        var response = wire.Read(1024);
+        if (response.Length == 0)
         {
             // ROM 88 occasionally misses a status query while committing pixels.
             // Retry only the idempotent query, never a partially written image.
             if (command[0] != 0xcf) throw new TimeoutException("Panel did not acknowledge command.");
             wire.Write(PanelProtocol.Pad(command));
-            if (wire.Read(1024).Length == 0) throw new TimeoutException("Panel did not acknowledge repeated status query.");
+            response = wire.Read(1024);
+            if (response.Length == 0) throw new TimeoutException("Panel did not acknowledge repeated status query.");
         }
+        return response;
     }
     public void SetBrightness(int percent)
     {
@@ -217,22 +235,37 @@ public sealed class Panel : IDisposable
     public void Push(byte[] frame, bool force = false)
     {
         if (force) previous = null;
-        foreach (var region in PanelProtocol.Changes(previous, frame))
+        var changes = PanelProtocol.Changes(previous, frame);
+        if (changes.Count == 0) return;
+        if (!partialUpdates || changes.Any(r => r.Width == 800 && r.Height == 480)) SendFull(frame);
+        else foreach (var region in changes)
         {
-            if (region.Width == 800 && region.Height == 480)
+            uint sent = sequence++;
+            var packet = PanelProtocol.Partial(frame, region, rom, sent); wire!.Write(packet.Header); wire.Write(packet.Data);
+            var status = PanelProtocol.Status(Command([0xcf, 0xef, 0x69, 0, 0, 0, 1], read: true));
+            if (status.Resend || status.RenderCount != sent)
             {
-                Command([0x86, 0xef, 0x69, 0, 0, 0, 1]); Command([0x2c], padding: 0x2c);
-                Command([0xc8, 0xef, 0x69, 0, 0x17, 0x70, 0x0e, 0x10]);
-                wire!.Write(PanelProtocol.Pad(PanelProtocol.Escape(frame)));
-                if (wire.Read(1024).Length == 0) throw new TimeoutException("Panel did not acknowledge frame.");
+                // A reply with an unexpected counter cannot confirm this update.
+                // Some firmware draws pixels without advancing its counter, so
+                // conservatively use explicitly acknowledged complete frames.
+                partialUpdates = false;
+                Log.Write($"Panel could not confirm partial update {sent} (resend={status.Resend}, rendered={status.RenderCount}); switching to complete frames.");
+                SendFull(frame); break;
             }
-            else
-            {
-                var packet = PanelProtocol.Partial(frame, region, rom, sequence++); wire!.Write(packet.Header); wire.Write(packet.Data);
-            }
-            Command([0xcf, 0xef, 0x69, 0, 0, 0, 1], read: true);
         }
         previous = frame;
+        FramesPresented++; LastFrame = DateTimeOffset.UtcNow;
+    }
+    private void SendFull(byte[] frame)
+    {
+        Command([0x86, 0xef, 0x69, 0, 0, 0, 1]); Command([0x2c], padding: 0x2c);
+        Command([0xc8, 0xef, 0x69, 0, 0x17, 0x70, 0x0e, 0x10]);
+        wire!.Write(PanelProtocol.Pad(PanelProtocol.Escape(frame)));
+        string reply = PanelProtocol.Reply(wire.Read(1024));
+        if (reply is not ("full_png_sucess" or "full_png_success")) throw new IOException("Panel rejected full frame: " + reply);
+        var status = PanelProtocol.Status(Command([0xcf, 0xef, 0x69, 0, 0, 0, 1], read: true));
+        if (status.Resend) throw new IOException("Panel requested a full-frame resend.");
+        sequence = 0;
     }
     public void Present(byte[]? frame, LightPlan plan)
     {
