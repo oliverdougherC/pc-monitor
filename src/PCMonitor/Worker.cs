@@ -72,6 +72,7 @@ public sealed class Worker
                     changed.WaitOne(1000); continue;
                 }
                 capture.Enable(config.CaptureFrames);
+                if (wasBlank) { sensors?.ResetRates(); hardwareSample = null; hardwareReadAt = 0; }
                 Sample sample;
                 bool hardwareFresh = false;
                 try

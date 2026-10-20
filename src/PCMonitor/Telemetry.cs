@@ -17,6 +17,7 @@ public sealed class Telemetry : IDisposable
     private int incompleteReads;
     public string State { get; private set; } = "starting";
     public Telemetry() { Open(); }
+    public void ResetRates() { previousTime = 0; netPrevious.Clear(); }
     private void Open()
     {
         try { computer = new Computer { IsCpuEnabled = true, IsGpuEnabled = true }; computer.Open(); }
@@ -61,6 +62,7 @@ public sealed class Telemetry : IDisposable
         double? read = null, write = null;
         try { read = diskRead?.NextValue(); write = diskWrite?.NextValue(); }
         catch (Exception e) when (e is InvalidOperationException or System.ComponentModel.Win32Exception) { Log.Write("Disk counters unavailable: " + e.Message); diskRead?.Dispose(); diskWrite?.Dispose(); diskRead = diskWrite = null; }
+        if (previousTime == 0) read = write = null;
         double? down = null, up = null; long now = Environment.TickCount64; double dt = (now - previousTime) / 1000.0;
         var next = new Dictionary<string, (long Read, long Write)>();
         try
