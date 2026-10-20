@@ -13,13 +13,15 @@ public sealed class Telemetry : IDisposable
     private long previousTime;
     private readonly Dictionary<string, (long Read, long Write)> netPrevious = [];
     private long retryHardware;
+    private long nextReacquire;
+    private int incompleteReads;
     public string State { get; private set; } = "starting";
     public Telemetry() { Open(); }
     private void Open()
     {
         try { computer = new Computer { IsCpuEnabled = true, IsGpuEnabled = true }; computer.Open(); }
         catch (Exception e) { Log.Write("Hardware sensors: " + e.Message); computer?.Close(); computer = null; retryHardware = Environment.TickCount64 + 30000; }
-        try
+        if (diskRead is null && diskWrite is null) try
         {
             diskRead = new("PhysicalDisk", "Disk Read Bytes/sec", "_Total", true);
             diskWrite = new("PhysicalDisk", "Disk Write Bytes/sec", "_Total", true);
@@ -77,18 +79,28 @@ public sealed class Telemetry : IDisposable
         netPrevious.Clear(); foreach (var item in next) netPrevious[item.Key] = item.Value;
         previousTime = now;
         var cpuTemp = Pick(HardwareType.Cpu, SensorType.Temperature, "Tctl", "CPU Package");
-        State = cpuTemp is null ? "partial: CPU temperature/power unavailable (driver or elevation)" : hardwareFailed > 0 ? "partial: hardware update failed" : "live";
-        return new Sample
+        var gpuLoad = Pick(gpuType, SensorType.Load, "GPU Core");
+        State = cpuTemp is null ? "partial: CPU temperature/power unavailable (driver or elevation)" : hardwareFailed > 0 ? "partial: hardware update failed" : gpuLoad is null ? "partial: GPU sensors unavailable" : "live";
+        incompleteReads = State == "live" ? 0 : incompleteReads + 1;
+        var result = new Sample
         {
             CpuLoad = cpuLoad, CpuTemp = cpuTemp,
             CpuPeak = clocks.Length == 0 ? null : clocks.Max(), CpuAverage = clocks.Length == 0 ? null : clocks.Average(),
             CpuPower = Pick(HardwareType.Cpu, SensorType.Power, "Total Power", "Package"),
-            GpuLoad = Pick(gpuType, SensorType.Load, "GPU Core"), GpuTemp = Pick(gpuType, SensorType.Temperature, "GPU Core"),
+            GpuLoad = gpuLoad, GpuTemp = Pick(gpuType, SensorType.Temperature, "GPU Core"),
             GpuClock = Pick(gpuType, SensorType.Clock, "GPU Core"), GpuPower = Pick(gpuType, SensorType.Power, "GPU Package", "GPU Board", "GPU Power"),
             Vram = Pick(gpuType, SensorType.SmallData, "GPU Memory Used"),
             RamTotal = memoryOk ? memory.TotalPhysical / 1e6 : null, RamUsed = memoryOk ? (memory.TotalPhysical - memory.AvailablePhysical) / 1e6 : null,
             DiskRead = read, DiskWrite = write, NetDown = down, NetUp = up, SensorState = State
         };
+        if (incompleteReads >= 3 && now >= nextReacquire)
+        {
+            // Reacquire native sensor handles after driver resets; progress alone
+            // must not keep an unusable backend alive indefinitely.
+            computer?.Close(); computer = null; retryHardware = now + 5000;
+            nextReacquire = now + 30000; incompleteReads = 0;
+        }
+        return result;
     }
     public void Dispose() { computer?.Close(); computer = null; diskRead?.Dispose(); diskWrite?.Dispose(); }
     [StructLayout(LayoutKind.Sequential)] private struct MemoryStatus { public uint Length, Load; public ulong TotalPhysical, AvailablePhysical, TotalPage, AvailablePage, TotalVirtual, AvailableVirtual, Extended; }

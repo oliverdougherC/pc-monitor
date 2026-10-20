@@ -22,4 +22,3 @@ try {
         Copy-Item -LiteralPath (Join-Path $root 'LICENSE'),(Join-Path $root 'THIRD-PARTY-NOTICES.md'),(Join-Path $root 'README.md') -Destination (Join-Path $root '.artifacts/publish')
     }
 } finally { Pop-Location }
-
