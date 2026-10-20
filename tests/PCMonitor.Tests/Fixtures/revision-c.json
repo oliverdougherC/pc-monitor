@@ -1,0 +1,93 @@
+{
+  "FullHash": "875e767ae840ccfeef5e275bc194bae2a250228ef99386488d640192b4e90a1d",
+  "Partial": [
+    {
+      "Rom": 88,
+      "Region": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "HeaderHash": "a5d1f4c4e259f9db6566cfae988f6583c90e7bdc146b755e8a9a0bb0d8c428b3",
+      "DataHash": "788f1dc7c2e28c18b1d160e9b1bd9798975491958fca87b62c55981d7a590d29"
+    },
+    {
+      "Rom": 88,
+      "Region": [
+        799,
+        479,
+        1,
+        1
+      ],
+      "HeaderHash": "a5d1f4c4e259f9db6566cfae988f6583c90e7bdc146b755e8a9a0bb0d8c428b3",
+      "DataHash": "a722e4cb44c86631a4f93035e4fd5744a782a8ef8b9bdb4cedd7ef7ee6157c9a"
+    },
+    {
+      "Rom": 88,
+      "Region": [
+        10,
+        20,
+        100,
+        3
+      ],
+      "HeaderHash": "090894b1a8ee6f7c292921b5cff2506f77d6d348b3cdfd56ffdd3c22738a4fee",
+      "DataHash": "77b6b9082e40046d30400f7133d138bc81f9f6a8a07111f0920fba12c846592d"
+    },
+    {
+      "Rom": 88,
+      "Region": [
+        0,
+        42,
+        800,
+        17
+      ],
+      "HeaderHash": "c90304446afcb061c773a6415b02816908e74d040b40a3ff82bece22f5e0b113",
+      "DataHash": "4367f1a67410b7561916910cc3cdd8b8bd72e5633a0d719d34c5678742a8d68c"
+    },
+    {
+      "Rom": 89,
+      "Region": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "HeaderHash": "8da23a8286a7ed41b4eba2802ca680fff1d75578a2cdb75c12608e883d7d51df",
+      "DataHash": "8b20967b901f12921cfd7e9ba6e569da0a6193d1692462f2dbcee9585f765d5f"
+    },
+    {
+      "Rom": 89,
+      "Region": [
+        799,
+        479,
+        1,
+        1
+      ],
+      "HeaderHash": "8da23a8286a7ed41b4eba2802ca680fff1d75578a2cdb75c12608e883d7d51df",
+      "DataHash": "76262c1103f8f42bd627c76e2a9b7c785af60b6f6562028dfe3651022b98118f"
+    },
+    {
+      "Rom": 89,
+      "Region": [
+        10,
+        20,
+        100,
+        3
+      ],
+      "HeaderHash": "d11a003d2e5f35b666fecb7cc0038ebd34dcd53b3aabedd9bfe6db716b51fdc3",
+      "DataHash": "ae2d9b7669f5f5a1ea51e2d8b055d1602e42756e78b9ead041f1a0c0ed46230e"
+    },
+    {
+      "Rom": 89,
+      "Region": [
+        0,
+        42,
+        800,
+        17
+      ],
+      "HeaderHash": "345474dcb61bcc5cbcf27c39363e5e9accc96a81d05efca9b530cfdc2548f1ef",
+      "DataHash": "c63ad8a01b9f3d8d0b85a90c404645eef155521f8837cf82a3f09bb924eeb465"
+    }
+  ]
+}

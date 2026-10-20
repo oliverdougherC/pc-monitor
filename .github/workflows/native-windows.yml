@@ -1,0 +1,39 @@
+name: Native Windows
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: native-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          cache: true
+          cache-dependency-path: '**/packages.lock.json'
+      - name: Build, protocol regressions, publish
+        shell: pwsh
+        run: ./scripts/Build.ps1 -Publish
+      - name: Native layout previews
+        shell: pwsh
+        run: |
+          $exe = Resolve-Path '.artifacts/publish/PCMonitor.exe'
+          $idle = Start-Process $exe -ArgumentList '--render', '.artifacts/idle.png' -Wait -PassThru -WindowStyle Hidden
+          if ($idle.ExitCode -ne 0) { throw 'Idle preview failed' }
+          $game = Start-Process $exe -ArgumentList '--render', '.artifacts/game.png', '--game' -Wait -PassThru -WindowStyle Hidden
+          if ($game.ExitCode -ne 0) { throw 'Game preview failed' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PCMonitor-win-x64
+          path: |
+            .artifacts/publish/
+            .artifacts/*.png

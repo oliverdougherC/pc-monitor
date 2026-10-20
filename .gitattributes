@@ -7,8 +7,10 @@
 *.otf  binary
 *.ico  binary
 
-# Python/yaml are read by tools on both platforms; PowerShell wants CRLF.
-*.py   text eol=lf
+# Source and manifests normalize to LF; PowerShell uses CRLF on Windows.
+*.cs   text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
 *.yaml text eol=lf
 *.md   text eol=lf
 *.ps1  text eol=crlf
