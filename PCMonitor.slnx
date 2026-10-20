@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="src/PCMonitor/PCMonitor.csproj" />
+  <Project Path="tests/PCMonitor.Tests/PCMonitor.Tests.csproj" />
+</Solution>
