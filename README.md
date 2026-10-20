@@ -60,6 +60,8 @@ Configuration, bounded logs, and status live in `%LOCALAPPDATA%\PCMonitor`:
 - `settings.json`: validated settings, reloaded transactionally every three seconds.
 - `Logs/tray.log`, `Logs/worker.log`: 2 MiB each plus two previous generations.
 - `status.json`: periodic status and component health, also refreshed by status commands.
+  Display diagnostics include confirmed frame count, last frame/sample timestamps,
+  and whether the connection uses partial updates or the complete-frame fallback.
 
 A deliberate Stop leaves the tray available without restarting monitoring.
 Exit closes the application until the next sign-in or scheduled-task start.
@@ -90,7 +92,8 @@ validation leave the last working settings active and write the reason to the lo
   notifications, foreground-window facts, watchdog and user-scoped pipe control.
 - `Worker.cs`: latest-intent control loop; owns sensors, game detection, rendering
   and the serial panel. Host events supersede a frame composed before them.
-- `Panel.cs`: revision-C framing, timed serial I/O, acknowledged diff updates,
+- `Panel.cs`: revision-C framing, timed serial I/O, validated firmware replies,
+  diff updates with automatic complete-frame fallback when replies cannot confirm them,
   warm blanking, reconnect and physical 180-degree rotation.
 - `Telemetry.cs`, `FrameCapture.cs`: LibreHardwareMonitor CPU/GPU sensors, native
   host counters, PresentMon lifecycle/parsing and bounded per-swapchain history.

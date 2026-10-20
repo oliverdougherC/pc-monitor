@@ -56,4 +56,4 @@ public static class PowerModel
     }
 }
 
-public sealed record WorkerStatus(DateTimeOffset Time, string Panel, string Sensors, string Capture, string Light, string Mode, string? Error = null, double TickMilliseconds = 0, string Night = "unknown");
+public sealed record WorkerStatus(DateTimeOffset Time, string Panel, string Sensors, string Capture, string Light, string Mode, string? Error = null, double TickMilliseconds = 0, string Night = "unknown", long FramesPresented = 0, DateTimeOffset? LastFrame = null, string UpdateMode = "unknown", DateTimeOffset? SampleTime = null);
